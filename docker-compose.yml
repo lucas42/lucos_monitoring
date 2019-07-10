@@ -1,0 +1,8 @@
+version: '3'
+services:
+    monitoring:
+      build: .
+      container_name: monitoring
+      ports: 
+        - "8015:8015"
+      image: lucas42/lucos_monitoring
