@@ -26,15 +26,51 @@ accept(ListenSocket, SchedulerID) ->
 
 handleRequest(Socket) ->
 	case gen_tcp:recv(Socket, 0) of
+		{ok, {http_request, Method, {abs_path, Path}, _Version}} ->
+			handleRequest(Socket, Method, binary_to_list(Path));
+		Error ->
+			Error
+	end.
+handleRequest(Socket, Method, Path) ->
+	case gen_tcp:recv(Socket, 0) of
 		{ok, http_eoh} ->
-			Response = <<"HTTP/1.1 200 OK\nContent-Length: 12\n\nhello world!\n">>,
+			DateTime = calendar:system_time_to_rfc3339(erlang:system_time(second)),
+			ClientIP = getClientIP(Socket),
+			{StatusCode, ContentType, Body} = controller(Method, Path),
+			Response = getHeaders(StatusCode, ContentType) ++ Body,
 			gen_tcp:send(Socket, Response),
 			gen_tcp:close(Socket),
+			io:format("~p ~p ~p ~p ~p~n", [ClientIP, DateTime, Method, StatusCode, Path]),
 			ok;
-
 		{ok, _Data} ->
-			handleRequest(Socket);
+			handleRequest(Socket, Method, Path);
 
 		Error ->
 			Error
+	end.
+
+getClientIP(Socket) ->
+	{ok, {ClientIP, _}} = inet:peername(Socket),
+	inet:ntoa(ClientIP).
+
+getHeaders(StatusCode, ContentType) ->
+	getStatusLine(StatusCode) ++
+		"ContentType: " ++ ContentType ++ "\n" ++
+		"\n".
+
+getStatusLine(StatusCode) ->
+	"HTTP/1.1 " ++ integer_to_list(StatusCode) ++ " " ++ getReasonPhrase(StatusCode) ++ "\n".
+
+getReasonPhrase(StatusCode) ->
+	case StatusCode of
+		200 -> "OK";
+		404 -> "Not Found"
+	end.
+
+controller(_Method, Path) ->
+	case Path of
+		"/" ->
+			{200, "text/plain", "front page"};
+		_ ->
+			{404, "text/plain", "Not Found"}
 	end.
