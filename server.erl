@@ -71,7 +71,7 @@ getReasonPhrase(StatusCode) ->
 controller(_Method, Path) ->
 	case Path of
 		"/" ->
-			{200, "text/plain", "front page"};
+			{200, "text/html", "<html><head><title>Lucos Monitoring</title></head><body>Monitoring for lucos services</body></html>"};
 		_ ->
 			{404, "text/plain", "Not Found"}
 	end.
