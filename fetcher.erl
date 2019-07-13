@@ -2,6 +2,11 @@
 -export([start/0, fetch/1]).
 
 start() ->
+	ok = application:start(crypto),
+	ok = application:start(asn1),
+	ok = application:start(public_key),
+	ok = application:start(ssl),
+	ok = application:start(inets),
 	{ok, Device} = file:open("./service-list", [read]),
 	spawnFetcher(Device).
 
@@ -16,4 +21,13 @@ spawnFetcher(Device) ->
 
 fetch(Host) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
-	io:format("Fetch: ~p~n", [InfoURL]).
+	io:format("Fetch: ~p~n", [InfoURL]),
+	case httpc:request(InfoURL) of
+		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
+			io:format("Success from ~p: ~p~n",[Host, Body]);
+		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
+			io:format("Error for ~p: Recieved ~p ~p from ~p~n", [Host, StatusCode, ReasonPhrase, InfoURL]);
+		{error, Reason} ->
+			io:format("Error for ~p: ~p~n", [Host, Reason])
+	end.
+    

@@ -2,6 +2,8 @@ FROM erlang:22-alpine
 
 WORKDIR /web/lucos/monitoring
 
+RUN apk add erlang-ssl erlang-crypto erlang-public-key
+
 COPY *.erl ./
 
 RUN erlc *.erl
