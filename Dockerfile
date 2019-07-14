@@ -1,8 +1,10 @@
-FROM erlang:22-alpine
+FROM erlang:22
 
 WORKDIR /web/lucos/monitoring
 
-RUN apk add erlang-ssl erlang-crypto erlang-public-key
+RUN apt-get update
+RUN apt-get install -y erlang-ssl erlang-crypto erlang-public-key erlang-jiffy
+ENV ERL_LIBS /usr/lib/erlang/lib/jiffy-0.14.8
 
 COPY *.erl ./
 

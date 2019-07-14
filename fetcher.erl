@@ -24,7 +24,8 @@ fetch(Host) ->
 	io:format("Fetch: ~p~n", [InfoURL]),
 	case httpc:request(InfoURL) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
-			io:format("Success from ~p: ~p~n",[Host, Body]);
+			Info = jiffy:decode(Body),
+			io:format("Success from ~p: ~p~n",[Host, Info]);
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 			io:format("Error for ~p: Recieved ~p ~p from ~p~n", [Host, StatusCode, ReasonPhrase, InfoURL]);
 		{error, Reason} ->
