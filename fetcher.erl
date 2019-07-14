@@ -24,11 +24,17 @@ fetch(Host) ->
 	io:format("Fetch: ~p~n", [InfoURL]),
 	case httpc:request(InfoURL) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
-			Info = jiffy:decode(Body),
-			io:format("Success from ~p: ~p~n",[Host, Info]);
+			{System, Checks, Metrics} = parseInfo(Body),
+			io:format("Success from ~p: ~n\t~p~n\t~p~n\t~p~n",[Host, System, Checks, Metrics]);
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 			io:format("Error for ~p: Recieved ~p ~p from ~p~n", [Host, StatusCode, ReasonPhrase, InfoURL]);
 		{error, Reason} ->
 			io:format("Error for ~p: ~p~n", [Host, Reason])
 	end.
-    
+
+parseInfo(Body) ->
+	Info = jiffy:decode(Body, [return_maps]),
+	System = maps:get(<<"system">>, Info),
+	Checks = maps:get(<<"checks">>, Info, #{}),
+	Metrics = maps:get(<<"metrics">>, Info, #{}),
+	{System, Checks, Metrics}.
