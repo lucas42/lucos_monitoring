@@ -30,7 +30,9 @@ fetch(StatePid, Host) ->
 			ok = gen_server:cast(StatePid, {systemError, Host, StatusCode, ReasonPhrase});
 		{error, Reason} ->
 			ok = gen_server:cast(StatePid, {systemError, Host, 0, Reason})
-	end.
+	end,
+	timer:sleep(timer:seconds(60)),
+	fetch(StatePid, Host).
 
 parseInfo(Body) ->
 	Info = jiffy:decode(Body, [return_maps]),
