@@ -13,13 +13,8 @@ handle_cast(Request, {ChecksMap, MetricsMap}) ->
 	case Request of
 		{updateSystem, Host, System, SystemChecks, SystemMetrics} ->
 			io:format("Received update for system ~p (Host ~p)~n", [System, Host]),
-			NewChecksMap = maps:put(Host, {success, System, SystemChecks}, ChecksMap),
-			NewMetricsMap = maps:put(Host, {success, System, SystemMetrics}, MetricsMap),
-			{noreply, {NewChecksMap, NewMetricsMap}};
-		{systemError, Host, Error} ->
-			io:format("Hit error on host ~p~n", [Host]),
-			NewChecksMap = maps:put(Host, {error, Error}, ChecksMap),
-			NewMetricsMap = maps:put(Host, {error, Error}, MetricsMap),
+			NewChecksMap = maps:put(Host, {System, SystemChecks}, ChecksMap),
+			NewMetricsMap = maps:put(Host, {System, SystemMetrics}, MetricsMap),
 			{noreply, {NewChecksMap, NewMetricsMap}}
 	end.
 

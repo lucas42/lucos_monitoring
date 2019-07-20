@@ -69,22 +69,6 @@ getReasonPhrase(StatusCode) ->
 		404 -> "Not Found"
 	end.
 
-renderError(Error) ->
-	case Error of
-		{http_error, {StatusCode, ReasonPhrase}} ->
-			"Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase;
-		{failed_connect, [{to_address, {Host, _Port}}, {inet,[inet],nxdomain}]} ->
-			"DNS failure when trying to resolve "++Host;
-		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],econnrefused}]} ->
-			"Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port);
-		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],etimedout}]} ->
-			"TCP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port);
-		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],timeout}]} ->
-			"HTTP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port);
-		{ErrorType, _Details} ->
-			"An unknown error of type "++atom_to_list(ErrorType)++" occured: "++lists:flatten(io_lib:format("~p",[Error]))
-	end.
-
 renderSystemChecks(SystemChecks) ->
 	{Html, Healthy, CheckCount} = maps:fold(
 		fun (CheckId, CheckInfo, {Html, Healthy, CheckCount}) ->
@@ -118,33 +102,32 @@ getCssClass(Type, Healthy) ->
 		false -> Type ++ " erroring"
 	end.
 
+renderSystemHeader(System, Host) ->
+	InfoURL = "https://" ++ Host ++ "/_info",
+	case System of
+		unknown ->
+			"<h2>
+				"++Host++"
+				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
+			</h2>";
+		System ->
+			Name = re:replace(System, "_", " ", [global, {return,list}]),
+			"<h2 class=\"system-name\">
+				"++Name++"
+				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
+			</h2>"
+	end.
+
 renderChecks(Checks) ->
 	maps:fold(
-		fun (Host, Data, Output) ->
-			InfoURL = "https://" ++ Host ++ "/_info",
-			case Data of
-				{success, System, SystemChecks} ->
-					Name = re:replace(System, "_", " ", [global, {return,list}]),
-					{Healthy, SystemChecksHtml} = renderSystemChecks(SystemChecks),
-					Output++"
-					<div class=\""++getCssClass("system", Healthy)++"\">
-						<h2 class=\"system-name\">
-							"++Name++"
-							<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
-						</h2>
-						"++SystemChecksHtml++"
-					</div>
-					";
-				{error, Error} ->
-					Output++"
-					<div class=\""++getCssClass("system", false)++"\">
-						<h2>
-							"++Host++"
-							<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
-						</h2>
-						<p>"++renderError(Error)++"</p>
-					</div>"
-			end
+		fun (Host, {System, SystemChecks}, Output) ->
+			{Healthy, SystemChecksHtml} = renderSystemChecks(SystemChecks),
+			Output++"
+			<div class=\""++getCssClass("system", Healthy)++"\">
+				"++renderSystemHeader(System, Host)++"
+				"++SystemChecksHtml++"
+			</div>
+			"
 		end, "", Checks).
 
 controller(_Method, Path, StatePid) ->
