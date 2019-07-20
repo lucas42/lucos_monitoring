@@ -175,6 +175,9 @@ encodeInfo(Systems) ->
 				<<"value">> => maps:size(Systems),
 				<<"techDetail">> => <<"The number of systems being monitored">>
 			}
+		},
+		ci => #{
+			circle => <<"gh/lucas42/lucos_monitoring">>
 		}
 	}).
 
