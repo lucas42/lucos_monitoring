@@ -96,6 +96,29 @@ renderSystemChecks(SystemChecks) ->
 				</table>"}
 	end.
 
+renderSystemMetrics(SystemMetrics) ->
+	Html = maps:fold(
+		fun (MetricId, MetricInfo, Html) ->
+			Value = maps:get(<<"value">>, MetricInfo, -1),
+			TechDetail = binary_to_list(maps:get(<<"techDetail">>, MetricInfo, <<"">>)),
+			MetricHtml = "
+				<tr class=\"metric\" title=\""++TechDetail++"\">
+					<td class=\"metricid\">"++binary_to_list(MetricId)++"</td>
+					<td class=\"value\">"++integer_to_list(Value)++"</td>
+				</tr>
+			",
+			Html++MetricHtml
+		end, "", SystemMetrics),
+	case Html of
+		"" -> "";
+		_ ->
+			"
+			<table class=\"metrics\">
+				<thead><td>Metric</td><td>Value</td></thead>
+				"++Html++"
+			</table>"
+	end.
+
 getCssClass(Type, Healthy) ->
 	case Healthy of
 		true -> Type ++ " healthy";
@@ -120,12 +143,13 @@ renderSystemHeader(System, Host) ->
 
 renderAll(Systems) ->
 	maps:fold(
-		fun (Host, {System, SystemChecks, _SystemMetrics}, Output) ->
+		fun (Host, {System, SystemChecks, SystemMetrics}, Output) ->
 			{Healthy, SystemChecksHtml} = renderSystemChecks(SystemChecks),
 			Output++"
 			<div class=\""++getCssClass("system", Healthy)++"\">
 				"++renderSystemHeader(System, Host)++"
 				"++SystemChecksHtml++"
+				"++renderSystemMetrics(SystemMetrics)++"
 			</div>
 			"
 		end, "", Systems).
@@ -151,6 +175,7 @@ controller(_Method, Path, StatePid) ->
 			.system.healthy h2, tr.check.healthy td.status { background-color: #060; }
 			.system.erroring h2, tr.check.erroring td.status { background-color: #900; }
 			.system.healthy .debug { display: none; }
+			.metrics { margin-top: 2em; }
 			"};
 		_ ->
 			{404, "text/plain", "Not Found"}
