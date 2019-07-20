@@ -101,7 +101,7 @@ renderSystemChecks(SystemChecks) ->
 		_Count ->
 			{Healthy, "
 				<table>
-					<thead><td>Check</td><td>Status</td><td>Details</td></thead>
+					<thead><td>Check</td><td>Status</td><td>Technical Detail</td></thead>
 					"++Html++"
 				</table>"}
 	end.
