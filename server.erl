@@ -73,16 +73,24 @@ getReasonPhrase(StatusCode) ->
 addZeroWidthSpaces(String) ->
 	re:replace(String, "\\/+", "\\&#8203;&\\&#8203;", [global, {return,list}]).
 
+renderCheckStatus(Health, Link) ->
+	case Link of
+		"" -> atom_to_list(Health);
+		_ ->
+			"<a href=\""++Link++"\" target=\"_blank\">"++atom_to_list(Health)++"</a>"
+	end.
+
 renderSystemChecks(SystemChecks) ->
 	{Html, Healthy, CheckCount} = maps:fold(
 		fun (CheckId, CheckInfo, {Html, Healthy, CheckCount}) ->
 			CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
 			TechDetail = addZeroWidthSpaces(binary_to_list(maps:get(<<"techDetail">>, CheckInfo, <<"-">>))),
 			Debug = addZeroWidthSpaces(binary_to_list(maps:get(<<"debug">>, CheckInfo, <<"">>))),
+			Link = binary_to_list(maps:get(<<"link">>, CheckInfo, <<"">>)),
 			CheckHtml = "
 				<tr class=\""++getCssClass("check", CheckHealthy)++"\">
 					<td class=\"checkid\">"++binary_to_list(CheckId)++"</td>
-					<td class=\"status\">"++atom_to_list(CheckHealthy)++"</td>
+					<td class=\"status\">"++renderCheckStatus(CheckHealthy, Link)++"</td>
 					<td class=\"techDetail\">"++TechDetail++"</td>
 					<td class=\"debug\">"++Debug++"</td>
 				</tr>
@@ -210,6 +218,8 @@ controller(_Method, RequestUri, StatePid) ->
 			#lucos_navbar_icon { float: left; height: 25px; padding: 2.5px 2%; cursor: pointer; max-width: 20%; border: none; }
 			#lucos_navbar_title { text-align: center; display: block; line-height: 30px; font-weight: bold; position: absolute; width: 50%; margin: 0 25%; z-index: -1; overflow: hidden; height: 30px; text-overflow: ellipsis; white-space: nowrap; }
 			body { padding-top: 35px; }
+			.status a { display: block; color:inherit; text-decoration: none; width: 100%; }
+			.status a:hover { text-decoration: underline; }
 			"};
 		"/_info" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
