@@ -70,12 +70,15 @@ getReasonPhrase(StatusCode) ->
 		500 -> "Internal Error"
 	end.
 
+addZeroWidthSpaces(String) ->
+	re:replace(String, "\\/+", "\\&#8203;&\\&#8203;", [global, {return,list}]).
+
 renderSystemChecks(SystemChecks) ->
 	{Html, Healthy, CheckCount} = maps:fold(
 		fun (CheckId, CheckInfo, {Html, Healthy, CheckCount}) ->
 			CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
-			TechDetail = binary_to_list(maps:get(<<"techDetail">>, CheckInfo, <<"-">>)),
-			Debug = binary_to_list(maps:get(<<"debug">>, CheckInfo, <<"">>)),
+			TechDetail = addZeroWidthSpaces(binary_to_list(maps:get(<<"techDetail">>, CheckInfo, <<"-">>))),
+			Debug = addZeroWidthSpaces(binary_to_list(maps:get(<<"debug">>, CheckInfo, <<"">>))),
 			CheckHtml = "
 				<tr class=\""++getCssClass("check", CheckHealthy)++"\">
 					<td class=\"checkid\">"++binary_to_list(CheckId)++"</td>
@@ -131,14 +134,14 @@ renderSystemHeader(System, Host) ->
 	case System of
 		unknown ->
 			"<h2>
-				"++Host++"
 				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
+				"++Host++"
 			</h2>";
 		System ->
 			Name = re:replace(System, "_", " ", [global, {return,list}]),
 			"<h2 class=\"system-name\">
-				"++Name++"
 				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
+				"++Name++"
 			</h2>"
 	end.
 
@@ -173,14 +176,27 @@ controller(_Method, RequestUri, StatePid) ->
 		"/" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
 			ChecksOutput = renderAll(Systems),
-			{200, "text/html", "<html><head><title>Lucos Monitoring</title><link rel=\"stylesheet\" type=\"text/css\" href=\"/style.css\" /></head><body><h1>Monitoring for Lucos Services</h1>" ++ ChecksOutput ++ "</body></html>"};
+			{200, "text/html", "<html>
+				<head>
+					<title>Lucos Monitoring</title>
+					<link rel=\"stylesheet\" type=\"text/css\" href=\"/style.css\" />
+					<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+				</head>
+				<body>
+					<div id=\"lucos_navbar\">
+						<a href=\"https://l42.eu/\"><img src=\"https://l42.eu/logo.png\" alt=\"lucOS\" id=\"lucos_navbar_icon\" /></a>
+						<span id=\"lucos_navbar_title\">Monitoring</span>
+					</div>
+					" ++ ChecksOutput ++ "
+				</body>
+			</html>"};
 		"/style.css" ->
 			{200, "text/css", "
 			.system h2 { background-color: #666; color: #fff; padding: 0.1em 1em; border-radius: 0.2em; }
 			h2.system-name { text-transform:capitalize; }
 			h2 .rawInfoURL { float: right; text-decoration: none; }
 			.empty { font-style: italic; }
-			table { border-collapse: collapse; }
+			table { border-collapse: collapse; display:block; overflow: scroll; }
 			td { border: none thin #ccc; padding: 0.2em 1em; }
 			thead td { font-weight: bold; border-bottom-style: solid; }
 			tr > td:not(:first-child) { border-left-style: solid; }
@@ -190,6 +206,10 @@ controller(_Method, RequestUri, StatePid) ->
 			.system.erroring h2, tr.check.erroring td.status { background-color: #900; }
 			.system.healthy .debug { display: none; }
 			.metrics { margin-top: 2em; }
+			#lucos_navbar { height: 30px; z-index:1000; color: white; position: absolute; left: 0; right: 0; top: 0; font-size: 18px; background-color: black; background-image: -webkit-gradient(linear, 0 100%, 0 0, color-stop(0, transparent), color-stop(0.15, transparent), color-stop(0.9, rgba(255, 255, 255, 0.4))); font-family: Georgia, serif; }
+			#lucos_navbar_icon { float: left; height: 25px; padding: 2.5px 2%; cursor: pointer; max-width: 20%; border: none; }
+			#lucos_navbar_title { text-align: center; display: block; line-height: 30px; font-weight: bold; position: absolute; width: 50%; margin: 0 25%; z-index: -1; overflow: hidden; height: 30px; text-overflow: ellipsis; white-space: nowrap; }
+			body { padding-top: 35px; }
 			"};
 		"/_info" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
