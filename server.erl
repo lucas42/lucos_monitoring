@@ -115,20 +115,27 @@ getCssClass(Type, Healthy) ->
 renderChecks(Checks) ->
 	maps:fold(
 		fun (Host, Data, Output) ->
+			InfoURL = "https://" ++ Host ++ "/_info",
 			case Data of
 				{success, System, SystemChecks} ->
 					Name = re:replace(System, "_", " ", [global, {return,list}]),
 					{Healthy, SystemChecksHtml} = renderSystemChecks(SystemChecks),
 					Output++"
 					<div class=\""++getCssClass("system", Healthy)++"\">
-						<h2 class=\"system-name\">"++Name++"</h2>
+						<h2 class=\"system-name\">
+							"++Name++"
+							<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
+						</h2>
 						"++SystemChecksHtml++"
 					</div>
 					";
 				{error, Error} ->
 					Output++"
 					<div class=\""++getCssClass("system", false)++"\">
-						<h2>"++Host++"</h2>
+						<h2>
+							"++Host++"
+							<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
+						</h2>
 						<p>"++renderError(Error)++"</p>
 					</div>"
 			end
@@ -145,6 +152,7 @@ controller(_Method, Path, StatePid) ->
 			{200, "text/css", "
 			.system h2 { background-color: #666; color: #fff; padding: 0.1em 1em; border-radius: 0.2em; }
 			h2.system-name { text-transform:capitalize; }
+			h2 .rawInfoURL { float: right; text-decoration: none; }
 			.empty { font-style: italic; }
 			table { border-collapse: collapse; }
 			td { border: none thin #ccc; padding: 0.2em 1em; }
