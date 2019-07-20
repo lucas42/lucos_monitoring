@@ -90,12 +90,27 @@ controller(_Method, Path, StatePid) ->
 				fun (Host, Data, Output) ->
 					case Data of
 						{success, System, SystemChecks} ->
-							Output++"<h2>"++System++"</h2>\n";
+							Name = re:replace(System, "_", " ", [global, {return,list}]),
+							Output++"
+							<div class=\"system\">
+								<h2 class=\"system-name\">"++Name++"</h2>
+							</div>
+							";
 						{error, Error} ->
-							Output++"<h2 class=\"error\">"++Host++"</h2>\n<p>"++stringifyError(Error)++"</p>"
+							Output++"
+							<div class=\"system erroring\">
+								<h2>"++Host++"</h2>
+								<p>"++stringifyError(Error)++"</p>
+							</div>"
 					end
 				end, "", Checks),
-			{200, "text/html", "<html><head><title>Lucos Monitoring</title></head><body><h1>Monitoring for lucos services</h1>" ++ ChecksOutput ++ "</body></html>"};
+			{200, "text/html", "<html><head><title>Lucos Monitoring</title><link rel=\"stylesheet\" type=\"text/css\" href=\"/style.css\" /></head><body><h1>Monitoring for Lucos Services</h1>" ++ ChecksOutput ++ "</body></html>"};
+		"/style.css" ->
+			{200, "text/css", "
+			.system h2 { background-color: #060; color: #fff; padding: 0.1em 1em; border-radius: 0.2em; }
+			h2.system-name { text-transform:capitalize; }
+			.system.erroring h2 { background-color: #900; }
+			"};
 		_ ->
 			{404, "text/plain", "Not Found"}
 	end.
