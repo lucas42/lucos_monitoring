@@ -86,11 +86,13 @@ renderSystemChecks(SystemChecks) ->
 		fun (CheckId, CheckInfo, {Html, Healthy, CheckCount}) ->
 			CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
 			TechDetail = binary_to_list(maps:get(<<"techDetail">>, CheckInfo, <<"-">>)),
+			Debug = binary_to_list(maps:get(<<"debug">>, CheckInfo, <<"">>)),
 			CheckHtml = "
 				<tr class=\""++getCssClass("check", CheckHealthy)++"\">
 					<td class=\"checkid\">"++binary_to_list(CheckId)++"</td>
 					<td class=\"status\">"++atom_to_list(CheckHealthy)++"</td>
 					<td class=\"techDetail\">"++TechDetail++"</td>
+					<td class=\"debug\">"++Debug++"</td>
 				</tr>
 			",
 			{Html++CheckHtml, (Healthy and CheckHealthy), CheckCount+1}
@@ -101,7 +103,7 @@ renderSystemChecks(SystemChecks) ->
 		_Count ->
 			{Healthy, "
 				<table>
-					<thead><td>Check</td><td>Status</td><td>Technical Detail</td></thead>
+					<thead><td>Check</td><td>Status</td><td>Technical Detail</td><td class=\"debug\">Debug</td></thead>
 					"++Html++"
 				</table>"}
 	end.
@@ -156,11 +158,12 @@ controller(_Method, Path, StatePid) ->
 			table { border-collapse: collapse; }
 			td { border: none thin #ccc; padding: 0.2em 1em; }
 			thead td { font-weight: bold; border-bottom-style: solid; }
-			tr > td:not(:last-child) { border-right-style: solid; }
+			tr > td:not(:first-child) { border-left-style: solid; }
 			tr:not(:last-child) > td { border-bottom-style: solid; }
 			tr.check td.status { background-color: #666; color: #fff; }
 			.system.healthy h2, tr.check.healthy td.status { background-color: #060; }
 			.system.erroring h2, tr.check.erroring td.status { background-color: #900; }
+			.system.healthy .debug { display: none; }
 			"};
 		_ ->
 			{404, "text/plain", "Not Found"}
