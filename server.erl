@@ -145,7 +145,6 @@ controller(_Method, Path, StatePid) ->
 	case Path of
 		"/" ->
 			Checks = gen_server:call(StatePid, {fetch, checks, all}),
-			io:format("Render checks: ~p~n", [Checks]),
 			ChecksOutput = renderChecks(Checks),
 			{200, "text/html", "<html><head><title>Lucos Monitoring</title><link rel=\"stylesheet\" type=\"text/css\" href=\"/style.css\" /></head><body><h1>Monitoring for Lucos Services</h1>" ++ ChecksOutput ++ "</body></html>"};
 		"/style.css" ->

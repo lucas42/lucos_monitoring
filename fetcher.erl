@@ -21,7 +21,6 @@ spawnFetcher(StatePid, Device) ->
 
 fetch(StatePid, Host) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
-	io:format("Fetch: ~p~n", [InfoURL]),
 	case httpc:request(InfoURL) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
 			{System, Checks, Metrics} = parseInfo(Body),
