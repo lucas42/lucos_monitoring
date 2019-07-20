@@ -17,6 +17,8 @@ jobs:
             echo "$DOCKERHUB_PASSWORD" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
             docker push $IMAGE_NAME:latest
   deploy:
+    environment:
+      PROJECT: lucos_monitoring
     docker:
       - image: circleci/buildpack-deps:buster
     steps:
@@ -32,10 +34,10 @@ jobs:
           command: echo "Deploying onto host \"$PRODUCTION_HOST\""
       - run:
           name: Pull container onto remote box
-          command: DOCKER_HOST="ssh://$DEPLOY_USERNAME@$PRODUCTION_HOST" docker-compose pull
+          command: DOCKER_HOST="ssh://$DEPLOY_USERNAME@$PRODUCTION_HOST" docker-compose pull -p $PROJECT
       - run:
           name: Deploy using docker-compose
-          command: DOCKER_HOST="ssh://$DEPLOY_USERNAME@$PRODUCTION_HOST" docker-compose up -d --no-build
+          command: DOCKER_HOST="ssh://$DEPLOY_USERNAME@$PRODUCTION_HOST" docker-compose up -d --no-build -p $PROJECT
 workflows:
   version: 2
   build-deploy:
