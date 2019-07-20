@@ -21,11 +21,14 @@ spawnFetcher(StatePid, Device) ->
 
 fetch(StatePid, Host) ->
 	{TLSCheck} = checkTlsExpiry(Host),
-	{InfoCheck, System, Checks, Metrics} = fetchInfo(Host),
-	AllChecks = maps:merge(#{
-		<<"fetch-info">> => InfoCheck,
-		<<"tls-certificate">> => TLSCheck
-	}, Checks),
+	{InfoCheck, System, Checks, Metrics, CircleCISlug} = fetchInfo(Host),
+	CIChecks = checkCI(CircleCISlug),
+	AllChecks = maps:merge(
+		maps:merge(#{
+			<<"fetch-info">> => InfoCheck,
+			<<"tls-certificate">> => TLSCheck
+		}, CIChecks)
+	, Checks),
 	ok = gen_server:cast(StatePid, {updateSystem, Host, System, AllChecks, Metrics}),
 	timer:sleep(timer:seconds(60)),
 	fetch(StatePid, Host).
@@ -68,7 +71,8 @@ parseInfo(Body) ->
 	System = binary_to_list(maps:get(<<"system">>, Info)),
 	Checks = maps:get(<<"checks">>, Info, #{}),
 	Metrics = maps:get(<<"metrics">>, Info, #{}),
-	{System, Checks, Metrics}.
+	CircleCISlug = maps:get(<<"circle">>, maps:get(<<"ci">>, Info, #{}), null),
+	{System, Checks, Metrics, CircleCISlug}.
 
 
 parseError(Error) ->
@@ -92,12 +96,12 @@ fetchInfo(Host) ->
 	TechDetail = list_to_binary("Makes HTTP request to "++InfoURL++""),
 	case httpc:request(get, {InfoURL, []}, [{timeout, timer:seconds(1)}], []) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
-			{System, Checks, Metrics} = parseInfo(Body),
+			{System, Checks, Metrics, CircleCISlug} = parseInfo(Body),
 			InfoCheck = #{
 				<<"ok">> => true,
 				<<"techDetail">> => TechDetail
 			},
-			{InfoCheck, System, Checks, Metrics};
+			{InfoCheck, System, Checks, Metrics, CircleCISlug};
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 			Error = {http_error, {StatusCode, ReasonPhrase}},
 			InfoCheck = #{
@@ -105,12 +109,47 @@ fetchInfo(Host) ->
 				<<"techDetail">> => TechDetail,
 				<<"debug">> => list_to_binary(parseError(Error))
 			},
-			{InfoCheck, unknown, #{}, #{}};
+			{InfoCheck, unknown, #{}, #{}, null};
 		{error, Error} ->
 			InfoCheck = #{
 				<<"ok">> => false,
 				<<"techDetail">> => TechDetail,
 				<<"debug">> => list_to_binary(parseError(Error))
 			},
-			{InfoCheck, unknown, #{}, #{}}
+			{InfoCheck, unknown, #{}, #{}, null}
+	end.
+
+checkCI(CircleCISlug) ->
+	case CircleCISlug of
+		null -> #{};
+		_ ->
+			ApiUrl = "https://circleci.com/api/v1.1/project/"++binary_to_list(CircleCISlug)++"?circle-token="++os:getenv("CIRCLECI_API_TOKEN", "")++"&limit=1&filter=complete",
+			case httpc:request(get, {ApiUrl, [{"Accept","application/json"}]}, [{timeout, timer:seconds(1)}], []) of
+				{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
+					Response = jiffy:decode(Body, [return_maps]),
+					Build = lists:nth(1, Response),
+					Outcome = binary_to_list(maps:get(<<"outcome">>, Build, <<"unknown">>)),
+					BuildUrl = maps:get(<<"build_url">>, Build, <<"">>),
+					case Outcome of
+						"success" ->
+							#{<<"circleci">> => #{
+								<<"ok">> => true,
+								<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+								<<"link">> => BuildUrl
+							}};
+						_ ->
+							#{<<"circleci">> => #{
+								<<"ok">> => false,
+								<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+								<<"debug">> => list_to_binary("Most recent build's status was \""++Outcome++"\""),
+								<<"link">> => BuildUrl
+							}}
+					end;
+				_ ->
+					#{<<"circleci">> => #{
+						<<"ok">> => false,
+						<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+						<<"debug">> => <<"Failed making call to circleCI API">>
+					}}
+			end
 	end.
