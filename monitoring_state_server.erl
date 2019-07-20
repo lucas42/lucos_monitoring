@@ -16,10 +16,10 @@ handle_cast(Request, {ChecksMap, MetricsMap}) ->
 			NewChecksMap = maps:put(Host, {success, System, SystemChecks}, ChecksMap),
 			NewMetricsMap = maps:put(Host, {success, System, SystemMetrics}, MetricsMap),
 			{noreply, {NewChecksMap, NewMetricsMap}};
-		{systemError, Host, StatusCode, Reason} ->
-			io:format("Hit error on host ~p Status: ~p ~p~n", [Host, StatusCode, Reason]),
-			NewChecksMap = maps:put(Host, {error, StatusCode, Reason}, ChecksMap),
-			NewMetricsMap = maps:put(Host, {error, StatusCode, Reason}, MetricsMap),
+		{systemError, Host, Error} ->
+			io:format("Hit error on host ~p~n", [Host]),
+			NewChecksMap = maps:put(Host, {error, Error}, ChecksMap),
+			NewMetricsMap = maps:put(Host, {error, Error}, MetricsMap),
 			{noreply, {NewChecksMap, NewMetricsMap}}
 	end.
 

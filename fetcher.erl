@@ -27,16 +27,16 @@ fetch(StatePid, Host) ->
 			{System, Checks, Metrics} = parseInfo(Body),
 			ok = gen_server:cast(StatePid, {updateSystem, Host, System, Checks, Metrics});
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
-			ok = gen_server:cast(StatePid, {systemError, Host, StatusCode, ReasonPhrase});
-		{error, Reason} ->
-			ok = gen_server:cast(StatePid, {systemError, Host, 0, Reason})
+			ok = gen_server:cast(StatePid, {systemError, Host, {http_error, {StatusCode, ReasonPhrase}}});
+		{error, Error} ->
+			ok = gen_server:cast(StatePid, {systemError, Host, Error})
 	end,
 	timer:sleep(timer:seconds(60)),
 	fetch(StatePid, Host).
 
 parseInfo(Body) ->
 	Info = jiffy:decode(Body, [return_maps]),
-	System = maps:get(<<"system">>, Info),
+	System = binary_to_list(maps:get(<<"system">>, Info)),
 	Checks = maps:get(<<"checks">>, Info, #{}),
 	Metrics = maps:get(<<"metrics">>, Info, #{}),
 	{System, Checks, Metrics}.
