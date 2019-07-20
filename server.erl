@@ -118,9 +118,9 @@ renderSystemHeader(System, Host) ->
 			</h2>"
 	end.
 
-renderChecks(Checks) ->
+renderAll(Systems) ->
 	maps:fold(
-		fun (Host, {System, SystemChecks}, Output) ->
+		fun (Host, {System, SystemChecks, _SystemMetrics}, Output) ->
 			{Healthy, SystemChecksHtml} = renderSystemChecks(SystemChecks),
 			Output++"
 			<div class=\""++getCssClass("system", Healthy)++"\">
@@ -128,13 +128,13 @@ renderChecks(Checks) ->
 				"++SystemChecksHtml++"
 			</div>
 			"
-		end, "", Checks).
+		end, "", Systems).
 
 controller(_Method, Path, StatePid) ->
 	case Path of
 		"/" ->
-			Checks = gen_server:call(StatePid, {fetch, checks, all}),
-			ChecksOutput = renderChecks(Checks),
+			Systems = gen_server:call(StatePid, {fetch, all}),
+			ChecksOutput = renderAll(Systems),
 			{200, "text/html", "<html><head><title>Lucos Monitoring</title><link rel=\"stylesheet\" type=\"text/css\" href=\"/style.css\" /></head><body><h1>Monitoring for Lucos Services</h1>" ++ ChecksOutput ++ "</body></html>"};
 		"/style.css" ->
 			{200, "text/css", "

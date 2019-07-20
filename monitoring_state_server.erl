@@ -5,28 +5,21 @@
 start_link() -> gen_server:start_link(?MODULE, [], []).
 
 init([]) ->
-	ChecksMap = #{},
-	MetricsMap = #{},
-	{ok, {ChecksMap, MetricsMap}}.
+	SystemMap = #{},
+	{ok, SystemMap}.
 
-handle_cast(Request, {ChecksMap, MetricsMap}) ->
+handle_cast(Request, SystemMap) ->
 	case Request of
 		{updateSystem, Host, System, SystemChecks, SystemMetrics} ->
 			io:format("Received update for system ~p (Host ~p)~n", [System, Host]),
-			NewChecksMap = maps:put(Host, {System, SystemChecks}, ChecksMap),
-			NewMetricsMap = maps:put(Host, {System, SystemMetrics}, MetricsMap),
-			{noreply, {NewChecksMap, NewMetricsMap}}
+			NewSystemMap = maps:put(Host, {System, SystemChecks, SystemMetrics}, SystemMap),
+			{noreply, NewSystemMap}
 	end.
 
-handle_call(Request, _From, State) ->
-	{ChecksMap, MetricsMap} = State,
+handle_call(Request, _From, SystemMap) ->
 	case Request of
-		{fetch, checks, all} ->
-			{reply, ChecksMap, State};
-		{fetch, metrics, all} ->
-			{reply, MetricsMap, State};
-		{fetch, checks, Host} ->
-			{reply, maps:get(Host, ChecksMap), State};
-		{fetch, metrics, Host} ->
-			{reply, maps:get(Host, MetricsMap), State}
+		{fetch, all} ->
+			{reply, SystemMap, SystemMap};
+		{fetch, Host} ->
+			{reply, maps:get(Host, SystemMap), SystemMap}
 	end.
