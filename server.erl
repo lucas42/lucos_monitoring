@@ -77,6 +77,8 @@ renderError(Error) ->
 			"DNS failure when trying to resolve "++Host;
 		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],econnrefused}]} ->
 			"Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port);
+		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],etimedout}]} ->
+			"TCP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port);
 		{ErrorType, _Details} ->
 			"An unknown error of type "++atom_to_list(ErrorType)++" occured: "++lists:flatten(io_lib:format("~p",[Error]))
 	end.
