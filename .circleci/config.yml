@@ -18,7 +18,7 @@ jobs:
             docker push $IMAGE_NAME:latest
   deploy:
     environment:
-      PROJECT: lucos_monitoring
+      COMPOSE_PROJECT_NAME: lucos_monitoring
     docker:
       - image: circleci/buildpack-deps:buster
     steps:
@@ -34,10 +34,10 @@ jobs:
           command: echo "Deploying onto host \"$PRODUCTION_HOST\""
       - run:
           name: Pull container onto remote box
-          command: DOCKER_HOST="ssh://$DEPLOY_USERNAME@$PRODUCTION_HOST" docker-compose pull -p $PROJECT
+          command: DOCKER_HOST="ssh://$DEPLOY_USERNAME@$PRODUCTION_HOST" docker-compose pull
       - run:
           name: Deploy using docker-compose
-          command: DOCKER_HOST="ssh://$DEPLOY_USERNAME@$PRODUCTION_HOST" docker-compose up -d --no-build -p $PROJECT
+          command: DOCKER_HOST="ssh://$DEPLOY_USERNAME@$PRODUCTION_HOST" docker-compose up -d --no-build
 workflows:
   version: 2
   build-deploy:
