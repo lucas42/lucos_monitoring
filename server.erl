@@ -28,24 +28,24 @@ accept(ListenSocket, SchedulerID, StatePid) ->
 
 handleRequest(Socket, StatePid) ->
 	case gen_tcp:recv(Socket, 0) of
-		{ok, {http_request, Method, {abs_path, Path}, _Version}} ->
-			handleRequest(Socket, Method, binary_to_list(Path), StatePid);
+		{ok, {http_request, Method, {abs_path, RequestUri}, _Version}} ->
+			handleRequest(Socket, Method, binary_to_list(RequestUri), StatePid);
 		Error ->
 			Error
 	end.
-handleRequest(Socket, Method, Path, StatePid) ->
+handleRequest(Socket, Method, RequestUri, StatePid) ->
 	case gen_tcp:recv(Socket, 0) of
 		{ok, http_eoh} ->
 			DateTime = calendar:system_time_to_rfc3339(erlang:system_time(second)),
 			ClientIP = getClientIP(Socket),
-			{StatusCode, ContentType, Body} = tryController(Method, Path, StatePid),
+			{StatusCode, ContentType, Body} = tryController(Method, RequestUri, StatePid),
 			Response = getHeaders(StatusCode, ContentType) ++ Body,
 			gen_tcp:send(Socket, Response),
 			gen_tcp:close(Socket),
-			io:format("~p ~p ~p ~p ~p~n", [ClientIP, DateTime, Method, StatusCode, Path]),
+			io:format("~p ~p ~p ~p ~p~n", [ClientIP, DateTime, Method, StatusCode, RequestUri]),
 			ok;
 		{ok, _Data} ->
-			handleRequest(Socket, Method, Path, StatePid);
+			handleRequest(Socket, Method, RequestUri, StatePid);
 
 		Error ->
 			Error
@@ -155,7 +155,8 @@ renderAll(Systems) ->
 			"
 		end, "", Systems).
 
-controller(_Method, Path, StatePid) ->
+controller(_Method, RequestUri, StatePid) ->
+	Path = re:replace(RequestUri, "\\?.*$", "", [{return,list}]),
 	case Path of
 		"/" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
@@ -182,8 +183,8 @@ controller(_Method, Path, StatePid) ->
 			{404, "text/plain", "Not Found"}
 	end.
 
-tryController(Method, Path, StatePid) ->
-	try controller(Method, Path, StatePid) of
+tryController(Method, RequestUri, StatePid) ->
+	try controller(Method, RequestUri, StatePid) of
 		Response -> Response
 	catch
 		ExceptionClass:Term:StackTrace ->
