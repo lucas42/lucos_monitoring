@@ -155,6 +155,18 @@ renderAll(Systems) ->
 			"
 		end, "", Systems).
 
+encodeInfo(Systems) ->
+	jiffy:encode(#{
+		system => <<"lucos_monitoring">>,
+		checks => #{},
+		metrics => #{
+			<<"system-count">> => #{
+				<<"value">> => maps:size(Systems),
+				<<"techDetail">> => <<"The number of systems being monitored">>
+			}
+		}
+	}).
+
 controller(_Method, RequestUri, StatePid) ->
 	Path = re:replace(RequestUri, "\\?.*$", "", [{return,list}]),
 	case Path of
@@ -179,6 +191,9 @@ controller(_Method, RequestUri, StatePid) ->
 			.system.healthy .debug { display: none; }
 			.metrics { margin-top: 2em; }
 			"};
+		"/_info" ->
+			Systems = gen_server:call(StatePid, {fetch, all}),
+			{200, "application/json", encodeInfo(Systems)};
 		_ ->
 			{404, "text/plain", "Not Found"}
 	end.
