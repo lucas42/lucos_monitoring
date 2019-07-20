@@ -21,7 +21,7 @@ spawnFetcher(StatePid, Device) ->
 
 fetch(StatePid, Host) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
-	case httpc:request(InfoURL) of
+	case httpc:request(get, {InfoURL, []}, [{timeout, timer:seconds(1)}], []) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
 			{System, Checks, Metrics} = parseInfo(Body),
 			{TLSCheck} = checkTlsExpiry(Host),
