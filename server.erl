@@ -38,7 +38,7 @@ handleRequest(Socket, Method, Path, StatePid) ->
 		{ok, http_eoh} ->
 			DateTime = calendar:system_time_to_rfc3339(erlang:system_time(second)),
 			ClientIP = getClientIP(Socket),
-			{StatusCode, ContentType, Body} = controller(Method, Path, StatePid),
+			{StatusCode, ContentType, Body} = tryController(Method, Path, StatePid),
 			Response = getHeaders(StatusCode, ContentType) ++ Body,
 			gen_tcp:send(Socket, Response),
 			gen_tcp:close(Socket),
@@ -66,7 +66,8 @@ getStatusLine(StatusCode) ->
 getReasonPhrase(StatusCode) ->
 	case StatusCode of
 		200 -> "OK";
-		404 -> "Not Found"
+		404 -> "Not Found";
+		500 -> "Internal Error"
 	end.
 
 renderSystemChecks(SystemChecks) ->
@@ -179,4 +180,13 @@ controller(_Method, Path, StatePid) ->
 			"};
 		_ ->
 			{404, "text/plain", "Not Found"}
+	end.
+
+tryController(Method, Path, StatePid) ->
+	try controller(Method, Path, StatePid) of
+		Response -> Response
+	catch
+		ExceptionClass:Term:StackTrace ->
+			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace]),
+			{500, "text/plain", "An Error occurred whilst generating this page."}
 	end.
