@@ -1,5 +1,5 @@
 -module(fetcher).
--export([start/1, fetch/2]).
+-export([start/1, tryRunChecks/2]).
 
 start(StatePid) ->
 	ok = application:start(crypto),
@@ -15,11 +15,21 @@ spawnFetcher(StatePid, Device) ->
 		eof  -> ok;
 		Line -> 
 			Host = string:trim(Line),
-			spawn(?MODULE, fetch, [StatePid, Host]),
+			spawn(?MODULE, tryRunChecks, [StatePid, Host]),
 			spawnFetcher(StatePid, Device)
 	end.
 
-fetch(StatePid, Host) ->
+tryRunChecks(StatePid, Host) ->
+	try runChecks(StatePid, Host) of
+		_ -> ok
+	catch
+		ExceptionClass:Term:StackTrace ->
+			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace])
+	end,
+	timer:sleep(timer:seconds(60)),
+	tryRunChecks(StatePid, Host).
+
+runChecks(StatePid, Host) ->
 	{TLSCheck} = checkTlsExpiry(Host),
 	{InfoCheck, System, Checks, Metrics, CircleCISlug} = fetchInfo(Host),
 	CIChecks = checkCI(CircleCISlug),
@@ -29,9 +39,7 @@ fetch(StatePid, Host) ->
 			<<"tls-certificate">> => TLSCheck
 		}, CIChecks)
 	, Checks),
-	ok = gen_server:cast(StatePid, {updateSystem, Host, System, AllChecks, Metrics}),
-	timer:sleep(timer:seconds(60)),
-	fetch(StatePid, Host).
+	ok = gen_server:cast(StatePid, {updateSystem, Host, System, AllChecks, Metrics}).
 
 checkTlsExpiry(Host) ->
 	TechDetail = <<"Checks whether the TLS Certificate is valid and not about to expire">>,
