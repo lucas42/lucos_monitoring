@@ -81,8 +81,10 @@ renderCheckStatus(Health, Link) ->
 	end.
 
 renderSystemChecks(SystemChecks) ->
-	{Html, Healthy, CheckCount} = maps:fold(
-		fun (CheckId, CheckInfo, {Html, Healthy, CheckCount}) ->
+	"<table>
+		<thead><td>Check</td><td>Status</td><td>Technical Detail</td><td class=\"debug\">Debug</td></thead>
+		" ++ maps:fold(
+		fun (CheckId, CheckInfo, Html) ->
 			CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
 			TechDetail = addZeroWidthSpaces(binary_to_list(maps:get(<<"techDetail">>, CheckInfo, <<"-">>))),
 			Debug = addZeroWidthSpaces(binary_to_list(maps:get(<<"debug">>, CheckInfo, <<"">>))),
@@ -95,18 +97,9 @@ renderSystemChecks(SystemChecks) ->
 					<td class=\"debug\">"++Debug++"</td>
 				</tr>
 			",
-			{Html++CheckHtml, (Healthy and CheckHealthy), CheckCount+1}
-		end, {"", true, 0}, SystemChecks),
-	case CheckCount of
-		0 ->
-			{Healthy, "<span class=\"empty\">No checks found</span>"};
-		_Count ->
-			{Healthy, "
-				<table>
-					<thead><td>Check</td><td>Status</td><td>Technical Detail</td><td class=\"debug\">Debug</td></thead>
-					"++Html++"
-				</table>"}
-	end.
+			Html++CheckHtml
+		end, "", SystemChecks) ++ "
+	</table>".
 
 systemHealthy(SystemChecks) ->
 	maps:fold(fun (_CheckId, CheckInfo, AccHealthy) ->
@@ -144,37 +137,36 @@ getCssClass(Type, Healthy) ->
 		false -> Type ++ " erroring"
 	end.
 
-renderSystemHeader(System, Host) ->
+renderSystemHeader(Name, Host) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
-	case System of
+	case Name of
 		unknown ->
 			"<h2>
 				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
 				"++Host++"
 			</h2>";
-		System ->
-			Name = re:replace(System, "_", " ", [global, {return,list}]),
+		_ ->
+			ReadableName = re:replace(Name, "_", " ", [global, {return,list}]),
 			"<h2 class=\"system-name\">
 				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
-				"++Name++"
+				"++ReadableName++"
 			</h2>"
 	end.
 
 renderAll(SystemMap) ->
 	SystemList = maps:to_list(SystemMap),
 	SortedSystems = lists:sort(
-		fun ({HostA, {NameA, SystemAChecks, _}}, {HostB, {NameB, SystemBChecks, _}}) ->
-			HealthyA = systemHealthy(SystemAChecks),
-			HealthyB = systemHealthy(SystemBChecks),
+		fun ({HostA, {NameA, ChecksA, _}}, {HostB, {NameB, ChecksB, _}}) ->
+			HealthyA = systemHealthy(ChecksA),
+			HealthyB = systemHealthy(ChecksB),
 			{HealthyA, NameA, HostA} < {HealthyB, NameB, HostB}
 		end, SystemList),
 	lists:foldl(
-		fun ({Host, {System, SystemChecks, SystemMetrics}}, Output) ->
-			{Healthy, SystemChecksHtml} = renderSystemChecks(SystemChecks),
+		fun ({Host, {SystemName, SystemChecks, SystemMetrics}}, Output) ->
 			Output++"
-			<div class=\""++getCssClass("system", Healthy)++"\">
-				"++renderSystemHeader(System, Host)++"
-				"++SystemChecksHtml++"
+			<div class=\""++getCssClass("system", systemHealthy(SystemChecks))++"\">
+				"++renderSystemHeader(SystemName, Host)++"
+				"++renderSystemChecks(SystemChecks)++"
 				"++renderSystemMetrics(SystemMetrics)++"
 			</div>
 			"
