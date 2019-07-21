@@ -108,6 +108,13 @@ renderSystemChecks(SystemChecks) ->
 				</table>"}
 	end.
 
+systemHealthy(SystemChecks) ->
+	maps:fold(fun (_CheckId, CheckInfo, AccHealthy) ->
+		CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
+		(AccHealthy and CheckHealthy)
+	end, true, SystemChecks).
+
+
 renderSystemMetrics(SystemMetrics) ->
 	Html = maps:fold(
 		fun (MetricId, MetricInfo, Html) ->
@@ -153,9 +160,16 @@ renderSystemHeader(System, Host) ->
 			</h2>"
 	end.
 
-renderAll(Systems) ->
-	maps:fold(
-		fun (Host, {System, SystemChecks, SystemMetrics}, Output) ->
+renderAll(SystemMap) ->
+	SystemList = maps:to_list(SystemMap),
+	SortedSystems = lists:sort(
+		fun ({HostA, {NameA, SystemAChecks, _}}, {HostB, {NameB, SystemBChecks, _}}) ->
+			HealthyA = systemHealthy(SystemAChecks),
+			HealthyB = systemHealthy(SystemBChecks),
+			{HealthyA, NameA, HostA} < {HealthyB, NameB, HostB}
+		end, SystemList),
+	lists:foldl(
+		fun ({Host, {System, SystemChecks, SystemMetrics}}, Output) ->
 			{Healthy, SystemChecksHtml} = renderSystemChecks(SystemChecks),
 			Output++"
 			<div class=\""++getCssClass("system", Healthy)++"\">
@@ -164,7 +178,7 @@ renderAll(Systems) ->
 				"++renderSystemMetrics(SystemMetrics)++"
 			</div>
 			"
-		end, "", Systems).
+		end, "", SortedSystems).
 
 encodeInfo(Systems) ->
 	jiffy:encode(#{
