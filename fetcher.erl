@@ -8,7 +8,8 @@ start(StatePid) ->
 	ok = application:start(ssl),
 	ok = application:start(inets),
 	{ok, Device} = file:open("./service-list", [read]),
-	spawnFetcher(StatePid, Device).
+	spawnFetcher(StatePid, Device),
+	file:close(Device).
 
 spawnFetcher(StatePid, Device) ->
 	case io:get_line(Device, "") of
