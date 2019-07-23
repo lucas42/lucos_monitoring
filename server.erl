@@ -57,7 +57,7 @@ getClientIP(Socket) ->
 
 getHeaders(StatusCode, ContentType) ->
 	getStatusLine(StatusCode) ++
-		"ContentType: " ++ ContentType ++ "\n" ++
+		"Content-Type: " ++ ContentType ++ "\n" ++
 		"\n".
 
 getStatusLine(StatusCode) ->
@@ -197,6 +197,7 @@ controller(_Method, RequestUri, StatePid) ->
 				<head>
 					<title>Lucos Monitoring</title>
 					<link rel=\"stylesheet\" type=\"text/css\" href=\"/style.css\" />
+					<link rel=\"icon\" href=\"/icon\" />
 					<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
 				</head>
 				<body>
@@ -233,6 +234,9 @@ controller(_Method, RequestUri, StatePid) ->
 		"/_info" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
 			{200, "application/json", encodeInfo(Systems)};
+		"/icon" ->
+			{ok, IconFile} = file:read_file("icon.png"),
+			{200, "image/png", IconFile};
 		_ ->
 			{404, "text/plain", "Not Found"}
 	end.
