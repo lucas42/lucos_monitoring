@@ -141,13 +141,13 @@ renderSystemHeader(Name, Host) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
 	case Name of
 		unknown ->
-			"<h2>
+			"<h2 id=\"host-"++Host++"\">
 				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
 				"++Host++"
 			</h2>";
 		_ ->
 			ReadableName = re:replace(Name, "_", " ", [global, {return,list}]),
-			"<h2 class=\"system-name\">
+			"<h2 id=\"host-"++Host++"\" class=\"system-name\">
 				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
 				"++ReadableName++"
 			</h2>"

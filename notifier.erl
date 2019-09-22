@@ -6,7 +6,7 @@ notify(Host, SystemName, SystemChecks, SystemMetrics) ->
 	System = getSystemTitle(Host, SystemName),
 	% Use Host for consistent Subject lines so things get bundled into nice threads
 	EmailSubject = "Monitoring issue on "++Host,
-	EmailBody = getEmailBody(System, SystemChecks, SystemMetrics),
+	EmailBody = getEmailBody(Host, System, SystemChecks, SystemMetrics),
 	sendEmail(EmailSubject, EmailBody),
 	io:format("Send notifications for ~p~n", [System]).
 
@@ -19,7 +19,14 @@ getSystemTitle(Host, Name) ->
 			re:replace(Name, "_", " ", [global, {return,list}])
 	end.
 
-getEmailBody(System, SystemChecks, SystemMetrics) ->
+getEmailBody(Host, System, SystemChecks, SystemMetrics) ->
+	getEmailSummary(System, SystemChecks)
+	++ "\r\n\r\n" ++
+	getSystemLink(Host)
+	++ "\r\n\r\n" ++
+	getMetricSummary(SystemMetrics).
+
+getEmailSummary(System, SystemChecks) ->
 	FailingChecks = maps:filter(fun(_,C) -> isCheckFailing(C) end, SystemChecks),
 	FailingCheckNames = maps:keys(FailingChecks),
 	FailCount = maps:size(FailingChecks),
@@ -31,6 +38,17 @@ getEmailBody(System, SystemChecks, SystemMetrics) ->
 			"The "++FailingCheckName++" check is failing on "++System;
 		_ ->
 			"There are "++integer_to_list(FailCount)++" failing checks on "++System
+	end.
+
+getSystemLink(Host) ->
+	"https://monitoring.l42.eu/#host-"++Host.
+
+getMetricSummary(SystemMetrics) ->
+	case maps:size(SystemMetrics) of
+		0 ->
+			"";
+		_ ->
+			io_lib:format("** System Metrics **~n~p~n",[SystemMetrics])
 	end.
 
 isCheckFailing(CheckInfo) ->
