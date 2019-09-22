@@ -4,7 +4,10 @@
 
 notify(Host, SystemName, SystemChecks, SystemMetrics) ->
 	System = getSystemTitle(Host, SystemName),
-	sendEmail("Monitoring Test", "This is the email body 5"),
+	% Use Host for consistent Subject lines so things get bundled into nice threads
+	EmailSubject = "Monitoring issue on "++Host,
+	EmailBody = getEmailBody(System, SystemChecks, SystemMetrics),
+	sendEmail(EmailSubject, EmailBody),
 	io:format("Send notifications for ~p~n", [System]).
 
 
@@ -15,6 +18,19 @@ getSystemTitle(Host, Name) ->
 		_ ->
 			Name
 	end.
+
+getEmailBody(System, SystemChecks, SystemMetrics) ->
+	FailingChecks = maps:filter(fun(_,C) -> isCheckFailing(C) end, SystemChecks),
+	FailCount = maps:size(FailingChecks),
+	case FailCount of
+		0 ->
+			"Everything OK on "++System;
+		_ ->
+			integer_to_list(FailCount)++" failing checks on "++System
+	end.
+
+isCheckFailing(CheckInfo) ->
+	not maps:get(<<"ok">>, CheckInfo, false).
 
 sendEmail(Subject, Body) ->
 	SendAddress =  os:getenv("SEND_ADDRESS"),
