@@ -16,17 +16,21 @@ getSystemTitle(Host, Name) ->
 		unknown ->
 			Host;
 		_ ->
-			Name
+			re:replace(Name, "_", " ", [global, {return,list}])
 	end.
 
 getEmailBody(System, SystemChecks, SystemMetrics) ->
 	FailingChecks = maps:filter(fun(_,C) -> isCheckFailing(C) end, SystemChecks),
+	FailingCheckNames = maps:keys(FailingChecks),
 	FailCount = maps:size(FailingChecks),
 	case FailCount of
 		0 ->
 			"Everything OK on "++System;
+		1 ->
+			FailingCheckName = binary_to_list(lists:last(FailingCheckNames)),
+			"The "++FailingCheckName++" check is failing on "++System;
 		_ ->
-			integer_to_list(FailCount)++" failing checks on "++System
+			"There are "++integer_to_list(FailCount)++" failing checks on "++System
 	end.
 
 isCheckFailing(CheckInfo) ->
