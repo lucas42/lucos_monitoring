@@ -5,8 +5,15 @@ Monitoring tool for lucos services
 * docker
 * docker-compose
 
+## Environment Variables
+
+* SEND_ADDRESS - the email address notifications will come from
+* SEND_PASSWORD - the password for the above email address
+* SMTP_RELAY - the SMTP Relay used to log into the above email address
+* TO_ADDRESS - The email address to send notifications to
+
 ## Running
 `nice -19 docker-compose up -d --no-build`
 
 ## Building
-The build is configured to run in Dockerhub when a commit is pushed to the master branch in github.
+The build is configured to run on CircleCI when a commit is pushed to the master branch in github.
