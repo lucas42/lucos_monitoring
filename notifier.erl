@@ -2,11 +2,11 @@
 -export([notify/4]).
 
 
-notify(Host, SystemName, SystemChecks, SystemMetrics) ->
+notify(Host, SystemName, FailingChecks, SystemMetrics) ->
 	System = getSystemTitle(Host, SystemName),
 	% Use Host for consistent Subject lines so things get bundled into nice threads
 	EmailSubject = "Monitoring issue on "++Host,
-	EmailBody = getEmailBody(Host, System, SystemChecks, SystemMetrics),
+	EmailBody = getEmailBody(Host, System, FailingChecks, SystemMetrics),
 	sendEmail(EmailSubject, EmailBody),
 	io:format("Send notifications for ~p~n", [System]).
 
@@ -19,15 +19,14 @@ getSystemTitle(Host, Name) ->
 			re:replace(Name, "_", " ", [global, {return,list}])
 	end.
 
-getEmailBody(Host, System, SystemChecks, SystemMetrics) ->
-	getEmailSummary(System, SystemChecks)
+getEmailBody(Host, System, FailingChecks, SystemMetrics) ->
+	getEmailSummary(System, FailingChecks)
 	++ "\r\n\r\n" ++
 	getSystemLink(Host)
 	++ "\r\n\r\n" ++
 	getMetricSummary(SystemMetrics).
 
-getEmailSummary(System, SystemChecks) ->
-	FailingChecks = maps:filter(fun(_,C) -> isCheckFailing(C) end, SystemChecks),
+getEmailSummary(System, FailingChecks) ->
 	FailCountSummary = getFailCountSummary(maps:size(FailingChecks), System),
 	maps:fold(fun (CheckId, CheckInfo, Output) ->
 		Output ++ "The \""++binary_to_list(CheckId)++"\" check is failing.\r\n"
@@ -64,9 +63,6 @@ getMetricSummary(SystemMetrics) ->
 		_ ->
 			io_lib:format("** System Metrics **~n~p~n",[SystemMetrics])
 	end.
-
-isCheckFailing(CheckInfo) ->
-	maps:get(<<"ok">>, CheckInfo, unknown) /= true.
 
 sendEmail(Subject, Body) ->
 	SendAddress =  os:getenv("SEND_ADDRESS"),
