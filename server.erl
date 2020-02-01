@@ -70,8 +70,6 @@ getReasonPhrase(StatusCode) ->
 		500 -> "Internal Error"
 	end.
 
-addZeroWidthSpaces(String) ->
-	re:replace(String, "\\/+", "\\&#8203;&\\&#8203;", [global, {return,list}]).
 
 renderCheckStatus(Health, Link) ->
 	case Link of
@@ -80,22 +78,25 @@ renderCheckStatus(Health, Link) ->
 			"<a href=\""++Link++"\" target=\"_blank\">"++atom_to_list(Health)++"</a>"
 	end.
 
+formatString(Key, CheckInfo) ->
+	RawValue = binary_to_list(maps:get(Key, CheckInfo, <<"">>)),
+	Value = re:replace(RawValue, "https?:\\S+", "<a href=\"&\" target=\"_blank\">&</a>"),
+	"<td class=\"formattedString "++binary_to_list(Key)++"\">"++Value++"</td>\r\n".
+
 renderSystemChecks(SystemChecks) ->
 	"<table>
 		<thead><td>Check</td><td>Status</td><td>Technical Detail</td><td class=\"debug\">Debug</td></thead>
 		" ++ maps:fold(
 		fun (CheckId, CheckInfo, Html) ->
 			CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
-			TechDetail = addZeroWidthSpaces(binary_to_list(maps:get(<<"techDetail">>, CheckInfo, <<"-">>))),
-			Debug = addZeroWidthSpaces(binary_to_list(maps:get(<<"debug">>, CheckInfo, <<"">>))),
 			Link = binary_to_list(maps:get(<<"link">>, CheckInfo, <<"">>)),
 			CheckHtml = "
 				<tr class=\""++getCssClass("check", CheckHealthy)++"\">
 					<td class=\"checkid\">"++binary_to_list(CheckId)++"</td>
 					<td class=\"status\">"++renderCheckStatus(CheckHealthy, Link)++"</td>
-					<td class=\"techDetail\">"++TechDetail++"</td>
-					<td class=\"debug\">"++Debug++"</td>
-				</tr>
+					"++formatString(<<"techDetail">>, CheckInfo)
+					++formatString(<<"debug">>, CheckInfo)
+				++"</tr>
 			",
 			Html++CheckHtml
 		end, "", SystemChecks) ++ "
@@ -237,6 +238,7 @@ controller(_Method, RequestUri, StatePid) ->
 			body { padding-top: 35px; }
 			.status a { display: block; color:inherit; text-decoration: none; width: 100%; }
 			.status a:hover { text-decoration: underline; }
+			.formattedString a { word-break: break-word; }
 			"};
 		"/_info" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
