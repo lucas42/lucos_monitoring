@@ -49,7 +49,7 @@ checkTlsExpiry(Host) ->
 	case string:to_integer(Output) of
 		{error, _Reason} ->
 			Check = #{
-				<<"ok">> => false,
+				<<"ok">> => unknown,
 				<<"techDetail">> => TechDetail,
 				<<"debug">> => <<"Can't get expiry time for TLS Cert">>
 			},
@@ -160,7 +160,7 @@ checkCI(CircleCISlug) ->
 					end;
 				_ ->
 					#{<<"circleci">> => #{
-						<<"ok">> => false,
+						<<"ok">> => unknown,
 						<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
 						<<"debug">> => <<"Failed making call to circleCI API">>
 					}}

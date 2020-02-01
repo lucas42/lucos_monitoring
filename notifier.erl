@@ -66,7 +66,7 @@ getMetricSummary(SystemMetrics) ->
 	end.
 
 isCheckFailing(CheckInfo) ->
-	not maps:get(<<"ok">>, CheckInfo, false).
+	maps:get(<<"ok">>, CheckInfo, unknown) /= true.
 
 sendEmail(Subject, Body) ->
 	SendAddress =  os:getenv("SEND_ADDRESS"),

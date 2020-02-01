@@ -104,7 +104,12 @@ renderSystemChecks(SystemChecks) ->
 systemHealthy(SystemChecks) ->
 	maps:fold(fun (_CheckId, CheckInfo, AccHealthy) ->
 		CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
-		(AccHealthy and CheckHealthy)
+		case {AccHealthy, CheckHealthy} of
+			{false, _} -> false;
+			{true, _} -> CheckHealthy;
+			{_, true} -> unknown;
+			{_, _} -> CheckHealthy
+		end
 	end, true, SystemChecks).
 
 
@@ -134,7 +139,8 @@ renderSystemMetrics(SystemMetrics) ->
 getCssClass(Type, Healthy) ->
 	case Healthy of
 		true -> Type ++ " healthy";
-		false -> Type ++ " erroring"
+		false -> Type ++ " erroring";
+		_ -> Type ++ " health-unknown"
 	end.
 
 renderSystemHeader(Name, Host) ->
@@ -222,6 +228,7 @@ controller(_Method, RequestUri, StatePid) ->
 			tr.check td.status { background-color: #666; color: #fff; }
 			.system.healthy h2, tr.check.healthy td.status { background-color: #060; }
 			.system.erroring h2, tr.check.erroring td.status { background-color: #900; }
+			.system.health-unknown h2, tr.check.health-unknown td.status { background-color: #555; }
 			.system.healthy .debug { display: none; }
 			.metrics { margin-top: 2em; }
 			#lucos_navbar { height: 30px; z-index:1000; color: white; position: absolute; left: 0; right: 0; top: 0; font-size: 18px; background-color: black; background-image: -webkit-gradient(linear, 0 100%, 0 0, color-stop(0, transparent), color-stop(0.15, transparent), color-stop(0.9, rgba(255, 255, 255, 0.4))); font-family: Georgia, serif; }
