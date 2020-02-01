@@ -28,16 +28,30 @@ getEmailBody(Host, System, SystemChecks, SystemMetrics) ->
 
 getEmailSummary(System, SystemChecks) ->
 	FailingChecks = maps:filter(fun(_,C) -> isCheckFailing(C) end, SystemChecks),
-	FailingCheckNames = maps:keys(FailingChecks),
-	FailCount = maps:size(FailingChecks),
+	FailCountSummary = getFailCountSummary(maps:size(FailingChecks), System),
+	maps:fold(fun (CheckId, CheckInfo, Output) ->
+		Output ++ "The \""++binary_to_list(CheckId)++"\" check is failing.\r\n"
+		++ getSubsection("Tech Details", <<"techDetail">>, CheckInfo)
+		++ getSubsection("Debug", <<"debug">>, CheckInfo)
+		++ getSubsection("Link", <<"link">>, CheckInfo)
+		++ "\r\n"
+	end, FailCountSummary ++ "\r\n", FailingChecks).
+
+getSubsection(Label, Key, CheckInfo) ->
+	Value = binary_to_list(maps:get(Key, CheckInfo, <<"">>)),
+	case Value of
+		"" -> "";
+		_ -> Label ++ ": " ++ Value ++ "\r\n"
+	end.
+
+getFailCountSummary(FailCount, System) ->
 	case FailCount of
 		0 ->
-			"Everything OK on "++System;
+			"Everything OK on "++System++".";
 		1 ->
-			FailingCheckName = binary_to_list(lists:last(FailingCheckNames)),
-			"The "++FailingCheckName++" check is failing on "++System;
+			"There is 1 failing check on "++System++":";
 		_ ->
-			"There are "++integer_to_list(FailCount)++" failing checks on "++System
+			"There are "++integer_to_list(FailCount)++" failing checks on "++System++":"
 	end.
 
 getSystemLink(Host) ->
