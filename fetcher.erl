@@ -123,6 +123,13 @@ fetchInfo(Host) ->
 				<<"debug">> => list_to_binary(parseError(Error))
 			},
 			{InfoCheck, unknown, #{}, #{}, null};
+		{error, timeout} ->
+			InfoCheck = #{
+				<<"ok">> => uknown,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => <<"HTTP Request timed out">>
+			},
+			{InfoCheck, unknown, #{}, #{}, null};
 		{error, Error} ->
 			InfoCheck = #{
 				<<"ok">> => false,
