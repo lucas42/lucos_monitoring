@@ -86,8 +86,6 @@ parseInfo(Body) ->
 
 parseError(Error) ->
 	case Error of
-		{http_error, {StatusCode, ReasonPhrase}} ->
-			"Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase;
 		{failed_connect, [{to_address, {Host, _Port}}, {inet,[inet],nxdomain}]} ->
 			"DNS failure when trying to resolve "++Host;
 		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],econnrefused}]} ->
@@ -118,11 +116,10 @@ fetchInfo(Host) ->
 			},
 			{InfoCheck, System, Checks, Metrics, CircleCISlug};
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
-			Error = {http_error, {StatusCode, ReasonPhrase}},
 			InfoCheck = #{
 				<<"ok">> => false,
 				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary(parseError(Error))
+				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase)
 			},
 			{InfoCheck, unknown, #{}, #{}, null};
 		{error, timeout} ->
@@ -167,11 +164,17 @@ checkCI(CircleCISlug) ->
 								<<"link">> => BuildUrl
 							}}
 					end;
-				_ ->
+				{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 					#{<<"circleci">> => #{
 						<<"ok">> => unknown,
 						<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-						<<"debug">> => <<"Failed making call to circleCI API">>
+						<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase)
+					}};
+				{error, Error} ->
+					#{<<"circleci">> => #{
+						<<"ok">> => unknown,
+						<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+						<<"debug">> => list_to_binary(parseError(Error))
 					}}
 			end
 	end.
