@@ -87,21 +87,23 @@ parseInfo(Body) ->
 parseError(Error) ->
 	case Error of
 		{failed_connect, [{to_address, {Host, _Port}}, {inet,[inet],nxdomain}]} ->
-			"DNS failure when trying to resolve "++Host;
+			{false, "DNS failure when trying to resolve "++Host};
 		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],econnrefused}]} ->
-			"Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port);
+			{false, "Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port)};
 		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],etimedout}]} ->
-			"TCP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port);
+			{unknown, "TCP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)};
 		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],timeout}]} ->
-			"HTTP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port);
+			{unknown, "HTTP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)};
 		socket_closed_remotely ->
-			"Socket closed remotely";
+			{false, "Socket closed remotely"};
+		timeout ->
+			{unknown, "HTTP Request timed out"};
 		{ErrorType, _Details} ->
 			io:format("Unknown parse error handled: ~p~n",[Error]),
-			"An unknown error of type "++atom_to_list(ErrorType)++" occured: "++lists:flatten(io_lib:format("~p",[Error]));
+			{false, "An unknown error of type "++atom_to_list(ErrorType)++" occured: "++lists:flatten(io_lib:format("~p",[Error]))};
 		_ ->
 			io:format("Unknown parse error handled: ~p~n",[Error]),
-			"An unknown error occured: "++lists:flatten(io_lib:format("~p",[Error]))
+			{false, "An unknown error occured: "++lists:flatten(io_lib:format("~p",[Error]))}
 	end.
 
 fetchInfo(Host) ->
@@ -122,18 +124,12 @@ fetchInfo(Host) ->
 				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase)
 			},
 			{InfoCheck, unknown, #{}, #{}, null};
-		{error, timeout} ->
-			InfoCheck = #{
-				<<"ok">> => uknown,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => <<"HTTP Request timed out">>
-			},
-			{InfoCheck, unknown, #{}, #{}, null};
 		{error, Error} ->
+			{Ok, Debug} = parseError(Error),
 			InfoCheck = #{
-				<<"ok">> => false,
+				<<"ok">> => Ok,
 				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary(parseError(Error))
+				<<"debug">> => list_to_binary(Debug)
 			},
 			{InfoCheck, unknown, #{}, #{}, null}
 	end.
@@ -166,15 +162,16 @@ checkCI(CircleCISlug) ->
 					end;
 				{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 					#{<<"circleci">> => #{
-						<<"ok">> => unknown,
+						<<"ok">> => false,
 						<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
 						<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase)
 					}};
 				{error, Error} ->
+					{Ok, Debug} = parseError(Error),
 					#{<<"circleci">> => #{
-						<<"ok">> => unknown,
+						<<"ok">> => Ok,
 						<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-						<<"debug">> => list_to_binary(parseError(Error))
+						<<"debug">> => list_to_binary(Debug)
 					}}
 			end
 	end.
