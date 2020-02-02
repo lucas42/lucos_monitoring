@@ -96,6 +96,8 @@ parseError(Error) ->
 			"TCP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port);
 		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],timeout}]} ->
 			"HTTP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port);
+		socket_closed_remotely ->
+			"Socket closed remotely";
 		{ErrorType, _Details} ->
 			io:format("Unknown parse error handled: ~p~n",[Error]),
 			"An unknown error of type "++atom_to_list(ErrorType)++" occured: "++lists:flatten(io_lib:format("~p",[Error]));
