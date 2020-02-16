@@ -84,7 +84,7 @@ formatString(Key, CheckInfo) ->
 	"<td class=\"formattedString "++binary_to_list(Key)++"\">"++Value++"</td>\r\n".
 
 renderSystemChecks(SystemChecks) ->
-	"<table>
+	"<div  class=\"system-checks\"><table>
 		<thead><td>Check</td><td>Status</td><td>Technical Detail</td><td class=\"debug\">Debug</td></thead>
 		" ++ maps:fold(
 		fun (CheckId, CheckInfo, Html) ->
@@ -100,7 +100,7 @@ renderSystemChecks(SystemChecks) ->
 			",
 			Html++CheckHtml
 		end, "", SystemChecks) ++ "
-	</table>".
+	</table></div>".
 
 systemHealthy(SystemChecks) ->
 	maps:fold(fun (_CheckId, CheckInfo, AccHealthy) ->
@@ -213,7 +213,9 @@ controller(_Method, RequestUri, StatePid) ->
 						<a href=\"https://l42.eu/\"><img src=\"https://l42.eu/logo.png\" alt=\"lucOS\" id=\"lucos_navbar_icon\" /></a>
 						<span id=\"lucos_navbar_title\">Monitoring</span>
 					</div>
+					<div id=\"checks\">
 					" ++ ChecksOutput ++ "
+					</div>
 				</body>
 			</html>"};
 		"/style.css" ->
@@ -222,7 +224,7 @@ controller(_Method, RequestUri, StatePid) ->
 			h2.system-name { text-transform:capitalize; }
 			h2 .rawInfoURL { float: right; text-decoration: none; }
 			.empty { font-style: italic; }
-			table { border-collapse: collapse; display:block; overflow: scroll; }
+			table { border-collapse: collapse; }
 			td { border: none thin #ccc; padding: 0.2em 1em; }
 			thead td { font-weight: bold; border-bottom-style: solid; }
 			tr > td:not(:first-child) { border-left-style: solid; }
@@ -240,6 +242,9 @@ controller(_Method, RequestUri, StatePid) ->
 			.status a { display: block; color:inherit; text-decoration: none; width: 100%; }
 			.status a:hover { text-decoration: underline; }
 			.formattedString a { word-break: break-word; }
+			#checks { max-width: 720px; display: block; margin: 0 auto;}
+			.system-checks { overflow: scroll; display: block; width: 100%; }
+			.system-checks > table { width: 100%; }
 			"};
 		"/_info" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
