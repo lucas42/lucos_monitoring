@@ -160,6 +160,12 @@ checkCI(CircleCISlug) ->
 								<<"link">> => BuildUrl
 							}}
 					end;
+				{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} when StatusCode >= 500 ->
+					#{<<"circleci">> => #{
+						<<"ok">> => unknown,
+						<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+						<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase)
+					}};
 				{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 					#{<<"circleci">> => #{
 						<<"ok">> => false,
