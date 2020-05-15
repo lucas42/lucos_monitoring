@@ -1,4 +1,4 @@
-FROM erlang:22
+FROM erlang:23
 
 WORKDIR /web/lucos/monitoring
 
