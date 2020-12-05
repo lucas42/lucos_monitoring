@@ -109,7 +109,7 @@ parseError(Error) ->
 fetchInfo(Host) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
 	TechDetail = list_to_binary("Makes HTTP request to "++InfoURL++""),
-	case httpc:request(get, {InfoURL, []}, [{timeout, timer:seconds(1)}], []) of
+	case httpc:request(get, {InfoURL, [{"User-Agent", "lucos_monitoring"}]}, [{timeout, timer:seconds(1)}], []) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
 			{System, Checks, Metrics, CircleCISlug} = parseInfo(Body),
 			InfoCheck = #{
