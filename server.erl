@@ -160,12 +160,21 @@ renderSystemHeader(Name, Host) ->
 			</h2>"
 	end.
 
+% Used to sort systems by status
+sortedHealthStatus(SystemChecks) ->
+	case systemHealthy(SystemChecks) of
+		true -> 2;
+		false -> 0;
+		% Ensure "unknown" systems come above healthy ones
+		_ -> 1
+	end.
+
 renderAll(SystemMap) ->
 	SystemList = maps:to_list(SystemMap),
 	SortedSystems = lists:sort(
 		fun ({HostA, {NameA, ChecksA, _}}, {HostB, {NameB, ChecksB, _}}) ->
-			HealthyA = systemHealthy(ChecksA),
-			HealthyB = systemHealthy(ChecksB),
+			HealthyA = sortedHealthStatus(ChecksA),
+			HealthyB = sortedHealthStatus(ChecksB),
 			{HealthyA, NameA, HostA} < {HealthyB, NameB, HostB}
 		end, SystemList),
 	lists:foldl(
