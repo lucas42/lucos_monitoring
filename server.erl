@@ -144,19 +144,25 @@ getCssClass(Type, Healthy) ->
 		_ -> Type ++ " health-unknown"
 	end.
 
-renderSystemHeader(Name, Host) ->
+renderSystemHeader(Name, Host, DupNameCount) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
-	case Name of
-		unknown ->
+	case {Name, DupNameCount} of
+		{unknown, _} ->
 			"<h2 id=\"host-"++Host++"\">
 				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
 				"++Host++"
 			</h2>";
-		_ ->
+		{_, 1} ->
 			ReadableName = re:replace(Name, "_", " ", [global, {return,list}]),
-			"<h2 id=\"host-"++Host++"\" class=\"system-name\">
+			"<h2 id=\"host-"++Host++"\">
 				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
-				"++ReadableName++"
+				<span class=\"system-name\">"++ReadableName++"</span>
+			</h2>";
+		{_, _} ->
+			ReadableName = re:replace(Name, "_", " ", [global, {return,list}]),
+			"<h2 id=\"host-"++Host++"\">
+				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
+				<span class=\"system-name\">"++ReadableName++"</span> ("++Host++")
 			</h2>"
 	end.
 
@@ -169,6 +175,12 @@ sortedHealthStatus(SystemChecks) ->
 		_ -> 1
 	end.
 
+countDupNames(SystemList, CompareSystemName) ->
+	length(lists:filter(
+		fun ({_, {SystemName, _, _}}) ->
+			SystemName == CompareSystemName
+		end, SystemList)).
+
 renderAll(SystemMap) ->
 	SystemList = maps:to_list(SystemMap),
 	SortedSystems = lists:sort(
@@ -179,9 +191,10 @@ renderAll(SystemMap) ->
 		end, SystemList),
 	lists:foldl(
 		fun ({Host, {SystemName, SystemChecks, SystemMetrics}}, Output) ->
+			DupNameCount = countDupNames(SystemList, SystemName),
 			Output++"
 			<div class=\""++getCssClass("system", systemHealthy(SystemChecks))++"\">
-				"++renderSystemHeader(SystemName, Host)++"
+				"++renderSystemHeader(SystemName, Host, DupNameCount)++"
 				"++renderSystemChecks(SystemChecks)++"
 				"++renderSystemMetrics(SystemMetrics)++"
 			</div>
@@ -230,7 +243,7 @@ controller(_Method, RequestUri, StatePid) ->
 		"/style.css" ->
 			{200, "text/css", "
 			.system h2 { background-color: #666; color: #fff; padding: 0.1em 1em; border-radius: 0.2em; }
-			h2.system-name { text-transform:capitalize; }
+			h2 .system-name { text-transform:capitalize; }
 			h2 .rawInfoURL { float: right; text-decoration: none; }
 			.empty { font-style: italic; }
 			table { border-collapse: collapse; }
