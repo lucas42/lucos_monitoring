@@ -265,7 +265,7 @@ controller(_Method, RequestUri, StatePid) ->
 			.status a:hover { text-decoration: underline; }
 			.formattedString a { word-break: break-word; }
 			#checks { max-width: 720px; display: block; margin: 0 auto;}
-			.system-checks { overflow: scroll; display: block; width: 100%; }
+			.system-checks { display: block; width: 100%; }
 			.system-checks > table { width: 100%; }
 			"};
 		"/_info" ->
