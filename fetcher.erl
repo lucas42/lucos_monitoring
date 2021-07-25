@@ -98,9 +98,6 @@ parseError(Error) ->
 			{false, "Socket closed remotely"};
 		timeout ->
 			{unknown, "HTTP Request timed out"};
-		{ErrorType, _Details} ->
-			io:format("Unknown parse error handled: ~p~n",[Error]),
-			{false, "An unknown error of type "++atom_to_list(ErrorType)++" occured: "++lists:flatten(io_lib:format("~p",[Error]))};
 		_ ->
 			io:format("Unknown parse error handled: ~p~n",[Error]),
 			{false, "An unknown error occured: "++lists:flatten(io_lib:format("~p",[Error]))}
