@@ -80,7 +80,7 @@ renderCheckStatus(Health, Link) ->
 
 formatString(Key, CheckInfo) ->
 	RawValue = binary_to_list(maps:get(Key, CheckInfo, <<"">>)),
-	Value = re:replace(RawValue, "https?:\\S+", "<a href=\"&\" target=\"_blank\">&</a>"),
+	Value = re:replace(RawValue, "https?:\\S+", "<a href=\"&\" target=\"_blank\">&</a>",[{return, list}]),
 	"<td class=\"formattedString "++binary_to_list(Key)++"\">"++Value++"</td>\r\n".
 
 renderSystemChecks(SystemChecks) ->
