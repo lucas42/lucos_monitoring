@@ -87,7 +87,7 @@ parseInfo(Body) ->
 parseError(Error) ->
 	case Error of
 		{failed_connect, [{to_address, {Host, _Port}}, {inet,[inet],nxdomain}]} ->
-			{false, "DNS failure when trying to resolve "++Host};
+			{unknown, "DNS failure when trying to resolve "++Host};
 		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],econnrefused}]} ->
 			{false, "Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port)};
 		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],closed}]} ->
