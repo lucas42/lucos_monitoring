@@ -108,7 +108,7 @@ parseError(Error) ->
 fetchInfo(Host) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
 	TechDetail = list_to_binary("Makes HTTP request to "++InfoURL++""),
-	case httpc:request(get, {InfoURL, [{"User-Agent", "lucos_monitoring"}]}, [{timeout, timer:seconds(1)}], []) of
+	case httpc:request(get, {InfoURL, [{"User-Agent", "lucos_monitoring"}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
 			{System, Checks, Metrics, CircleCISlug} = parseInfo(Body),
 			InfoCheck = #{
@@ -138,7 +138,7 @@ checkCI(CircleCISlug) ->
 		null -> #{};
 		_ ->
 			ApiUrl = "https://circleci.com/api/v1.1/project/"++binary_to_list(CircleCISlug)++"?circle-token="++os:getenv("CIRCLECI_API_TOKEN", "")++"&limit=1&filter=complete",
-			case httpc:request(get, {ApiUrl, [{"Accept","application/json"}]}, [{timeout, timer:seconds(1)}], []) of
+			case httpc:request(get, {ApiUrl, [{"Accept","application/json"}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 				{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
 					Response = jiffy:decode(Body, [return_maps]),
 					Build = lists:nth(1, Response),
