@@ -7,8 +7,8 @@ notify(Host, SystemName, FailingChecks, SystemMetrics) ->
 	% Use Host for consistent Subject lines so things get bundled into nice threads
 	EmailSubject = "Monitoring issue on "++Host,
 	EmailBody = getEmailBody(Host, System, FailingChecks, SystemMetrics),
-	sendEmail(EmailSubject, EmailBody),
-	io:format("Send notifications for ~p~n", [System]).
+	io:format("Send notifications for ~p~n", [System]),
+	sendEmail(EmailSubject, EmailBody).
 
 
 getSystemTitle(Host, Name) ->
