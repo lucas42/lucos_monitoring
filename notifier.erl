@@ -70,7 +70,8 @@ sendEmail(Subject, Body) ->
 	Relay = os:getenv("SMTP_RELAY"),
 	To = os:getenv("TO_ADDRESS"),
 	Sender = "Lucos Monitoring <"++SendAddress++">",
-	Content = "Subject: "++Subject++"\r\nFrom: "++Sender++"\r\nTo: <"++To++">\r\n\r\n"++Body,
+	CurrentDate = calendar:system_time_to_rfc3339(erlang:system_time(second)),
+	Content = "Subject: "++Subject++"\r\nFrom: "++Sender++"\r\nTo: <"++To++">"++"\r\nDate: "++CurrentDate++"\r\n\r\n"++Body,
 	Email = {SendAddress, [To], Content},
 	Options = [{relay, Relay}, {username, SendAddress}, {password, Password}],
 	try gen_smtp_client:send_blocking(Email, Options) of
