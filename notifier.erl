@@ -73,7 +73,16 @@ sendEmail(Subject, Body) ->
 	CurrentDate = calendar:system_time_to_rfc3339(erlang:system_time(second)),
 	Content = "Subject: "++Subject++"\r\nFrom: "++Sender++"\r\nTo: <"++To++">"++"\r\nDate: "++CurrentDate++"\r\n\r\n"++Body,
 	Email = {SendAddress, [To], Content},
-	Options = [{relay, Relay}, {username, SendAddress}, {password, Password}],
+	Options = [
+		{relay, Relay},
+		{username, SendAddress},
+		{password, Password},
+		{tls_options, [
+			{verify, verify_peer},
+			{cacerts, public_key:cacerts_get()},
+			{depth, 10},
+			{server_name_indication, Relay}]}
+		],
 	try gen_smtp_client:send_blocking(Email, Options) of
 		_ -> ok
 	catch
