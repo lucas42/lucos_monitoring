@@ -141,23 +141,32 @@ checkCI(CircleCISlug) ->
 			case httpc:request(get, {ApiUrl, [{"Accept","application/json"}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 				{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
 					Response = jiffy:decode(Body, [return_maps]),
-					Build = lists:nth(1, Response),
-					Outcome = binary_to_list(maps:get(<<"outcome">>, Build, <<"unknown">>)),
-					BuildUrl = maps:get(<<"build_url">>, Build, <<"">>),
-					case Outcome of
-						"success" ->
+					case Response of
+						[] ->
 							#{<<"circleci">> => #{
 								<<"ok">> => true,
 								<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-								<<"link">> => BuildUrl
+								<<"debug">> => <<"No recent builds found">>
 							}};
 						_ ->
-							#{<<"circleci">> => #{
-								<<"ok">> => false,
-								<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-								<<"debug">> => list_to_binary("Most recent build's status was \""++Outcome++"\""),
-								<<"link">> => BuildUrl
-							}}
+						Build = lists:nth(1, Response),
+						Outcome = binary_to_list(maps:get(<<"outcome">>, Build, <<"unknown">>)),
+						BuildUrl = maps:get(<<"build_url">>, Build, <<"">>),
+						case Outcome of
+							"success" ->
+								#{<<"circleci">> => #{
+									<<"ok">> => true,
+									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+									<<"link">> => BuildUrl
+								}};
+							_ ->
+								#{<<"circleci">> => #{
+									<<"ok">> => false,
+									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+									<<"debug">> => list_to_binary("Most recent build's status was \""++Outcome++"\""),
+									<<"link">> => BuildUrl
+								}}
+						end
 					end;
 				{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} when StatusCode >= 500 ->
 					#{<<"circleci">> => #{
