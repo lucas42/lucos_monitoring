@@ -231,13 +231,11 @@ controller(_Method, RequestUri, StatePid) ->
 					<meta name=\"mobile-web-app-capable\" content=\"yes\">
 				</head>
 				<body>
-					<div id=\"lucos_navbar\">
-						<a href=\"https://l42.eu/\"><img src=\"https://l42.eu/logo.png\" alt=\"lucOS\" id=\"lucos_navbar_icon\" /></a>
-						<span id=\"lucos_navbar_title\">Monitoring</span>
-					</div>
+					<lucos-navbar>Monitoring</lucos-navbar>
 					<div id=\"checks\">
 					" ++ ChecksOutput ++ "
 					</div>
+					<script src=\"/lucos_navbar.js\" type=\"text/javascript\"></script>
 				</body>
 			</html>"};
 		"/style.css" ->
@@ -257,10 +255,6 @@ controller(_Method, RequestUri, StatePid) ->
 			.system.health-unknown h2, tr.check.health-unknown td.status { background-color: #555; }
 			.system.healthy .debug { display: none; }
 			.metrics { margin-top: 2em; }
-			#lucos_navbar { height: 30px; z-index:1000; color: white; position: absolute; left: 0; right: 0; top: 0; font-size: 18px; background-color: black; background-image: -webkit-gradient(linear, 0 100%, 0 0, color-stop(0, transparent), color-stop(0.15, transparent), color-stop(0.9, rgba(255, 255, 255, 0.4))); font-family: Georgia, serif; }
-			#lucos_navbar_icon { float: left; height: 25px; padding: 2.5px 2%; cursor: pointer; max-width: 20%; border: none; }
-			#lucos_navbar_title { text-align: center; display: block; line-height: 30px; font-weight: bold; position: absolute; width: 50%; margin: 0 25%; z-index: -1; overflow: hidden; height: 30px; text-overflow: ellipsis; white-space: nowrap; }
-			body { padding-top: 35px; }
 			.status a { display: block; color:inherit; text-decoration: none; width: 100%; }
 			.status a:hover { text-decoration: underline; }
 			.formattedString a { word-break: break-word; }
@@ -274,6 +268,9 @@ controller(_Method, RequestUri, StatePid) ->
 		"/icon" ->
 			{ok, IconFile} = file:read_file("icon.png"),
 			{200, "image/png", IconFile};
+		"/lucos_navbar.js" ->
+			{ok, ScriptFile} = file:read_file("lucos_navbar.js"),
+			{200, "text/javascript", ScriptFile};
 		_ ->
 			{404, "text/plain", "Not Found"}
 	end.

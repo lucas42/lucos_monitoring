@@ -1,3 +1,4 @@
+FROM lucas42/lucos_navbar:latest as navbar
 FROM erlang:25
 
 WORKDIR /web/lucos/monitoring
@@ -10,6 +11,7 @@ COPY rebar.config ./
 RUN rebar3 compile
 
 COPY public ./
+COPY --from=navbar lucos_navbar.js .
 COPY *.erl ./
 
 RUN erlc *.erl
