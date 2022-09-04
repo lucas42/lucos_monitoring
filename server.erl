@@ -215,7 +215,9 @@ encodeInfo(Systems) ->
 			circle => <<"gh/lucas42/lucos_monitoring">>
 		},
 		icon => <<"/icon">>,
-		network_only => true
+		network_only => true,
+		title => <<"Monitoring">>,
+		show_on_homepage => true
 	}).
 
 controller(_Method, RequestUri, StatePid) ->
