@@ -213,7 +213,9 @@ encodeInfo(Systems) ->
 		},
 		ci => #{
 			circle => <<"gh/lucas42/lucos_monitoring">>
-		}
+		},
+		icon => <<"/icon">>,
+		network_only => true
 	}).
 
 controller(_Method, RequestUri, StatePid) ->
