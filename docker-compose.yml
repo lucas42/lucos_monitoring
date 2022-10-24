@@ -1,13 +1,14 @@
 version: '3'
 services:
-    monitoring:
-      build: .
-      container_name: monitoring
-      ports: 
-        - "8015:8015"
-      environment:
-        - SEND_ADDRESS
-        - SEND_PASSWORD
-        - SMTP_RELAY
-        - TO_ADDRESS
-      image: lucas42/lucos_monitoring
+  monitoring:
+    build: .
+    container_name: monitoring
+    ports: 
+      - "8015:8015"
+    environment:
+      - SEND_ADDRESS
+      - SEND_PASSWORD
+      - SMTP_RELAY
+      - TO_ADDRESS
+    image: lucas42/lucos_monitoring
+    restart: always
