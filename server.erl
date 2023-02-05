@@ -119,12 +119,12 @@ renderSystemMetrics(SystemMetrics) ->
 		fun (MetricId, MetricInfo, Html) ->
 			Value = maps:get(<<"value">>, MetricInfo, -1),
 			TechDetail = binary_to_list(maps:get(<<"techDetail">>, MetricInfo, <<"">>)),
-			MetricHtml = "
-				<tr class=\"metric\" title=\""++TechDetail++"\">
-					<td class=\"metricid\">"++binary_to_list(MetricId)++"</td>
-					<td class=\"value\">"++integer_to_list(Value)++"</td>
+			MetricHtml = io_lib:format("
+				<tr class=\"metric\" title=~p>
+					<td class=\"metricid\">~s</td>
+					<td class=\"value\">~p</td>
 				</tr>
-			",
+			", [TechDetail, binary_to_list(MetricId), Value]),
 			Html++MetricHtml
 		end, "", SystemMetrics),
 	case Html of
@@ -259,6 +259,7 @@ controller(_Method, RequestUri, StatePid) ->
 			.system.health-unknown h2, tr.check.health-unknown td.status { background-color: #555; }
 			.system.healthy .debug { display: none; }
 			.metrics { margin-top: 2em; }
+			tr.metric[title] { cursor: help; }
 			.status a { display: block; color:inherit; text-decoration: none; width: 100%; }
 			.status a:hover { text-decoration: underline; }
 			.formattedString a { word-break: break-word; }
