@@ -78,9 +78,14 @@ renderCheckStatus(Health, Link) ->
 			"<a href=\""++Link++"\" target=\"_blank\">"++atom_to_list(Health)++"</a>"
 	end.
 
-formatString(Key, CheckInfo) ->
-	RawValue = binary_to_list(maps:get(Key, CheckInfo, <<"">>)),
-	Value = re:replace(RawValue, "https?:\\S+", "<a href=\"&\" target=\"_blank\">&</a>",[{return, list}]),
+formatStringFromInfo(Key, CheckInfo) ->
+	formatString(Key, maps:get(Key, CheckInfo, <<"">>)).
+
+formatString(Key, BinaryValue) ->
+	RawValue = binary_to_list(BinaryValue),
+	ZWSValue = re:replace(RawValue, "_", "\\&ZeroWidthSpace;_",[global, {return, list}]),
+	LinkedValue = re:replace(ZWSValue, "https?:\\S+", "<a href=\"&\" target=\"_blank\">&</a>",[global, {return, list}]),
+	Value = re:replace(LinkedValue, "href=\"([^\"]*)&ZeroWidthSpace;([^\"]*)\"", "href=\"\\g1\\g2\"",[global, {return, list}]),
 	"<td class=\"formattedString "++binary_to_list(Key)++"\">"++Value++"</td>\r\n".
 
 renderSystemChecks(SystemChecks) ->
@@ -92,10 +97,10 @@ renderSystemChecks(SystemChecks) ->
 			Link = binary_to_list(maps:get(<<"link">>, CheckInfo, <<"">>)),
 			CheckHtml = "
 				<tr class=\""++getCssClass("check", CheckHealthy)++"\">
-					<td class=\"checkid\">"++binary_to_list(CheckId)++"</td>
+					"++formatString(<<"checkid">>, CheckId)++"
 					<td class=\"status\">"++renderCheckStatus(CheckHealthy, Link)++"</td>
-					"++formatString(<<"techDetail">>, CheckInfo)
-					++formatString(<<"debug">>, CheckInfo)
+					"++formatStringFromInfo(<<"techDetail">>, CheckInfo)
+					++formatStringFromInfo(<<"debug">>, CheckInfo)
 				++"</tr>
 			",
 			Html++CheckHtml
