@@ -1,5 +1,5 @@
 FROM lucas42/lucos_navbar:latest as navbar
-FROM erlang:25
+FROM erlang:26
 
 WORKDIR /web/lucos/monitoring
 
