@@ -137,7 +137,7 @@ checkCI(CircleCISlug) ->
 	case CircleCISlug of
 		null -> #{};
 		_ ->
-			ApiUrl = "https://circleci.com/api/v1.1/project/"++binary_to_list(CircleCISlug)++"?circle-token="++os:getenv("CIRCLECI_API_TOKEN", "")++"&limit=1&filter=complete",
+			ApiUrl = "https://circleci.com/api/v1.1/project/"++binary_to_list(CircleCISlug)++"/tree/main?circle-token="++os:getenv("CIRCLECI_API_TOKEN", "")++"&limit=1&filter=complete",
 			case httpc:request(get, {ApiUrl, [{"Accept","application/json"}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 				{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
 					Response = jiffy:decode(Body, [return_maps]),
