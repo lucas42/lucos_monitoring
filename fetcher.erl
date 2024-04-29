@@ -86,15 +86,15 @@ parseInfo(Body) ->
 
 parseError(Error) ->
 	case Error of
-		{failed_connect, [{to_address, {Host, _Port}}, {inet,[inet],nxdomain}]} ->
+		{failed_connect, [{to_address, {Host, _Port}}, {_ipFamily,[_ipFamily],nxdomain}]} ->
 			{unknown, "DNS failure when trying to resolve "++Host};
-		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],econnrefused}]} ->
+		{failed_connect, [{to_address, {Host, Port}}, {_ipFamily,[_ipFamily],econnrefused}]} ->
 			{false, "Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port)};
-		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],closed}]} ->
+		{failed_connect, [{to_address, {Host, Port}}, {_ipFamily,[_ipFamily],closed}]} ->
 			{false, "TCP connection was closed connecting to host "++Host++" on port "++integer_to_list(Port)};
-		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],etimedout}]} ->
+		{failed_connect, [{to_address, {Host, Port}}, {_ipFamily,[_ipFamily],etimedout}]} ->
 			{unknown, "TCP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)};
-		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],timeout}]} ->
+		{failed_connect, [{to_address, {Host, Port}}, {_ipFamily,[_ipFamily],timeout}]} ->
 			{unknown, "HTTP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)};
 		socket_closed_remotely ->
 			{false, "Socket closed remotely"};
@@ -108,7 +108,7 @@ parseError(Error) ->
 fetchInfo(Host) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
 	TechDetail = list_to_binary("Makes HTTP request to "++InfoURL++""),
-	case httpc:request(get, {InfoURL, [{"User-Agent", "lucos_monitoring"}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
+	case httpc:request(get, {InfoURL, [{"User-Agent", "lucos_monitoring"}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], [{socket_opts, [{ipfamily, inet6fb4}]}]) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
 			{System, Checks, Metrics, CircleCISlug} = parseInfo(Body),
 			InfoCheck = #{

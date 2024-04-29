@@ -12,3 +12,4 @@ services:
       - TO_ADDRESS
     image: lucas42/lucos_monitoring
     restart: always
+    network_mode: host
