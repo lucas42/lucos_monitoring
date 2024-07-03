@@ -19,4 +19,4 @@ Monitoring tool for lucos services
 The build is configured to run on CircleCI when a commit is pushed to the master branch in github.
 
 ## Running Tests
-`rebar3 do eunit, cover`
+`rebar3 do eunit --cover, cover`
