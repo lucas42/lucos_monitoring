@@ -1,7 +1,7 @@
 -module(server).
--export([start/0, accept/3, handleRequest/2]).
+-export([start/2, accept/3, handleRequest/2]).
 
-start() ->
+start(_StartType, _StartArgs) ->
 	{Port, _} = string:to_integer(os:getenv("PORT", "8080")),
 	{ok, StatePid} = monitoring_state_server:start_link(),
 	SchedulerCount = erlang:system_info(schedulers),
