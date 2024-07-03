@@ -1,5 +1,6 @@
 -module(fetcher).
 -export([start/1, tryRunChecks/2]).
+-include_lib("eunit/include/eunit.hrl").
 
 start(StatePid) ->
 	ok = application:start(crypto),
@@ -193,3 +194,10 @@ checkCI(CircleCISlug) ->
 					}}
 			end
 	end.
+
+-ifdef(TEST).
+	parseInfo_test() ->
+		?assertEqual({"lucos_test",#{},#{},null}, parseInfo("{\"system\":\"lucos_test\"}")),
+		?assertException(error, {2,invalid_json}, parseInfo("{{{{}}}")),
+		?assertException(error, {badkey,<<"system">>}, parseInfo("{}")).
+-endif.
