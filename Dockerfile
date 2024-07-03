@@ -7,12 +7,12 @@ RUN apt-get update
 RUN apt-get install -y erlang-ssl erlang-crypto erlang-public-key
 
 ENV ERL_LIBS _build/default/lib/
-COPY rebar.config ./
+COPY rebar.* ./
 RUN rebar3 compile
 
 COPY public ./
 COPY --from=navbar lucos_navbar.js .
-COPY *.erl ./
+COPY src/*.erl ./
 
 RUN erlc *.erl
 

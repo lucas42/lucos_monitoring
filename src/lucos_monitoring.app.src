@@ -1,0 +1,13 @@
+{application, lucos_monitoring,
+ [{description, "Monitoring tool for lucos services"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {lucos_monitoring_app, []}},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []},
+  {links, []}
+ ]}.
