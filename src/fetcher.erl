@@ -87,27 +87,49 @@ parseInfo(Body) ->
 
 parseError(Error) ->
 	case Error of
-		{failed_connect, [{to_address, {Host, _Port}}, {_ipFamily,[_ipFamily],nxdomain}]} ->
-			{unknown, "DNS failure when trying to resolve "++Host};
-		{failed_connect, [{to_address, {Host, _Port}}, {_ipFamily,[_ipFamily],nxdomain}, {_ipFamily2,[_ipFamily2],timeout}]} ->
-			{unknown, "DNS lookup timed out for host "++Host};
-		{failed_connect, [{to_address, {Host, _Port}}, {_ipFamily,[_ipFamily],timeout}, {_ipFamily2,[_ipFamily2],nxdomain}]} ->
-			{unknown, "DNS lookup timed out for host "++Host};
-		{failed_connect, [{to_address, {Host, Port}}, {_ipFamily,[_ipFamily],econnrefused}]} ->
-			{false, "Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port)};
-		{failed_connect, [{to_address, {Host, Port}}, {_ipFamily,[_ipFamily],closed}]} ->
-			{false, "TCP connection was closed connecting to host "++Host++" on port "++integer_to_list(Port)};
-		{failed_connect, [{to_address, {Host, Port}}, {_ipFamily,[_ipFamily],etimedout}]} ->
-			{unknown, "TCP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)};
-		{failed_connect, [{to_address, {Host, Port}}, {_ipFamily,[_ipFamily],timeout}]} ->
-			{unknown, "HTTP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)};
+		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],Ipv4ErrorType}]} ->
+			parseConnectionError(Host, Port, 4, Ipv4ErrorType);
+		{failed_connect, [{to_address, {Host, Port}}, {inet6,[inet6],Ipv6ErrorType}]} ->
+			parseConnectionError(Host, Port, 6, Ipv6ErrorType);
+		{failed_connect, [{to_address, {Host, Port}}, {inet6,[inet6],Ipv6ErrorType}, {inet,[inet],Ipv4ErrorType}]} ->
+			{Status4, Debug4} = parseConnectionError(Host, Port, 4, Ipv4ErrorType),
+			{Status6, Debug6} = parseConnectionError(Host, Port, 6, Ipv6ErrorType),
+			Debug = Debug4++"; "++Debug6,
+			Status = case {Status4, Status6} of
+				{unknown, unknown} ->
+					unknown;
+				{false, false} ->
+					false;
+				{false, unknown} ->
+					false;
+				{unknown, false} ->
+					false
+			end,
+			{Status, Debug};
 		socket_closed_remotely ->
 			{false, "Socket closed remotely"};
 		timeout ->
 			{unknown, "HTTP Request timed out"};
 		_ ->
-			io:format("Unknown parse error handled: ~p~n",[Error]),
+			io:format("Unknown error handled: ~p~n",[Error]),
 			{false, "An unknown error occured: "++lists:flatten(io_lib:format("~p",[Error]))}
+	end.
+
+parseConnectionError(Host, Port, IpVersion, ErrorType) ->
+	case ErrorType of
+		nxdomain ->
+			{unknown, "DNS failure when trying to resolve ipv"++integer_to_list(IpVersion)++" address for "++Host};
+		econnrefused ->
+			{false, "Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
+		closed ->
+			{false, "TCP connection was closed connecting to host "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
+		etimedout ->
+			{unknown, "TCP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
+		timeout ->
+			{unknown, "HTTP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
+		_ ->
+			io:format("Unknown connection error handled: ~p (ipv~p connection)~n",[ErrorType, IpVersion]),
+			{false, lists:flatten(io_lib:format("An unknown connection error occured: ~p (ipv~p connection)",[ErrorType, IpVersion]))}
 	end.
 
 fetchInfo(Host) ->
@@ -200,4 +222,10 @@ checkCI(CircleCISlug) ->
 		?assertEqual({"lucos_test",#{},#{},null}, parseInfo("{\"system\":\"lucos_test\"}")),
 		?assertException(error, {2,invalid_json}, parseInfo("{{{{}}}")),
 		?assertException(error, {badkey,<<"system">>}, parseInfo("{}")).
+	parseError_test() ->
+		?assertEqual({false, "HTTP connection timed out whilst connecting to example.l42.eu on port 443 over ipv4; Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],econnrefused},{inet,[inet],timeout}]})),
+		?assertEqual({false, "TCP connection was closed connecting to host example.l42.eu on port 1234 over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",1234}}, {inet,[inet],closed}]})),
+		?assertEqual({unknown, "DNS failure when trying to resolve ipv6 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",1234}}, {inet6,[inet6],nxdomain}]})),
+		?assertEqual({false, "An unknown connection error occured: not_a_real_error (ipv6 connection)"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],not_a_real_error}]})),
+		?assertEqual({false, "An unknown error occured: {not_a_real_error}"}, parseError({not_a_real_error})).
 -endif.
