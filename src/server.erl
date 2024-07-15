@@ -2,21 +2,25 @@
 -export([start/2, accept/3, handleRequest/2]).
 
 start(_StartType, _StartArgs) ->
-	{Port, _} = string:to_integer(os:getenv("PORT", "8080")),
-	{ok, StatePid} = monitoring_state_server:start_link(),
-	SchedulerCount = erlang:system_info(schedulers),
-	Opts = [{active, false},
-			binary,
-			{packet, http_bin}],
-	{ok, ListenSocket} = gen_tcp:listen(Port, Opts),
-	Spawn = fun(SchedulerID) ->	
-		spawn_opt(?MODULE, accept, [ListenSocket, SchedulerID, StatePid], [link, {scheduler, SchedulerID}])
-	end,
-	lists:foreach(Spawn, lists:seq(1, SchedulerCount)),
-	io:format("server listening on port ~b with ~b schedulers~n", [Port, SchedulerCount]),
-	fetcher:start(StatePid),
-	receive
-		Any -> io:format("~p~n", [Any])
+	try
+		{Port, _} = string:to_integer(os:getenv("PORT", "8080")),
+		{ok, StatePid} = monitoring_state_server:start_link(),
+		SchedulerCount = erlang:system_info(schedulers),
+		Opts = [{active, false},
+				binary,
+				{packet, http_bin}],
+		{ok, ListenSocket} = gen_tcp:listen(Port, Opts),
+		Spawn = fun(SchedulerID) ->
+			spawn_opt(?MODULE, accept, [ListenSocket, SchedulerID, StatePid], [link, {scheduler, SchedulerID}])
+		end,
+		lists:foreach(Spawn, lists:seq(1, SchedulerCount)),
+		io:format("server listening on port ~b with ~b schedulers~n", [Port, SchedulerCount]),
+		fetcher:start(StatePid),
+		receive
+			Any -> io:format("~p~n", [Any])
+		end
+	catch
+		Exception:Reason -> io:format("Startup error occured: ~p ~n",[Reason])
 	end.
 
 accept(ListenSocket, SchedulerID, StatePid) ->
