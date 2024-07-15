@@ -10,6 +10,8 @@ services:
       - SEND_PASSWORD
       - SMTP_RELAY
       - TO_ADDRESS
+      - ERL_CRASH_DUMP=/dev/stderr
+      - ERL_CRASH_DUMP_BYTES=8192
     image: lucas42/lucos_monitoring
     restart: always
     network_mode: host
