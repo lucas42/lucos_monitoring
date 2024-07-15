@@ -9,15 +9,19 @@ start(_StartType, _StartArgs) ->
 		Opts = [{active, false},
 				binary,
 				{packet, http_bin}],
-		{ok, ListenSocket} = gen_tcp:listen(Port, Opts),
-		Spawn = fun(SchedulerID) ->
-			spawn_opt(?MODULE, accept, [ListenSocket, SchedulerID, StatePid], [link, {scheduler, SchedulerID}])
-		end,
-		lists:foreach(Spawn, lists:seq(1, SchedulerCount)),
-		io:format("server listening on port ~b with ~b schedulers~n", [Port, SchedulerCount]),
-		fetcher:start(StatePid),
-		receive
-			Any -> io:format("~p~n", [Any])
+		case gen_tcp:listen(Port, Opts) of
+			{ok, ListenSocket} ->
+				Spawn = fun(SchedulerID) ->
+					spawn_opt(?MODULE, accept, [ListenSocket, SchedulerID, StatePid], [link, {scheduler, SchedulerID}])
+				end,
+				lists:foreach(Spawn, lists:seq(1, SchedulerCount)),
+				io:format("server listening on port ~b with ~b schedulers~n", [Port, SchedulerCount]),
+				fetcher:start(StatePid),
+				receive
+					Any -> io:format("~p~n", [Any])
+				end;
+			{error, Error} ->
+				io:format("Can't listen on port ~p: ~p ~n",[Port, Error])
 		end
 	catch
 		Exception:Reason -> io:format("Startup error occured: ~p ~n",[Reason])
