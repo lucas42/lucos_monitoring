@@ -137,12 +137,22 @@ fetchInfo(Host) ->
 	TechDetail = list_to_binary("Makes HTTP request to "++InfoURL++""),
 	case httpc:request(get, {InfoURL, [{"User-Agent", "lucos_monitoring"}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], [{socket_opts, [{ipfamily, inet6fb4}]}]) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
-			{System, Checks, Metrics, CircleCISlug} = parseInfo(Body),
-			InfoCheck = #{
-				<<"ok">> => true,
-				<<"techDetail">> => TechDetail
-			},
-			{InfoCheck, System, Checks, Metrics, CircleCISlug};
+			try
+				{System, Checks, Metrics, CircleCISlug} = parseInfo(Body),
+				InfoCheck = #{
+					<<"ok">> => true,
+					<<"techDetail">> => TechDetail
+				},
+				{InfoCheck, System, Checks, Metrics, CircleCISlug}
+			catch
+				Exception:Reason ->
+					ErroringInfoCheck = #{
+						<<"ok">> => false,
+						<<"techDetail">> => TechDetail,
+						<<"debug">> => list_to_binary(lists:flatten(io_lib:format("Couldn't parse response from endpoint.~nError: ~p",[Reason])))
+					},
+					{ErroringInfoCheck, unknown, #{}, #{}, null}
+			end;
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 			InfoCheck = #{
 				<<"ok">> => false,

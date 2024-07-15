@@ -271,6 +271,7 @@ controller(_Method, RequestUri, StatePid) ->
 			.system.erroring h2, tr.check.erroring td.status { background-color: #900; }
 			.system.health-unknown h2, tr.check.health-unknown td.status { background-color: #555; }
 			.system.healthy .debug { display: none; }
+			tbody .debug { white-space: pre; }
 			.metrics { margin-top: 2em; }
 			tr.metric[title] { cursor: help; }
 			.status a { display: block; color:inherit; text-decoration: none; width: 100%; }
