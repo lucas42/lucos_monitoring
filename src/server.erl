@@ -24,7 +24,7 @@ start(_StartType, _StartArgs) ->
 				io:format("Can't listen on port ~p: ~p ~n",[Port, Error])
 		end
 	catch
-		Exception:Reason -> io:format("Startup error occured: ~p ~n",[Reason])
+		Exception:Reason -> io:format("Startup error occured: ~p ~p ~n",[Exception, Reason])
 	end.
 
 accept(ListenSocket, SchedulerID, StatePid) ->

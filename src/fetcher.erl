@@ -151,7 +151,7 @@ fetchInfo(Host) ->
 					ErroringInfoCheck = #{
 						<<"ok">> => false,
 						<<"techDetail">> => TechDetail,
-						<<"debug">> => list_to_binary(lists:flatten(io_lib:format("Couldn't parse response from endpoint.~nError: ~p",[Reason])))
+						<<"debug">> => list_to_binary(lists:flatten(io_lib:format("Couldn't parse response from endpoint.~nError: ~p ~p",[Exception, Reason])))
 					},
 					{ErroringInfoCheck, unknown, #{}, #{}, null}
 			end;
