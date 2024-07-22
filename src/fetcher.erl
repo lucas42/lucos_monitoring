@@ -119,6 +119,8 @@ parseConnectionError(Host, Port, IpVersion, ErrorType) ->
 	case ErrorType of
 		nxdomain ->
 			{unknown, "DNS failure when trying to resolve ipv"++integer_to_list(IpVersion)++" address for "++Host};
+		ehostunreach ->
+			{unknown, "No route to host "++Host++" over ipv"++integer_to_list(IpVersion)};
 		econnrefused ->
 			{false, "Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
 		closed ->
