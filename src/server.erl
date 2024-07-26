@@ -281,6 +281,8 @@ controller(_Method, RequestUri, StatePid) ->
 			.system-checks { display: block; width: 100%; }
 			.system-checks > table { width: 100%; }
 			"};
+		"/robots.txt" ->
+			{200, "text/plain", "User-agent: *\nDisallow:\n"};
 		"/_info" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
 			{200, "application/json", encodeInfo(Systems)};
