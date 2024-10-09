@@ -16,7 +16,7 @@ Monitoring tool for lucos services
 `docker-compose up --no-build`
 
 ## Building
-The build is configured to run on CircleCI when a commit is pushed to the master branch in github.
+The build is configured to run on CircleCI when a commit is pushed to the `main` branch in github.
 
 ## Running Tests
 `rebar3 do eunit --cover, cover`
