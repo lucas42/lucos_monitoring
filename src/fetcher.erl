@@ -45,7 +45,7 @@ runChecks(StatePid, Host) ->
 
 checkTlsExpiry(Host) ->
 	TechDetail = <<"Checks whether the TLS Certificate is valid and not about to expire">>,
-	Command = "echo | openssl s_client -connect "++Host++":443 -servername "++Host++" 2>/dev/null | openssl x509 -noout -enddate | sed 's/.*=//' | date +'%s' -f -",
+	Command = "echo | timeout 1s openssl s_client -connect "++Host++":443 -servername "++Host++" 2>/dev/null | openssl x509 -noout -enddate | sed 's/.*=//' | date +'%s' -f -",
 	Output = os:cmd(Command),
 	case string:to_integer(Output) of
 		{error, _Reason} ->
