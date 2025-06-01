@@ -83,15 +83,17 @@ sendEmail(Subject, Body) ->
 			{depth, 10},
 			{server_name_indication, Relay}]}
 		],
-	try gen_smtp_client:send_blocking(Email, Options) of
-		_ -> ok
-	catch
-		ExceptionClass:Term:StackTrace ->
-			case Term of
-				{permanent_failure, ErrorMessage} ->
-					io:format("Error Sending Email: ~p~n", [binary_to_list(ErrorMessage)]);
-				_ ->
-					io:format("Unhandled Error Sending Email.  ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace])
-			end,
-			fail
-	end.
+	gen_smtp_client:send(Email, Options, fun(Response) ->
+		case Response of
+			{ok, _ } ->
+				ok;
+			{error, send, {permanent_failure, _, ErrorMessage}} ->
+				io:format("Error Sending Email: ~p~n", [binary_to_list(ErrorMessage)]);
+			{error, send, Error} ->
+				io:format("Unhandled Error Sending Email.  ~p~n", [Error]);
+			{error, Type, Error} ->
+				io:format("Unhandled Email Error of Type ~p.  ~p~n", [Type, Error]);
+			_ ->
+				io:format("Unexpected Response from sending email. ~p.~n", [Response])
+		end
+	end).
