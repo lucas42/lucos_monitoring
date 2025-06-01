@@ -12,14 +12,15 @@ handle_cast(Request, SystemMap) ->
 	case Request of
 		{updateSystem, Host, System, SystemChecks, SystemMetrics} ->
 			io:format("Received update for system ~p (Host ~p)~n", [System, Host]),
-			{_, OldSystemChecks, _} = maps:get(Host, SystemMap, {nil, nil, nil}),
-			case meaningfulChange(OldSystemChecks, SystemChecks) of
+			{_, OldSystemChecks, _} = maps:get(Host, SystemMap, {nil, maps:new(), nil}),
+			NormalisedChecks = replaceUnknowns(OldSystemChecks, SystemChecks, maps:iterator(SystemChecks, reversed)),
+			case meaningfulChange(OldSystemChecks, NormalisedChecks) of
 				true ->
-					state_change(Host, System, SystemChecks, SystemMetrics);
+					state_change(Host, System, NormalisedChecks, SystemMetrics);
 				false ->
 					ok
 			end,
-			NewSystemMap = maps:put(Host, {System, SystemChecks, SystemMetrics}, SystemMap),
+			NewSystemMap = maps:put(Host, {System, NormalisedChecks, SystemMetrics}, SystemMap),
 			{noreply, NewSystemMap}
 	end.
 
@@ -31,6 +32,26 @@ handle_call(Request, _From, SystemMap) ->
 			{reply, maps:get(Host, SystemMap), SystemMap}
 	end.
 
+% Replaces any unknown "ok" with whichever the value was there previously.  Also keeps a tally of how many unknowns have been received in a row
+replaceUnknowns(OldChecks, NewChecks, Iterator) ->
+	case maps:next(Iterator) of
+		{Key, NewCheck, NextIterator} ->
+			NormalisedCheck = case maps:get(<<"ok">>, NewCheck, unknown) of
+				unknown ->
+					OldCheck = maps:get(Key, OldChecks, #{<<"ok">> => unknown}),
+					OldOK = maps:get(<<"ok">>, OldCheck, unknown),
+					OldCount = maps:get(<<"unknown_count">>, OldCheck, 0),
+					NewOK = OldOK,
+					NewCount = OldCount + 1,
+					maps:put(<<"unknown_count">>, NewCount, maps:put(<<"ok">>, NewOK, NewCheck));
+				_ ->
+					maps:put(<<"unknown_count">>, 0, NewCheck)
+			end,
+			maps:put(Key, NormalisedCheck, replaceUnknowns(OldChecks, NewChecks, NextIterator));
+		none ->
+			maps:new()
+	end.
+
 % Decides whether the checks have changed in a meaningful way (ie ignore "unknown" states)
 meaningfulChange(OldChecks, NewChecks) ->
 	NewFailingChecks = failingChecks(NewChecks),
@@ -38,13 +59,9 @@ meaningfulChange(OldChecks, NewChecks) ->
 	maps:keys(OldFailingChecks) /= maps:keys(NewFailingChecks).
 
 failingChecks(Checks) ->
-	case Checks of
-		nil -> maps:new();
-		_ ->
-			maps:filter(fun(_, Check) ->
-				maps:get(<<"ok">>, Check, unknown) == false
-			end, Checks)
-	end.
+	maps:filter(fun(_, Check) ->
+		maps:get(<<"ok">>, Check, unknown) == false
+	end, Checks).
 
 state_change(Host, System, SystemChecks, SystemMetrics) ->
 	io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
