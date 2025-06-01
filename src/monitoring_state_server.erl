@@ -32,18 +32,22 @@ handle_call(Request, _From, SystemMap) ->
 			{reply, maps:get(Host, SystemMap), SystemMap}
 	end.
 
-% Replaces any unknown "ok" with whichever the value was there previously.  Also keeps a tally of how many unknowns have been received in a row
+% Replaces any unknown "ok" with whichever the value was there previously, until 3 consecutive unknowns are recieved at which point ok is set to false
 replaceUnknowns(OldChecks, NewChecks, Iterator) ->
 	case maps:next(Iterator) of
 		{Key, NewCheck, NextIterator} ->
 			NormalisedCheck = case maps:get(<<"ok">>, NewCheck, unknown) of
 				unknown ->
 					OldCheck = maps:get(Key, OldChecks, #{<<"ok">> => unknown}),
-					OldOK = maps:get(<<"ok">>, OldCheck, unknown),
 					OldCount = maps:get(<<"unknown_count">>, OldCheck, 0),
-					NewOK = OldOK,
 					NewCount = OldCount + 1,
-					maps:put(<<"unknown_count">>, NewCount, maps:put(<<"ok">>, NewOK, NewCheck));
+					IncrementedCheck = maps:put(<<"unknown_count">>, NewCount, NewCheck),
+					case NewCount >= 3 of
+						true ->
+							 maps:put(<<"ok">>, false, IncrementedCheck);
+						false ->
+							maps:put(<<"ok">>, maps:get(<<"ok">>, OldCheck, unknown), IncrementedCheck)
+					end;
 				_ ->
 					maps:put(<<"unknown_count">>, 0, NewCheck)
 			end,
