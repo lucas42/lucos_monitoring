@@ -13,7 +13,8 @@ handle_cast(Request, SystemMap) ->
 		{updateSystem, Host, System, SystemChecks, SystemMetrics} ->
 			io:format("Received update for system ~p (Host ~p)~n", [System, Host]),
 			{_, OldSystemChecks, _} = maps:get(Host, SystemMap, {nil, maps:new(), nil}),
-			NormalisedChecks = replaceUnknowns(OldSystemChecks, SystemChecks, maps:iterator(SystemChecks, reversed)),
+			MergedChecks = mergeMissingInfoChecks(OldSystemChecks, SystemChecks),
+			NormalisedChecks = replaceUnknowns(OldSystemChecks, MergedChecks, maps:iterator(MergedChecks, reversed)),
 			case meaningfulChange(OldSystemChecks, NormalisedChecks) of
 				true ->
 					state_change(Host, System, NormalisedChecks, SystemMetrics);
@@ -54,6 +55,15 @@ replaceUnknowns(OldChecks, NewChecks, Iterator) ->
 			maps:put(Key, NormalisedCheck, replaceUnknowns(OldChecks, NewChecks, NextIterator));
 		none ->
 			maps:new()
+	end.
+
+% If there's a problem with the 'fetch-info' check, merge the old and new checks to avoid flapiness
+mergeMissingInfoChecks(OldChecks, NewChecks) ->
+	case maps:get(<<"ok">>, maps:get(<<"fetch-info">>, NewChecks, #{<<"ok">> => unknown}), unknown) of
+		true ->
+			NewChecks;
+		_ ->
+			maps:merge(OldChecks, NewChecks)
 	end.
 
 % Decides whether the checks have changed in a meaningful way (ie ignore "unknown" states)
