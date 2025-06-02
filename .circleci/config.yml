@@ -3,12 +3,9 @@ version: 2.1
 jobs:
   test:
     docker:
-      - image: cimg/elixir:1.18.4-erlang-27.2.2
+      - image: erlang:28
     steps:
       - checkout
-      - run:
-          name: Install rebar
-          command: mix local.rebar
       - run:
           name: Run Tests
           command: rebar3 do eunit --cover, cover
