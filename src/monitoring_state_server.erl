@@ -13,8 +13,7 @@ handle_cast(Request, SystemMap) ->
 		{updateSystem, Host, System, SystemChecks, SystemMetrics} ->
 			io:format("Received update for system ~p (Host ~p)~n", [System, Host]),
 			{_, OldSystemChecks, _} = maps:get(Host, SystemMap, {nil, maps:new(), nil}),
-			MergedChecks = mergeMissingInfoChecks(OldSystemChecks, SystemChecks),
-			NormalisedChecks = replaceUnknowns(OldSystemChecks, MergedChecks, maps:iterator(MergedChecks, reversed)),
+			NormalisedChecks = normaliseChecks(OldSystemChecks, SystemChecks),
 			case meaningfulChange(OldSystemChecks, NormalisedChecks) of
 				true ->
 					state_change(Host, System, NormalisedChecks, SystemMetrics);
@@ -66,6 +65,11 @@ mergeMissingInfoChecks(OldChecks, NewChecks) ->
 			maps:merge(OldChecks, NewChecks)
 	end.
 
+% Reduce monitoring flapiness by using existing check data to bolster new checks which may be facing a temporary blip
+normaliseChecks(OldChecks, NewChecks) ->
+	MergedChecks = mergeMissingInfoChecks(OldChecks, NewChecks),
+	replaceUnknowns(OldChecks, MergedChecks, maps:iterator(MergedChecks, reversed)).
+
 % Decides whether the checks have changed in a meaningful way (ie ignore "unknown" states)
 meaningfulChange(OldChecks, NewChecks) ->
 	NewFailingChecks = failingChecks(NewChecks),
@@ -80,3 +84,19 @@ failingChecks(Checks) ->
 state_change(Host, System, SystemChecks, SystemMetrics) ->
 	io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
 	notifier:notify(Host, System, failingChecks(SystemChecks), SystemMetrics).
+
+
+-ifdef(TEST).
+	-include_lib("eunit/include/eunit.hrl").
+	nomaliseChecks_test() ->
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 3}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
+		?assertEqual(#{<<"item-count">> => #{<<"ok">> => false, <<"unknown_count">> => 0}, <<"api-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true,  <<"unknown_count">> => 1}}, normaliseChecks(#{<<"item-count">> => #{<<"ok">> => false}, <<"api-check">> => #{<<"ok">> => true}, <<"fetch-info">> => #{<<"ok">> => true}}, #{<<"fetch-info">> => #{<<"ok">> => unknown}})).
+
+	meaningfulChange_test() ->
+		?assertEqual(false, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}})),
+		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 3}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}})),
+		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => false, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}})),
+		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => false, <<"unknown_count">> => 4}})).
+-endif.
