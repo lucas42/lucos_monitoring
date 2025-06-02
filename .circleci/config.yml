@@ -3,7 +3,7 @@ version: 2.1
 jobs:
   test:
     docker:
-      - image: circleci/erlang
+      - image: cimg/elixir
     steps:
       - checkout
       - run:
