@@ -7,8 +7,8 @@ jobs:
     steps:
       - checkout
       - run:
-        name: Install rebar
-        command: mix local.rebar
+          name: Install rebar
+          command: mix local.rebar
       - run:
           name: Run Tests
           command: rebar3 do eunit --cover, cover
