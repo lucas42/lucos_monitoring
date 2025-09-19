@@ -1,0 +1,21 @@
+{
+	"name": "lucOS Monitoring",
+	"short_name": "Monitoring",
+	"start_url": "/",
+	"display": "standalone",
+	"theme_color": "#666",
+	"icons":[
+		{
+			"src": "/icon",
+			"sizes": "100x100",
+			"type": "image/png",
+			"purpose": "any"
+		},
+		{
+			"src": "/maskable_icon.png",
+			"sizes": "100x100",
+			"type": "image/png",
+			"purpose": "maskable"
+		}
+	]
+}

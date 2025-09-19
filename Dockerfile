@@ -8,7 +8,7 @@ ENV ERL_LIBS _build/default/lib/
 COPY rebar.* ./
 RUN rebar3 compile
 
-COPY public ./
+COPY resources ./
 RUN mkdir src
 COPY src/* src/
 RUN rebar3 as prod release
@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y ca-certificates
 
 COPY --from=build /lucos_monitoring/_build/prod/rel/prod/ ./
 COPY --from=navbar lucos_navbar.js .
-COPY public ./
+COPY resources ./
 COPY service-list .
 
 ENV PORT 8015

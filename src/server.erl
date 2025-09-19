@@ -244,6 +244,7 @@ controller(_Method, RequestUri, StatePid) ->
 					<title>Lucos Monitoring</title>
 					<link rel=\"stylesheet\" type=\"text/css\" href=\"/style.css\" />
 					<link rel=\"icon\" href=\"/icon\" />
+					<link rel=\"manifest\" href=\"/manifest.json\" />
 					<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
 					<meta name=\"mobile-web-app-capable\" content=\"yes\">
 				</head>
@@ -289,6 +290,12 @@ controller(_Method, RequestUri, StatePid) ->
 		"/icon" ->
 			{ok, IconFile} = file:read_file("icon.png"),
 			{200, "image/png", IconFile};
+		"/maskable_icon.png" ->
+			{ok, IconFile} = file:read_file("maskable_icon.png"),
+			{200, "image/png", IconFile};
+		"/manifest.json" ->
+			{ok, ManifestFile} = file:read_file("manifest.json"),
+			{200, "application/manifest.json", ManifestFile};
 		"/lucos_navbar.js" ->
 			{ok, ScriptFile} = file:read_file("lucos_navbar.js"),
 			{200, "text/javascript", ScriptFile};
