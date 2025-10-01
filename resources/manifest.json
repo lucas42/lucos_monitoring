@@ -3,7 +3,7 @@
 	"short_name": "Monitoring",
 	"start_url": "/",
 	"display": "standalone",
-	"theme_color": "#666",
+	"theme_color": "#000",
 	"icons":[
 		{
 			"src": "/icon",
