@@ -16,8 +16,7 @@ RUN rebar3 as prod release
 RUN curl "https://configy.l42.eu/systems/http?fields=domain" -H "Accept: text/csv;header=absent" > service-list
 RUN curl "https://configy.l42.eu/hosts/http?fields=domain" -H "Accept: text/csv;header=absent" >> service-list
 
-
-FROM debian:bookworm
+FROM debian:trixie
 
 WORKDIR /web
 RUN apt-get update && apt-get install -y ca-certificates
