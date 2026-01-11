@@ -26,6 +26,4 @@ COPY --from=navbar lucos_navbar.js .
 COPY resources ./
 COPY --from=build /lucos_monitoring/service-list ./
 
-ENV PORT 8015
-EXPOSE $PORT
 CMD ["bin/prod", "foreground"]

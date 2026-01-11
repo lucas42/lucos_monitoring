@@ -3,12 +3,13 @@ services:
     build: .
     container_name: monitoring
     ports: 
-      - "8015:8015"
+      - $PORT:$PORT
     environment:
       - SEND_ADDRESS
       - SEND_PASSWORD
       - SMTP_RELAY
       - TO_ADDRESS
+      - PORT
     image: lucas42/lucos_monitoring
     restart: always
     network_mode: host
