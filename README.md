@@ -3,7 +3,7 @@ Monitoring tool for lucos services
 
 ## Dependencies
 * docker
-* docker-compose
+* docker compose
 
 ## Environment Variables
 
@@ -13,7 +13,7 @@ Monitoring tool for lucos services
 * TO_ADDRESS - The email address to send notifications to
 
 ## Running
-`docker-compose up --no-build`
+`docker compose up --no-build`
 
 ## Building
 The build is configured to run on CircleCI when a commit is pushed to the `main` branch in github.
