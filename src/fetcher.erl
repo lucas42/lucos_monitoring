@@ -189,10 +189,16 @@ checkCI(CircleCISlug) ->
 							}};
 						_ ->
 						Build = lists:nth(1, Response),
-						Outcome = maps:get(<<"outcome">>, Build, <<"unknown">>),
+						Status = maps:get(<<"status">>, Build, <<"unknown">>),
 						BuildUrl = maps:get(<<"build_url">>, Build, <<"">>),
-						case Outcome of
+						case Status of
 							<<"success">> ->
+								#{<<"circleci">> => #{
+									<<"ok">> => true,
+									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+									<<"link">> => BuildUrl
+								}};
+							<<"running">> ->
 								#{<<"circleci">> => #{
 									<<"ok">> => true,
 									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
@@ -209,7 +215,7 @@ checkCI(CircleCISlug) ->
 								#{<<"circleci">> => #{
 									<<"ok">> => false,
 									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-									<<"debug">> => <<"Most recent build's status was \"", Outcome/binary, "\"">>,
+									<<"debug">> => <<"Most recent build's status was \"", Status/binary, "\"">>,
 									<<"link">> => BuildUrl
 								}}
 						end
