@@ -189,20 +189,27 @@ checkCI(CircleCISlug) ->
 							}};
 						_ ->
 						Build = lists:nth(1, Response),
-						Outcome = binary_to_list(maps:get(<<"outcome">>, Build, <<"unknown">>)),
+						Outcome = maps:get(<<"outcome">>, Build, <<"unknown">>),
 						BuildUrl = maps:get(<<"build_url">>, Build, <<"">>),
 						case Outcome of
-							"success" ->
+							<<"success">> ->
 								#{<<"circleci">> => #{
 									<<"ok">> => true,
 									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+									<<"link">> => BuildUrl
+								}};
+							null ->
+								#{<<"circleci">> => #{
+									<<"ok">> => unknown,
+									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+									<<"debug">> => <<"No status returned for most recent build">>,
 									<<"link">> => BuildUrl
 								}};
 							_ ->
 								#{<<"circleci">> => #{
 									<<"ok">> => false,
 									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-									<<"debug">> => list_to_binary("Most recent build's status was \""++Outcome++"\""),
+									<<"debug">> => <<"Most recent build's status was \"", Outcome/binary, "\"">>,
 									<<"link">> => BuildUrl
 								}}
 						end
