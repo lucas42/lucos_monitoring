@@ -1,5 +1,5 @@
 FROM lucas42/lucos_navbar:2.1.2 AS navbar
-FROM erlang:28.3.1.0 AS build
+FROM erlang:28.3.2.0 AS build
 
 WORKDIR /lucos_monitoring
 RUN apt-get update
