@@ -205,15 +205,17 @@ checkCI(CircleCISlug) ->
 									<<"link">> => BuildUrl
 								}};
 							<<"pending">> ->
+								% Treated as ok since we would just wait for it to finish anyway - no action to take
 								#{<<"circleci">> => #{
-									<<"ok">> => unknown,
+									<<"ok">> => true,
 									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
 									<<"debug">> => <<"Most recent build is pending">>,
 									<<"link">> => BuildUrl
 								}};
 							<<"queued">> ->
+								% Treated as ok since we would just wait for it to finish anyway - no action to take
 								#{<<"circleci">> => #{
-									<<"ok">> => unknown,
+									<<"ok">> => true,
 									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
 									<<"debug">> => <<"Most recent build is queued">>,
 									<<"link">> => BuildUrl
