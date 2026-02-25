@@ -204,6 +204,20 @@ checkCI(CircleCISlug) ->
 									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
 									<<"link">> => BuildUrl
 								}};
+							<<"pending">> ->
+								#{<<"circleci">> => #{
+									<<"ok">> => unknown,
+									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+									<<"debug">> => <<"Most recent build is pending">>,
+									<<"link">> => BuildUrl
+								}};
+							<<"queued">> ->
+								#{<<"circleci">> => #{
+									<<"ok">> => unknown,
+									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+									<<"debug">> => <<"Most recent build is queued">>,
+									<<"link">> => BuildUrl
+								}};
 							null ->
 								#{<<"circleci">> => #{
 									<<"ok">> => unknown,
