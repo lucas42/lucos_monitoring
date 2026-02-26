@@ -5,32 +5,51 @@
 start_link() -> gen_server:start_link(?MODULE, [], []).
 
 init([]) ->
-	SystemMap = #{},
-	{ok, SystemMap}.
+	{ok, {#{}, #{}}}.
 
-handle_cast(Request, SystemMap) ->
+handle_cast(Request, {SystemMap, SuppressionMap}) ->
 	case Request of
 		{updateSystem, Host, System, SystemChecks, SystemMetrics} ->
 			io:format("Received update for system ~p (Host ~p)~n", [System, Host]),
 			{_, OldSystemChecks, _} = maps:get(Host, SystemMap, {nil, maps:new(), nil}),
 			NormalisedChecks = normaliseChecks(OldSystemChecks, SystemChecks),
-			case meaningfulChange(OldSystemChecks, NormalisedChecks) of
+			NewSuppressionMap = case meaningfulChange(OldSystemChecks, NormalisedChecks) of
 				true ->
-					state_change(Host, System, NormalisedChecks, SystemMetrics);
+					state_change(Host, System, NormalisedChecks, SystemMetrics, SuppressionMap);
 				false ->
-					ok
+					SuppressionMap
 			end,
 			NewSystemMap = maps:put(Host, {System, NormalisedChecks, SystemMetrics}, SystemMap),
-			{noreply, NewSystemMap}
+			{noreply, {NewSystemMap, NewSuppressionMap}}
 	end.
 
-handle_call(Request, _From, SystemMap) ->
+handle_call(Request, _From, {SystemMap, SuppressionMap}) ->
 	case Request of
 		{fetch, all} ->
-			{reply, SystemMap, SystemMap};
+			{reply, SystemMap, {SystemMap, SuppressionMap}};
 		{fetch, Host} ->
-			{reply, maps:get(Host, SystemMap), SystemMap}
+			{reply, maps:get(Host, SystemMap), {SystemMap, SuppressionMap}};
+		{suppress, System} ->
+			case systemExists(System, SystemMap) of
+				true ->
+					ExpiryTime = erlang:system_time(second) + 600,
+					NewSuppressionMap = maps:put(System, ExpiryTime, SuppressionMap),
+					io:format("Suppression window opened for ~p~n", [System]),
+					{reply, ok, {SystemMap, NewSuppressionMap}};
+				false ->
+					{reply, {error, not_found}, {SystemMap, SuppressionMap}}
+			end;
+		{unsuppress, System} ->
+			NewSuppressionMap = maps:remove(System, SuppressionMap),
+			io:format("Suppression window closed for ~p~n", [System]),
+			{reply, ok, {SystemMap, NewSuppressionMap}}
 	end.
+
+systemExists(System, SystemMap) ->
+	maps:fold(fun
+		(_, {S, _, _}, _) when S =:= System -> true;
+		(_, _, Acc) -> Acc
+	end, false, SystemMap).
 
 % Replaces any unknown "ok" with whichever the value was there previously, until 3 consecutive unknowns are recieved at which point ok is set to false
 replaceUnknowns(OldChecks, NewChecks, Iterator) ->
@@ -81,9 +100,25 @@ failingChecks(Checks) ->
 		maps:get(<<"ok">>, Check, unknown) == false
 	end, Checks).
 
-state_change(Host, System, SystemChecks, SystemMetrics) ->
-	io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
-	notifier:notify(Host, System, failingChecks(SystemChecks), SystemMetrics).
+state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap) ->
+	case maps:get(System, SuppressionMap, undefined) of
+		undefined ->
+			io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
+			notifier:notify(Host, System, failingChecks(SystemChecks), SystemMetrics),
+			SuppressionMap;
+		ExpiryTime ->
+			Now = erlang:system_time(second),
+			case Now < ExpiryTime of
+				true ->
+					io:format("Alert suppressed for ~p during deploy window~n", [System]),
+					SuppressionMap;
+				false ->
+					io:format("ERROR: Suppression window for ~p expired without being cleared - deploy may have taken longer than 10 minutes~n", [System]),
+					io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
+					notifier:notify(Host, System, failingChecks(SystemChecks), SystemMetrics),
+					maps:remove(System, SuppressionMap)
+			end
+	end.
 
 
 -ifdef(TEST).
@@ -99,4 +134,14 @@ state_change(Host, System, SystemChecks, SystemMetrics) ->
 		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 3}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}})),
 		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => false, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}})),
 		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => false, <<"unknown_count">> => 4}})).
+
+	systemExists_test() ->
+		SystemMap = #{
+			"host1.example.com" => {"lucos_foo", #{}, #{}},
+			"host2.example.com" => {"lucos_bar", #{}, #{}}
+		},
+		?assertEqual(true, systemExists("lucos_foo", SystemMap)),
+		?assertEqual(true, systemExists("lucos_bar", SystemMap)),
+		?assertEqual(false, systemExists("lucos_missing", SystemMap)),
+		?assertEqual(false, systemExists("lucos_foo", #{})).
 -endif.

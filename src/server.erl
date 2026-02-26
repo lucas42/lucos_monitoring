@@ -74,6 +74,7 @@ getStatusLine(StatusCode) ->
 getReasonPhrase(StatusCode) ->
 	case StatusCode of
 		200 -> "OK";
+		204 -> "No Content";
 		404 -> "Not Found";
 		500 -> "Internal Error"
 	end.
@@ -233,7 +234,7 @@ encodeInfo(Systems) ->
 		show_on_homepage => true
 	}).
 
-controller(_Method, RequestUri, StatePid) ->
+controller(Method, RequestUri, StatePid) ->
 	Path = re:replace(RequestUri, "\\?.*$", "", [{return,list}]),
 	case Path of
 		"/" ->
@@ -300,7 +301,23 @@ controller(_Method, RequestUri, StatePid) ->
 			{ok, ScriptFile} = file:read_file("lucos_navbar.js"),
 			{200, "text/javascript", ScriptFile};
 		_ ->
-			{404, "text/plain", "Not Found"}
+			case string:prefix(Path, "/suppress/") of
+				nomatch ->
+					{404, "text/plain", "Not Found"};
+				System ->
+					case Method of
+						'PUT' ->
+							case gen_server:call(StatePid, {suppress, System}) of
+								ok ->
+									{204, "text/plain", ""};
+								{error, not_found} ->
+									{404, "text/plain", "System not found"}
+							end;
+						'DELETE' ->
+							gen_server:call(StatePid, {unsuppress, System}),
+							{204, "text/plain", ""}
+					end
+			end
 	end.
 
 tryController(Method, RequestUri, StatePid) ->
