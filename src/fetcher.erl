@@ -260,13 +260,94 @@ checkCI(CircleCISlug) ->
 
 -ifdef(TEST).
 	parseInfo_test() ->
+		% Basic: system field only, no checks/metrics/ci
 		?assertEqual({"lucos_test",#{},#{},null}, parseInfo("{\"system\":\"lucos_test\"}")),
+		% Checks field is extracted when present
+		?assertEqual({"lucos_test",#{<<"db">> => #{<<"ok">> => true}},#{},null}, parseInfo("{\"system\":\"lucos_test\",\"checks\":{\"db\":{\"ok\":true}}}")),
+		% ci.circle field is extracted correctly
+		?assertEqual({"lucos_test",#{},#{},<<"gh/lucas42/lucos_test">>}, parseInfo("{\"system\":\"lucos_test\",\"ci\":{\"circle\":\"gh/lucas42/lucos_test\"}}")),
+		% ci present but no circle key returns null
+		?assertEqual({"lucos_test",#{},#{},null}, parseInfo("{\"system\":\"lucos_test\",\"ci\":{}}")),
+		% Invalid JSON raises an exception
 		?assertException(error, {2,invalid_json}, parseInfo("{{{{}}}")),
-		?assertException(error, {badkey,<<"system">>}, parseInfo("{}")).
+		% Empty body raises an exception
+		?assertException(error, _, parseInfo("")),
+		% Missing required 'system' field raises an exception
+		?assertException(error, {badkey,<<"system">>}, parseInfo("{}")),
+		% system as integer raises an exception (binary_to_list fails on non-binary)
+		?assertException(error, badarg, parseInfo("{\"system\":42}")),
+		% system as JSON null raises an exception (null becomes atom null, not a binary)
+		?assertException(error, badarg, parseInfo("{\"system\":null}")),
+		% ci as a non-map raises an exception (maps:get fails on non-map)
+		?assertException(error, {badmap,<<"not_a_map">>}, parseInfo("{\"system\":\"lucos_test\",\"ci\":\"not_a_map\"}")).
+
+	% BUG: checks as a non-map string passes through parseInfo without error,
+	% causing runChecks to crash with {badmap,_} when it calls maps:merge.
+	% parseInfo should validate checks is a map so fetchInfo's try-catch handles it.
+	parseInfo_checks_nonmap_bug_test() ->
+		?assertException(error, _, parseInfo("{\"system\":\"lucos_test\",\"checks\":\"not_a_map\"}")).
+
+	% BUG: checks as JSON null passes through parseInfo without error,
+	% causing runChecks to crash with {badmap,null} when it calls maps:merge.
+	parseInfo_checks_null_bug_test() ->
+		?assertException(error, _, parseInfo("{\"system\":\"lucos_test\",\"checks\":null}")).
+
+	% BUG: metrics as a non-map value passes through parseInfo without error,
+	% causing runChecks to crash when the state server tries to handle it.
+	parseInfo_metrics_nonmap_bug_test() ->
+		?assertException(error, _, parseInfo("{\"system\":\"lucos_test\",\"metrics\":42}")).
+
 	parseError_test() ->
+		% IPv4+IPv6: IPv4 HTTP timeout (unknown) + IPv6 connection refused (false) → false
 		?assertEqual({false, "HTTP connection timed out whilst connecting to example.l42.eu on port 443 over ipv4; Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],econnrefused},{inet,[inet],timeout}]})),
+		% IPv4 only: TCP connection closed
 		?assertEqual({false, "TCP connection was closed connecting to host example.l42.eu on port 1234 over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",1234}}, {inet,[inet],closed}]})),
+		% IPv6 only: DNS failure
 		?assertEqual({unknown, "DNS failure when trying to resolve ipv6 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",1234}}, {inet6,[inet6],nxdomain}]})),
+		% IPv6 only: unknown connection error type
 		?assertEqual({false, "An unknown connection error occured: not_a_real_error (ipv6 connection)"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],not_a_real_error}]})),
+		% Completely unknown top-level error term
 		?assertEqual({false, "An unknown error occured: {not_a_real_error}"}, parseError({not_a_real_error})).
+
+	parseError_topLevel_test() ->
+		% The remote end closed the socket unexpectedly
+		?assertEqual({false, "Socket closed remotely"}, parseError(socket_closed_remotely)),
+		% The overall HTTP request timed out at the httpc level (distinct from connection-level timeout)
+		?assertEqual({unknown, "HTTP Request timed out"}, parseError(timeout)).
+
+	parseError_ipv4_test() ->
+		% DNS lookup failure over IPv4
+		?assertEqual({unknown, "DNS failure when trying to resolve ipv4 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],nxdomain}]})),
+		% No route to host over IPv4
+		?assertEqual({unknown, "No route to host example.l42.eu over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],ehostunreach}]})),
+		% TCP connection refused over IPv4
+		?assertEqual({false, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],econnrefused}]})),
+		% TCP connection timed out over IPv4
+		?assertEqual({unknown, "TCP connection timed out whilst connecting to example.l42.eu on port 443 over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],etimedout}]})),
+		% HTTP-level connection timeout over IPv4
+		?assertEqual({unknown, "HTTP connection timed out whilst connecting to example.l42.eu on port 443 over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],timeout}]})),
+		% Unknown connection error type over IPv4
+		?assertEqual({false, "An unknown connection error occured: not_a_real_error (ipv4 connection)"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],not_a_real_error}]})),
+		% TLS handshake/certificate errors fall through to the unknown connection error handler
+		?assertEqual({false, "An unknown connection error occured: {tls_alert,certificate_expired} (ipv4 connection)"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],{tls_alert,certificate_expired}}]})).
+
+	parseError_ipv6_test() ->
+		% No route to host over IPv6
+		?assertEqual({unknown, "No route to host example.l42.eu over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],ehostunreach}]})),
+		% TCP connection refused over IPv6
+		?assertEqual({false, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],econnrefused}]})),
+		% TCP connection timed out over IPv6
+		?assertEqual({unknown, "TCP connection timed out whilst connecting to example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],etimedout}]})),
+		% HTTP-level connection timeout over IPv6
+		?assertEqual({unknown, "HTTP connection timed out whilst connecting to example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],timeout}]})),
+		% TCP connection was closed over IPv6
+		?assertEqual({false, "TCP connection was closed connecting to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],closed}]})).
+
+	parseError_combined_test() ->
+		% Both IPv4 and IPv6 fail with DNS errors (both unknown → overall unknown)
+		?assertEqual({unknown, "DNS failure when trying to resolve ipv4 address for example.l42.eu; DNS failure when trying to resolve ipv6 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],nxdomain},{inet,[inet],nxdomain}]})),
+		% Both IPv4 and IPv6 connection refused (both false → overall false)
+		?assertEqual({false, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv4; Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],econnrefused},{inet,[inet],econnrefused}]})),
+		% IPv4 connection refused (false) + IPv6 DNS failure (unknown) → overall false
+		?assertEqual({false, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv4; DNS failure when trying to resolve ipv6 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],nxdomain},{inet,[inet],econnrefused}]})).
 -endif.
