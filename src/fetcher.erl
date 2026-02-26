@@ -79,8 +79,8 @@ checkTlsExpiry(Host) ->
 parseInfo(Body) ->
 	Info = jiffy:decode(Body, [return_maps]),
 	System = binary_to_list(maps:get(<<"system">>, Info)),
-	Checks = maps:get(<<"checks">>, Info, #{}),
-	Metrics = maps:get(<<"metrics">>, Info, #{}),
+	Checks = maps:merge(#{}, maps:get(<<"checks">>, Info, #{})),
+	Metrics = maps:merge(#{}, maps:get(<<"metrics">>, Info, #{})),
 	CircleCISlug = maps:get(<<"circle">>, maps:get(<<"ci">>, Info, #{}), null),
 	{System, Checks, Metrics, CircleCISlug}.
 
