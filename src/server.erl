@@ -76,6 +76,7 @@ getReasonPhrase(StatusCode) ->
 		200 -> "OK";
 		204 -> "No Content";
 		404 -> "Not Found";
+		405 -> "Method Not Allowed";
 		500 -> "Internal Error"
 	end.
 
@@ -315,7 +316,9 @@ controller(Method, RequestUri, StatePid) ->
 							end;
 						'DELETE' ->
 							gen_server:call(StatePid, {unsuppress, System}),
-							{204, "text/plain", ""}
+							{204, "text/plain", ""};
+						_ ->
+							{405, "text/plain", "Method Not Allowed"}
 					end
 			end
 	end.
