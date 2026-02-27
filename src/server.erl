@@ -37,26 +37,39 @@ accept(ListenSocket, SchedulerID, StatePid) ->
 handleRequest(Socket, StatePid) ->
 	case gen_tcp:recv(Socket, 0) of
 		{ok, {http_request, Method, {abs_path, RequestUri}, _Version}} ->
-			handleRequest(Socket, Method, binary_to_list(RequestUri), StatePid);
+			handleRequest(Socket, Method, binary_to_list(RequestUri), #{}, StatePid);
 		Error ->
 			Error
 	end.
-handleRequest(Socket, Method, RequestUri, StatePid) ->
+handleRequest(Socket, Method, RequestUri, Headers, StatePid) ->
 	case gen_tcp:recv(Socket, 0) of
 		{ok, http_eoh} ->
+			ContentLength = maps:get('Content-Length', Headers, 0),
+			RequestBody = readBody(Socket, ContentLength),
 			DateTime = calendar:system_time_to_rfc3339(erlang:system_time(second)),
 			ClientIP = getClientIP(Socket),
-			{StatusCode, ContentType, Body} = tryController(Method, RequestUri, StatePid),
-			Response = getHeaders(StatusCode, ContentType) ++ Body,
+			{StatusCode, ContentType, ResponseBody} = tryController(Method, RequestUri, RequestBody, StatePid),
+			Response = getHeaders(StatusCode, ContentType) ++ ResponseBody,
 			gen_tcp:send(Socket, Response),
 			gen_tcp:close(Socket),
 			io:format("~p ~p ~p ~p ~p~n", [ClientIP, DateTime, Method, StatusCode, RequestUri]),
 			ok;
+		{ok, {http_header, _, 'Content-Length', _, Value}} ->
+			{Length, _} = string:to_integer(binary_to_list(Value)),
+			handleRequest(Socket, Method, RequestUri, maps:put('Content-Length', Length, Headers), StatePid);
 		{ok, _Data} ->
-			handleRequest(Socket, Method, RequestUri, StatePid);
+			handleRequest(Socket, Method, RequestUri, Headers, StatePid);
 
 		Error ->
 			Error
+	end.
+
+readBody(_Socket, 0) -> "";
+readBody(Socket, Length) ->
+	inet:setopts(Socket, [{packet, raw}]),
+	case gen_tcp:recv(Socket, Length) of
+		{ok, Data} -> binary_to_list(Data);
+		_ -> ""
 	end.
 
 getClientIP(Socket) ->
@@ -75,6 +88,7 @@ getReasonPhrase(StatusCode) ->
 	case StatusCode of
 		200 -> "OK";
 		204 -> "No Content";
+		400 -> "Bad Request";
 		404 -> "Not Found";
 		405 -> "Method Not Allowed";
 		500 -> "Internal Error"
@@ -235,7 +249,7 @@ encodeInfo(Systems) ->
 		show_on_homepage => true
 	}).
 
-controller(Method, RequestUri, StatePid) ->
+controller(Method, RequestUri, Body, StatePid) ->
 	Path = re:replace(RequestUri, "\\?.*$", "", [{return,list}]),
 	case Path of
 		"/" ->
@@ -301,6 +315,22 @@ controller(Method, RequestUri, StatePid) ->
 		"/lucos_navbar.js" ->
 			{ok, ScriptFile} = file:read_file("lucos_navbar.js"),
 			{200, "text/javascript", ScriptFile};
+		"/suppress/clear" ->
+			case Method of
+				'POST' ->
+					try jiffy:decode(list_to_binary(Body), [return_maps]) of
+						#{<<"systemDeployed">> := System} ->
+							gen_server:call(StatePid, {unsuppress, binary_to_list(System)}),
+							{204, "text/plain", ""};
+						_ ->
+							{400, "text/plain", "Missing systemDeployed field"}
+					catch
+						_:_ ->
+							{400, "text/plain", "Invalid JSON body"}
+					end;
+				_ ->
+					{405, "text/plain", "Method Not Allowed"}
+			end;
 		_ ->
 			case string:prefix(Path, "/suppress/") of
 				nomatch ->
@@ -323,8 +353,8 @@ controller(Method, RequestUri, StatePid) ->
 			end
 	end.
 
-tryController(Method, RequestUri, StatePid) ->
-	try controller(Method, RequestUri, StatePid) of
+tryController(Method, RequestUri, Body, StatePid) ->
+	try controller(Method, RequestUri, Body, StatePid) of
 		Response -> Response
 	catch
 		ExceptionClass:Term:StackTrace ->
