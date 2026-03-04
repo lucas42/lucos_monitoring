@@ -230,6 +230,45 @@ renderAll(SystemMap) ->
 			"
 		end, "", SortedSystems).
 
+systemNameBinary(unknown) -> <<"unknown">>;
+systemNameBinary(Name) when is_list(Name) -> list_to_binary(Name).
+
+encodeStatus(SystemMap) ->
+	SystemList = maps:to_list(SystemMap),
+	EncodedSystems = maps:from_list(lists:map(
+		fun ({Host, {SystemName, SystemChecks, SystemMetrics}}) ->
+			Healthy = systemHealthy(SystemChecks),
+			EncodedChecks = maps:map(
+				fun (_CheckId, CheckInfo) ->
+					maps:without([<<"unknown_count">>, <<"link">>], CheckInfo)
+				end, SystemChecks),
+			SystemJson = #{
+				<<"name">> => systemNameBinary(SystemName),
+				<<"healthy">> => Healthy,
+				<<"checks">> => EncodedChecks,
+				<<"metrics">> => SystemMetrics
+			},
+			{list_to_binary(Host), SystemJson}
+		end, SystemList)),
+	{TotalSystems, HealthyCount, ErroringCount, UnknownCount} = lists:foldl(
+		fun ({_Host, {_Name, SystemChecks, _Metrics}}, {Total, Healthy, Erroring, Unknown}) ->
+			case systemHealthy(SystemChecks) of
+				true  -> {Total + 1, Healthy + 1, Erroring, Unknown};
+				false -> {Total + 1, Healthy, Erroring + 1, Unknown};
+				_     -> {Total + 1, Healthy, Erroring, Unknown + 1}
+			end
+		end, {0, 0, 0, 0}, SystemList),
+	Summary = #{
+		<<"total_systems">> => TotalSystems,
+		<<"healthy">> => HealthyCount,
+		<<"erroring">> => ErroringCount,
+		<<"unknown">> => UnknownCount
+	},
+	jiffy:encode(#{
+		<<"systems">> => EncodedSystems,
+		<<"summary">> => Summary
+	}).
+
 encodeInfo(Systems) ->
 	jiffy:encode(#{
 		system => <<"lucos_monitoring">>,
@@ -300,6 +339,9 @@ controller(Method, RequestUri, Body, StatePid) ->
 			"};
 		"/robots.txt" ->
 			{200, "text/plain", "User-agent: *\nDisallow:\n"};
+		"/api/status" ->
+			Systems = gen_server:call(StatePid, {fetch, all}),
+			{200, "application/json", encodeStatus(Systems)};
 		"/_info" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
 			{200, "application/json", encodeInfo(Systems)};
@@ -361,3 +403,96 @@ tryController(Method, RequestUri, Body, StatePid) ->
 			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace]),
 			{500, "text/plain", "An Error occurred whilst generating this page."}
 	end.
+
+-ifdef(TEST).
+	-include_lib("eunit/include/eunit.hrl").
+
+	encodeStatus_empty_test() ->
+		Result = jiffy:decode(encodeStatus(#{}), [return_maps]),
+		?assertEqual(#{}, maps:get(<<"systems">>, Result)),
+		Summary = maps:get(<<"summary">>, Result),
+		?assertEqual(0, maps:get(<<"total_systems">>, Summary)),
+		?assertEqual(0, maps:get(<<"healthy">>, Summary)),
+		?assertEqual(0, maps:get(<<"erroring">>, Summary)),
+		?assertEqual(0, maps:get(<<"unknown">>, Summary)).
+
+	encodeStatus_healthy_system_test() ->
+		SystemMap = #{
+			"example.l42.eu" => {"lucos_example", #{
+				<<"fetch-info">> => #{<<"ok">> => true, <<"techDetail">> => <<"Fetches /_info">>}
+			}, #{}}
+		},
+		Result = jiffy:decode(encodeStatus(SystemMap), [return_maps]),
+		Systems = maps:get(<<"systems">>, Result),
+		System = maps:get(<<"example.l42.eu">>, Systems),
+		?assertEqual(<<"lucos_example">>, maps:get(<<"name">>, System)),
+		?assertEqual(true, maps:get(<<"healthy">>, System)),
+		Summary = maps:get(<<"summary">>, Result),
+		?assertEqual(1, maps:get(<<"total_systems">>, Summary)),
+		?assertEqual(1, maps:get(<<"healthy">>, Summary)),
+		?assertEqual(0, maps:get(<<"erroring">>, Summary)),
+		?assertEqual(0, maps:get(<<"unknown">>, Summary)).
+
+	encodeStatus_erroring_system_test() ->
+		SystemMap = #{
+			"broken.l42.eu" => {"lucos_broken", #{
+				<<"fetch-info">> => #{<<"ok">> => false, <<"techDetail">> => <<"Fetches /_info">>, <<"debug">> => <<"Connection refused">>}
+			}, #{}}
+		},
+		Result = jiffy:decode(encodeStatus(SystemMap), [return_maps]),
+		Systems = maps:get(<<"systems">>, Result),
+		System = maps:get(<<"broken.l42.eu">>, Systems),
+		?assertEqual(false, maps:get(<<"healthy">>, System)),
+		Checks = maps:get(<<"checks">>, System),
+		FetchInfo = maps:get(<<"fetch-info">>, Checks),
+		?assertEqual(false, maps:get(<<"ok">>, FetchInfo)),
+		?assertEqual(<<"Connection refused">>, maps:get(<<"debug">>, FetchInfo)),
+		Summary = maps:get(<<"summary">>, Result),
+		?assertEqual(1, maps:get(<<"total_systems">>, Summary)),
+		?assertEqual(0, maps:get(<<"healthy">>, Summary)),
+		?assertEqual(1, maps:get(<<"erroring">>, Summary)),
+		?assertEqual(0, maps:get(<<"unknown">>, Summary)).
+
+	encodeStatus_unknown_system_name_test() ->
+		SystemMap = #{
+			"unreachable.l42.eu" => {unknown, #{
+				<<"fetch-info">> => #{<<"ok">> => unknown, <<"techDetail">> => <<"Fetches /_info">>}
+			}, #{}}
+		},
+		Result = jiffy:decode(encodeStatus(SystemMap), [return_maps]),
+		Systems = maps:get(<<"systems">>, Result),
+		System = maps:get(<<"unreachable.l42.eu">>, Systems),
+		?assertEqual(<<"unknown">>, maps:get(<<"name">>, System)),
+		Summary = maps:get(<<"summary">>, Result),
+		?assertEqual(1, maps:get(<<"total_systems">>, Summary)),
+		?assertEqual(0, maps:get(<<"healthy">>, Summary)),
+		?assertEqual(0, maps:get(<<"erroring">>, Summary)),
+		?assertEqual(1, maps:get(<<"unknown">>, Summary)).
+
+	encodeStatus_strips_internal_fields_test() ->
+		SystemMap = #{
+			"example.l42.eu" => {"lucos_example", #{
+				<<"fetch-info">> => #{<<"ok">> => true, <<"techDetail">> => <<"Fetches /_info">>, <<"unknown_count">> => 0, <<"link">> => <<"https://example.l42.eu/_info">>}
+			}, #{}}
+		},
+		Result = jiffy:decode(encodeStatus(SystemMap), [return_maps]),
+		Systems = maps:get(<<"systems">>, Result),
+		System = maps:get(<<"example.l42.eu">>, Systems),
+		Checks = maps:get(<<"checks">>, System),
+		FetchInfo = maps:get(<<"fetch-info">>, Checks),
+		?assertEqual(false, maps:is_key(<<"unknown_count">>, FetchInfo)),
+		?assertEqual(false, maps:is_key(<<"link">>, FetchInfo)).
+
+	encodeStatus_multiple_systems_summary_test() ->
+		SystemMap = #{
+			"healthy.l42.eu" => {"lucos_healthy", #{<<"fetch-info">> => #{<<"ok">> => true, <<"techDetail">> => <<"">>}}, #{}},
+			"erroring.l42.eu" => {"lucos_erroring", #{<<"fetch-info">> => #{<<"ok">> => false, <<"techDetail">> => <<"">>}}, #{}},
+			"unknown.l42.eu" => {unknown, #{<<"fetch-info">> => #{<<"ok">> => unknown, <<"techDetail">> => <<"">>}}, #{}}
+		},
+		Result = jiffy:decode(encodeStatus(SystemMap), [return_maps]),
+		Summary = maps:get(<<"summary">>, Result),
+		?assertEqual(3, maps:get(<<"total_systems">>, Summary)),
+		?assertEqual(1, maps:get(<<"healthy">>, Summary)),
+		?assertEqual(1, maps:get(<<"erroring">>, Summary)),
+		?assertEqual(1, maps:get(<<"unknown">>, Summary)).
+-endif.
