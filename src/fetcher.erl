@@ -251,6 +251,24 @@ checkCIWorkflows(Slug, PipelineId, PipelineUrl, TechDetail, AuthHeader) ->
 			}}
 	end.
 
+% For each workflow name, keep only the most recent workflow (by created_at).
+% This ensures that a successful retry supersedes an earlier failure with the same name.
+keepLatestWorkflowPerName(Workflows) ->
+	LatestByName = lists:foldl(fun(W, Acc) ->
+		Name = maps:get(<<"name">>, W, <<"">>),
+		CreatedAt = maps:get(<<"created_at">>, W, <<"">>),
+		case maps:find(Name, Acc) of
+			{ok, Existing} ->
+				ExistingCreatedAt = maps:get(<<"created_at">>, Existing, <<"">>),
+				if CreatedAt > ExistingCreatedAt -> maps:put(Name, W, Acc);
+				   true -> Acc
+				end;
+			error ->
+				maps:put(Name, W, Acc)
+		end
+	end, #{}, Workflows),
+	maps:values(LatestByName).
+
 checkWorkflowStatuses(_Slug, [], PipelineUrl, TechDetail) ->
 	#{<<"circleci">> => #{
 		<<"ok">> => true,
@@ -259,8 +277,9 @@ checkWorkflowStatuses(_Slug, [], PipelineUrl, TechDetail) ->
 		<<"link">> => list_to_binary(PipelineUrl)
 	}};
 checkWorkflowStatuses(Slug, Workflows, PipelineUrl, TechDetail) ->
-	FailedWorkflows = [W || W <- Workflows, maps:get(<<"status">>, W, null) =:= <<"failed">>],
-	RunningWorkflows = [W || W <- Workflows, maps:get(<<"status">>, W, null) =:= <<"running">>],
+	LatestWorkflows = keepLatestWorkflowPerName(Workflows),
+	FailedWorkflows = [W || W <- LatestWorkflows, maps:get(<<"status">>, W, null) =:= <<"failed">>],
+	RunningWorkflows = [W || W <- LatestWorkflows, maps:get(<<"status">>, W, null) =:= <<"running">>],
 	case FailedWorkflows of
 		[FailedWorkflow | _] ->
 			WorkflowName = maps:get(<<"name">>, FailedWorkflow, <<"unknown">>),
@@ -444,4 +463,30 @@ checkWorkflowStatuses(Slug, Workflows, PipelineUrl, TechDetail) ->
 			<<"techDetail">> => <<"Checks status of most recent circleCI pipeline">>,
 			<<"link">> => <<"https://app.circleci.com/pipelines/github/lucas42/lucos_test/42">>
 		}}, Result).
+
+	checkWorkflowStatuses_retry_success_supersedes_failure_test() ->
+		% A successful re-run (same workflow name, later created_at) should supersede an earlier failure.
+		% This is the bug described in #34: manual retries were being ignored.
+		Workflows = [
+			#{<<"id">> => <<"wf-1">>, <<"name">> => <<"build-deploy">>, <<"status">> => <<"failed">>,  <<"created_at">> => <<"2026-02-22T16:42:52.000Z">>},
+			#{<<"id">> => <<"wf-2">>, <<"name">> => <<"build-deploy">>, <<"status">> => <<"success">>, <<"created_at">> => <<"2026-02-22T17:52:17.000Z">>}
+		],
+		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/github/lucas42/lucos_test/42", <<"Checks status of most recent circleCI pipeline">>),
+		?assertMatch(#{<<"circleci">> := #{<<"ok">> := true}}, Result).
+
+	keepLatestWorkflowPerName_test() ->
+		% Single workflow → returned as-is
+		W1 = #{<<"id">> => <<"wf-1">>, <<"name">> => <<"build-deploy">>, <<"created_at">> => <<"2026-02-22T16:00:00.000Z">>},
+		?assertEqual([W1], keepLatestWorkflowPerName([W1])),
+
+		% Two workflows with the same name → only the later one survives
+		W2 = #{<<"id">> => <<"wf-2">>, <<"name">> => <<"build-deploy">>, <<"created_at">> => <<"2026-02-22T17:00:00.000Z">>},
+		?assertEqual([W2], keepLatestWorkflowPerName([W1, W2])),
+
+		% Two workflows with different names → both survive
+		W3 = #{<<"id">> => <<"wf-3">>, <<"name">> => <<"test-api">>, <<"created_at">> => <<"2026-02-22T16:00:00.000Z">>},
+		Result = keepLatestWorkflowPerName([W1, W3]),
+		?assertEqual(2, length(Result)),
+		?assert(lists:member(W1, Result)),
+		?assert(lists:member(W3, Result)).
 -endif.
