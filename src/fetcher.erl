@@ -176,84 +176,114 @@ checkCI(CircleCISlug) ->
 	case CircleCISlug of
 		null -> #{};
 		_ ->
-			ApiUrl = "https://circleci.com/api/v1.1/project/"++binary_to_list(CircleCISlug)++"/tree/main?circle-token="++os:getenv("CIRCLECI_API_TOKEN", "")++"&limit=1&filter=complete",
-			case httpc:request(get, {ApiUrl, [{"Accept","application/json"}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
-				{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
-					Response = jiffy:decode(Body, [return_maps]),
-					case Response of
+			TechDetail = <<"Checks status of most recent circleCI pipeline">>,
+			Token = os:getenv("CIRCLECI_API_TOKEN", ""),
+			AuthHeader = {"Circle-Token", Token},
+			PipelineUrl = "https://circleci.com/api/v2/project/"++binary_to_list(CircleCISlug)++"/pipeline?branch=main",
+			case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
+				{ok, {{_Version, 200, _ReasonPhrase}, _Headers, PipelineBody}} ->
+					PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
+					case maps:get(<<"items">>, PipelineResponse, []) of
 						[] ->
 							#{<<"circleci">> => #{
 								<<"ok">> => true,
-								<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-								<<"debug">> => <<"No recent builds found">>
+								<<"techDetail">> => TechDetail,
+								<<"debug">> => <<"No recent pipelines found">>
 							}};
-						_ ->
-						Build = lists:nth(1, Response),
-						Status = maps:get(<<"status">>, Build, <<"unknown">>),
-						BuildUrl = maps:get(<<"build_url">>, Build, <<"">>),
-						case Status of
-							<<"success">> ->
-								#{<<"circleci">> => #{
-									<<"ok">> => true,
-									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-									<<"link">> => BuildUrl
-								}};
-							<<"running">> ->
-								#{<<"circleci">> => #{
-									<<"ok">> => true,
-									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-									<<"link">> => BuildUrl
-								}};
-							<<"pending">> ->
-								% Treated as ok since we would just wait for it to finish anyway - no action to take
-								#{<<"circleci">> => #{
-									<<"ok">> => true,
-									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-									<<"debug">> => <<"Most recent build is pending">>,
-									<<"link">> => BuildUrl
-								}};
-							<<"queued">> ->
-								% Treated as ok since we would just wait for it to finish anyway - no action to take
-								#{<<"circleci">> => #{
-									<<"ok">> => true,
-									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-									<<"debug">> => <<"Most recent build is queued">>,
-									<<"link">> => BuildUrl
-								}};
-							null ->
-								#{<<"circleci">> => #{
-									<<"ok">> => unknown,
-									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-									<<"debug">> => <<"No status returned for most recent build">>,
-									<<"link">> => BuildUrl
-								}};
-							_ ->
-								#{<<"circleci">> => #{
-									<<"ok">> => false,
-									<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-									<<"debug">> => <<"Most recent build's status was \"", Status/binary, "\"">>,
-									<<"link">> => BuildUrl
-								}}
-						end
+						[LatestPipeline | _] ->
+							PipelineId = binary_to_list(maps:get(<<"id">>, LatestPipeline)),
+							PipelineNumber = maps:get(<<"number">>, LatestPipeline),
+							PipelineUrl2 = "https://app.circleci.com/pipelines/"++binary_to_list(CircleCISlug)++"/"++integer_to_list(PipelineNumber),
+							checkCIWorkflows(binary_to_list(CircleCISlug), PipelineId, PipelineUrl2, TechDetail, AuthHeader)
 					end;
 				{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} when StatusCode >= 500 ->
 					#{<<"circleci">> => #{
 						<<"ok">> => unknown,
-						<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-						<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase)
+						<<"techDetail">> => TechDetail,
+						<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
 					}};
 				{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 					#{<<"circleci">> => #{
 						<<"ok">> => false,
-						<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
-						<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase)
+						<<"techDetail">> => TechDetail,
+						<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
 					}};
 				{error, Error} ->
 					{Ok, Debug} = parseError(Error),
 					#{<<"circleci">> => #{
 						<<"ok">> => Ok,
-						<<"techDetail">> => <<"Checks status of most recent circleCI build">>,
+						<<"techDetail">> => TechDetail,
 						<<"debug">> => list_to_binary(Debug)
+					}}
+			end
+	end.
+
+checkCIWorkflows(Slug, PipelineId, PipelineUrl, TechDetail, AuthHeader) ->
+	WorkflowUrl = "https://circleci.com/api/v2/pipeline/"++PipelineId++"/workflow",
+	case httpc:request(get, {WorkflowUrl, [{"Accept","application/json"}, AuthHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
+		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, WorkflowBody}} ->
+			WorkflowResponse = jiffy:decode(WorkflowBody, [return_maps]),
+			Workflows = maps:get(<<"items">>, WorkflowResponse, []),
+			checkWorkflowStatuses(Slug, Workflows, PipelineUrl, TechDetail);
+		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} when StatusCode >= 500 ->
+			#{<<"circleci">> => #{
+				<<"ok">> => unknown,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from workflow endpoint"),
+				<<"link">> => list_to_binary(PipelineUrl)
+			}};
+		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
+			#{<<"circleci">> => #{
+				<<"ok">> => false,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from workflow endpoint"),
+				<<"link">> => list_to_binary(PipelineUrl)
+			}};
+		{error, Error} ->
+			{Ok, Debug} = parseError(Error),
+			#{<<"circleci">> => #{
+				<<"ok">> => Ok,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => list_to_binary(Debug),
+				<<"link">> => list_to_binary(PipelineUrl)
+			}}
+	end.
+
+checkWorkflowStatuses(_Slug, [], PipelineUrl, TechDetail) ->
+	#{<<"circleci">> => #{
+		<<"ok">> => true,
+		<<"techDetail">> => TechDetail,
+		<<"debug">> => <<"No workflows found for most recent pipeline">>,
+		<<"link">> => list_to_binary(PipelineUrl)
+	}};
+checkWorkflowStatuses(Slug, Workflows, PipelineUrl, TechDetail) ->
+	FailedWorkflows = [W || W <- Workflows, maps:get(<<"status">>, W, null) =:= <<"failed">>],
+	RunningWorkflows = [W || W <- Workflows, maps:get(<<"status">>, W, null) =:= <<"running">>],
+	case FailedWorkflows of
+		[FailedWorkflow | _] ->
+			WorkflowName = maps:get(<<"name">>, FailedWorkflow, <<"unknown">>),
+			WorkflowId = binary_to_list(maps:get(<<"id">>, FailedWorkflow, <<"">>)),
+			WorkflowLink = "https://app.circleci.com/pipelines/"++Slug++"/workflows/"++WorkflowId,
+			#{<<"circleci">> => #{
+				<<"ok">> => false,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => <<"Workflow \"", WorkflowName/binary, "\" failed">>,
+				<<"link">> => list_to_binary(WorkflowLink)
+			}};
+		[] ->
+			case RunningWorkflows of
+				[_ | _] ->
+					#{<<"circleci">> => #{
+						<<"ok">> => true,
+						<<"techDetail">> => TechDetail,
+						<<"debug">> => <<"Pipeline is still running">>,
+						<<"link">> => list_to_binary(PipelineUrl)
+					}};
+				[] ->
+					#{<<"circleci">> => #{
+						<<"ok">> => true,
+						<<"techDetail">> => TechDetail,
+						<<"link">> => list_to_binary(PipelineUrl)
 					}}
 			end
 	end.
@@ -350,4 +380,65 @@ checkCI(CircleCISlug) ->
 		?assertEqual({false, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv4; Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],econnrefused},{inet,[inet],econnrefused}]})),
 		% IPv4 connection refused (false) + IPv6 DNS failure (unknown) → overall false
 		?assertEqual({false, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv4; DNS failure when trying to resolve ipv6 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],nxdomain},{inet,[inet],econnrefused}]})).
+
+	checkWorkflowStatuses_empty_test() ->
+		% No workflows → ok with debug note
+		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", [], "https://app.circleci.com/pipelines/gh/lucas42/lucos_test/42", <<"Checks status of most recent circleCI pipeline">>),
+		?assertEqual(#{<<"circleci">> => #{
+			<<"ok">> => true,
+			<<"techDetail">> => <<"Checks status of most recent circleCI pipeline">>,
+			<<"debug">> => <<"No workflows found for most recent pipeline">>,
+			<<"link">> => <<"https://app.circleci.com/pipelines/gh/lucas42/lucos_test/42">>
+		}}, Result).
+
+	checkWorkflowStatuses_success_test() ->
+		% Single successful workflow → ok
+		Workflows = [#{<<"id">> => <<"wf-1">>, <<"name">> => <<"build-deploy">>, <<"status">> => <<"success">>}],
+		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/gh/lucas42/lucos_test/42", <<"Checks status of most recent circleCI pipeline">>),
+		?assertEqual(#{<<"circleci">> => #{
+			<<"ok">> => true,
+			<<"techDetail">> => <<"Checks status of most recent circleCI pipeline">>,
+			<<"link">> => <<"https://app.circleci.com/pipelines/gh/lucas42/lucos_test/42">>
+		}}, Result).
+
+	checkWorkflowStatuses_failed_test() ->
+		% Single failed workflow → not ok, links to workflow
+		Workflows = [#{<<"id">> => <<"wf-2">>, <<"name">> => <<"build-deploy">>, <<"status">> => <<"failed">>}],
+		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/gh/lucas42/lucos_test/42", <<"Checks status of most recent circleCI pipeline">>),
+		?assertEqual(#{<<"circleci">> => #{
+			<<"ok">> => false,
+			<<"techDetail">> => <<"Checks status of most recent circleCI pipeline">>,
+			<<"debug">> => <<"Workflow \"build-deploy\" failed">>,
+			<<"link">> => <<"https://app.circleci.com/pipelines/gh/lucas42/lucos_test/workflows/wf-2">>
+		}}, Result).
+
+	checkWorkflowStatuses_failed_wins_over_success_test() ->
+		% One failed, one success → not ok (failed takes priority, no race condition)
+		Workflows = [
+			#{<<"id">> => <<"wf-1">>, <<"name">> => <<"build-amd64">>, <<"status">> => <<"failed">>},
+			#{<<"id">> => <<"wf-2">>, <<"name">> => <<"test-api">>, <<"status">> => <<"success">>}
+		],
+		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/gh/lucas42/lucos_test/42", <<"Checks status of most recent circleCI pipeline">>),
+		?assertMatch(#{<<"circleci">> := #{<<"ok">> := false}}, Result).
+
+	checkWorkflowStatuses_running_test() ->
+		% All running → ok with debug note
+		Workflows = [#{<<"id">> => <<"wf-1">>, <<"name">> => <<"build-deploy">>, <<"status">> => <<"running">>}],
+		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/gh/lucas42/lucos_test/42", <<"Checks status of most recent circleCI pipeline">>),
+		?assertEqual(#{<<"circleci">> => #{
+			<<"ok">> => true,
+			<<"techDetail">> => <<"Checks status of most recent circleCI pipeline">>,
+			<<"debug">> => <<"Pipeline is still running">>,
+			<<"link">> => <<"https://app.circleci.com/pipelines/gh/lucas42/lucos_test/42">>
+		}}, Result).
+
+	checkWorkflowStatuses_on_hold_test() ->
+		% on_hold (awaiting approval) → treated as ok (no action to take yet)
+		Workflows = [#{<<"id">> => <<"wf-1">>, <<"name">> => <<"build-deploy">>, <<"status">> => <<"on_hold">>}],
+		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/gh/lucas42/lucos_test/42", <<"Checks status of most recent circleCI pipeline">>),
+		?assertEqual(#{<<"circleci">> => #{
+			<<"ok">> => true,
+			<<"techDetail">> => <<"Checks status of most recent circleCI pipeline">>,
+			<<"link">> => <<"https://app.circleci.com/pipelines/gh/lucas42/lucos_test/42">>
+		}}, Result).
 -endif.
