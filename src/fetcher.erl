@@ -176,10 +176,12 @@ checkCI(CircleCISlug) ->
 	case CircleCISlug of
 		null -> #{};
 		_ ->
-			TechDetail = <<"Checks status of most recent circleCI pipeline">>,
+			TechDetail = <<"Checks status of recent circleCI pipelines">>,
 			Token = os:getenv("CIRCLECI_API_TOKEN", ""),
 			AuthHeader = {"Circle-Token", Token},
-			PipelineUrl = "https://circleci.com/api/v2/project/"++binary_to_list(CircleCISlug)++"/pipeline?branch=main",
+			% Fetch the last 5 pipelines so that a failed pipeline followed by a
+			% push-to-fix (which creates a new pipeline) is still detected.
+			PipelineUrl = "https://circleci.com/api/v2/project/"++binary_to_list(CircleCISlug)++"/pipeline?branch=main&limit=5",
 			case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 				{ok, {{_Version, 200, _ReasonPhrase}, _Headers, PipelineBody}} ->
 					PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
@@ -190,13 +192,14 @@ checkCI(CircleCISlug) ->
 								<<"techDetail">> => TechDetail,
 								<<"debug">> => <<"No recent pipelines found">>
 							}};
-						[LatestPipeline | _] ->
-							PipelineId = binary_to_list(maps:get(<<"id">>, LatestPipeline)),
+						[LatestPipeline | OtherPipelines] ->
 							PipelineNumber = maps:get(<<"number">>, LatestPipeline),
 							SlugStr = binary_to_list(CircleCISlug),
 							WebSlug = re:replace(SlugStr, "^gh/", "github/", [{return, list}]),
-							PipelineUrl2 = "https://app.circleci.com/pipelines/"++WebSlug++"/"++integer_to_list(PipelineNumber),
-							checkCIWorkflows(SlugStr, PipelineId, PipelineUrl2, TechDetail, AuthHeader)
+							LatestPipelineUrl = "https://app.circleci.com/pipelines/"++WebSlug++"/"++integer_to_list(PipelineNumber),
+							AllPipelines = [LatestPipeline | OtherPipelines],
+							AllWorkflows = collectAllWorkflows(AllPipelines, AuthHeader),
+							checkWorkflowStatuses(SlugStr, AllWorkflows, LatestPipelineUrl, TechDetail)
 					end;
 				{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} when StatusCode >= 500 ->
 					#{<<"circleci">> => #{
@@ -220,36 +223,21 @@ checkCI(CircleCISlug) ->
 			end
 	end.
 
-checkCIWorkflows(Slug, PipelineId, PipelineUrl, TechDetail, AuthHeader) ->
+% Fetches workflows for each pipeline in the list and concatenates them into a
+% single flat list. Errors fetching a pipeline's workflows are silently skipped
+% so that a transient API failure on one pipeline doesn't hide results from others.
+collectAllWorkflows([], _AuthHeader) -> [];
+collectAllWorkflows([Pipeline | Rest], AuthHeader) ->
+	PipelineId = binary_to_list(maps:get(<<"id">>, Pipeline)),
 	WorkflowUrl = "https://circleci.com/api/v2/pipeline/"++PipelineId++"/workflow",
-	case httpc:request(get, {WorkflowUrl, [{"Accept","application/json"}, AuthHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
+	Workflows = case httpc:request(get, {WorkflowUrl, [{"Accept","application/json"}, AuthHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, WorkflowBody}} ->
 			WorkflowResponse = jiffy:decode(WorkflowBody, [return_maps]),
-			Workflows = maps:get(<<"items">>, WorkflowResponse, []),
-			checkWorkflowStatuses(Slug, Workflows, PipelineUrl, TechDetail);
-		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} when StatusCode >= 500 ->
-			#{<<"circleci">> => #{
-				<<"ok">> => unknown,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from workflow endpoint"),
-				<<"link">> => list_to_binary(PipelineUrl)
-			}};
-		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
-			#{<<"circleci">> => #{
-				<<"ok">> => false,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from workflow endpoint"),
-				<<"link">> => list_to_binary(PipelineUrl)
-			}};
-		{error, Error} ->
-			{Ok, Debug} = parseError(Error),
-			#{<<"circleci">> => #{
-				<<"ok">> => Ok,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary(Debug),
-				<<"link">> => list_to_binary(PipelineUrl)
-			}}
-	end.
+			maps:get(<<"items">>, WorkflowResponse, []);
+		_ ->
+			[]
+	end,
+	Workflows ++ collectAllWorkflows(Rest, AuthHeader).
 
 % For each workflow name, keep only the most recent workflow (by created_at).
 % This ensures that a successful retry supersedes an earlier failure with the same name.
@@ -489,4 +477,30 @@ checkWorkflowStatuses(Slug, Workflows, PipelineUrl, TechDetail) ->
 		?assertEqual(2, length(Result)),
 		?assert(lists:member(W1, Result)),
 		?assert(lists:member(W3, Result)).
+
+	% A failed workflow from an older pipeline is superseded by a success in a newer
+	% pipeline when workflows from both pipelines are combined into a single list.
+	% This is the cross-pipeline case that was previously invisible to monitoring:
+	% failed pipeline N, then push-to-fix creates pipeline N+1 (success).
+	checkWorkflowStatuses_cross_pipeline_success_supersedes_failure_test() ->
+		Workflows = [
+			% Older pipeline: failed
+			#{<<"id">> => <<"wf-old">>, <<"name">> => <<"build-deploy">>, <<"status">> => <<"failed">>,  <<"created_at">> => <<"2026-03-13T17:11:00.000Z">>},
+			% Newer pipeline: success (push-to-fix)
+			#{<<"id">> => <<"wf-new">>, <<"name">> => <<"build-deploy">>, <<"status">> => <<"success">>, <<"created_at">> => <<"2026-03-13T17:15:00.000Z">>}
+		],
+		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/github/lucas42/lucos_test/43", <<"Checks status of recent circleCI pipelines">>),
+		?assertMatch(#{<<"circleci">> := #{<<"ok">> := true}}, Result).
+
+	% A failed workflow from a newer pipeline is NOT superseded by a success from an
+	% older one: the failure is the most recent state and must be surfaced.
+	checkWorkflowStatuses_cross_pipeline_failure_after_success_test() ->
+		Workflows = [
+			% Older pipeline: success
+			#{<<"id">> => <<"wf-old">>, <<"name">> => <<"build-deploy">>, <<"status">> => <<"success">>, <<"created_at">> => <<"2026-03-13T17:11:00.000Z">>},
+			% Newer pipeline: failed (regression)
+			#{<<"id">> => <<"wf-new">>, <<"name">> => <<"build-deploy">>, <<"status">> => <<"failed">>,  <<"created_at">> => <<"2026-03-13T17:22:00.000Z">>}
+		],
+		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/github/lucas42/lucos_test/44", <<"Checks status of recent circleCI pipelines">>),
+		?assertMatch(#{<<"circleci">> := #{<<"ok">> := false}}, Result).
 -endif.
