@@ -9,22 +9,33 @@ start(_StartType, _StartArgs) ->
 		Opts = [{active, false},
 				binary,
 				{packet, http_bin}],
-		case gen_tcp:listen(Port, Opts) of
-			{ok, ListenSocket} ->
-				Spawn = fun(SchedulerID) ->
-					spawn_opt(?MODULE, accept, [ListenSocket, SchedulerID, StatePid], [link, {scheduler, SchedulerID}])
-				end,
-				lists:foreach(Spawn, lists:seq(1, SchedulerCount)),
-				io:format("server listening on port ~b with ~b schedulers~n", [Port, SchedulerCount]),
-				fetcher:start(StatePid),
-				receive
-					Any -> io:format("~p~n", [Any])
-				end;
-			{error, Error} ->
-				io:format("Can't listen on port ~p: ~p ~n",[Port, Error])
-		end
+		listen_with_retry(Port, Opts, StatePid, SchedulerCount, 30)
 	catch
 		Exception:Reason -> io:format("Startup error occured: ~p ~p ~n",[Exception, Reason])
+	end.
+
+listen_with_retry(Port, _Opts, _StatePid, _SchedulerCount, 0) ->
+	io:format("Can't listen on port ~p: eaddrinuse (all retries exhausted)~n", [Port]),
+	{error, {eaddrinuse, Port}};
+listen_with_retry(Port, Opts, StatePid, SchedulerCount, RetriesLeft) ->
+	case gen_tcp:listen(Port, Opts) of
+		{ok, ListenSocket} ->
+			Spawn = fun(SchedulerID) ->
+				spawn_opt(?MODULE, accept, [ListenSocket, SchedulerID, StatePid], [link, {scheduler, SchedulerID}])
+			end,
+			lists:foreach(Spawn, lists:seq(1, SchedulerCount)),
+			io:format("server listening on port ~b with ~b schedulers~n", [Port, SchedulerCount]),
+			fetcher:start(StatePid),
+			receive
+				Any -> io:format("~p~n", [Any])
+			end;
+		{error, eaddrinuse} ->
+			io:format("Can't listen on port ~p: eaddrinuse (~p retries left, retrying in 1s)~n", [Port, RetriesLeft]),
+			timer:sleep(1000),
+			listen_with_retry(Port, Opts, StatePid, SchedulerCount, RetriesLeft - 1);
+		{error, Error} ->
+			io:format("Can't listen on port ~p: ~p ~n",[Port, Error]),
+			{error, Error}
 	end.
 
 accept(ListenSocket, SchedulerID, StatePid) ->
