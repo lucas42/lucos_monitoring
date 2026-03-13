@@ -13,9 +13,9 @@ services:
     image: lucas42/lucos_monitoring
     restart: always
     healthcheck:
-      test: ["CMD", "wget", "-qO- http://127.0.0.1:${PORT}/_info"]
+      test: ["CMD-SHELL", "wget --tries=1 -qO- http://127.0.0.1:${PORT:-8080}/_info"]
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 30s
     network_mode: host
