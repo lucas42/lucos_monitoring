@@ -19,7 +19,7 @@ RUN curl "https://configy.l42.eu/hosts/http?fields=domain" -H "Accept: text/csv;
 FROM debian:trixie
 
 WORKDIR /web
-RUN apt-get update && apt-get install -y ca-certificates
+RUN apt-get update && apt-get install -y ca-certificates wget
 
 COPY --from=build /lucos_monitoring/_build/prod/rel/prod/ ./
 COPY --from=navbar lucos_navbar.js .
