@@ -3,7 +3,8 @@
 -include_lib("eunit/include/eunit.hrl").
 
 start(StatePid) ->
-	{ok, _} = application:ensure_all_started(inets),
+	ok = application:ensure_started(ssl),
+	ok = application:ensure_started(inets),
 	{ok, Device} = file:open("./service-list", [read]),
 	spawnFetcher(StatePid, Device),
 	file:close(Device).
