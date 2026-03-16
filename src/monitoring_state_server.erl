@@ -101,12 +101,12 @@ failingChecks(Checks) ->
 	end, Checks).
 
 loganneEvent(Host, System, FailingChecks) ->
-	SystemTitle = re:replace(System, "_", " ", [global, {return, list}]),
+	SystemTitle = lists:flatten(re:replace(System, "_", " ", [global, {return, list}])),
 	case maps:size(FailingChecks) of
 		0 ->
 			{"monitoringRecovery", "All checks healthy on " ++ SystemTitle ++ " (" ++ Host ++ ")"};
 		FailCount ->
-			FailNames = lists:join(", ", [binary_to_list(K) || K <- maps:keys(FailingChecks)]),
+			FailNames = string:join([binary_to_list(K) || K <- maps:keys(FailingChecks)], ", "),
 			{"monitoringAlert", integer_to_list(FailCount) ++ " failing check(s) on " ++ SystemTitle ++ " (" ++ Host ++ "): " ++ FailNames}
 	end.
 
