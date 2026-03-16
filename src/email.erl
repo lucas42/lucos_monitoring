@@ -1,4 +1,4 @@
--module(notifier).
+-module(email).
 -export([notify/4]).
 
 

@@ -101,21 +101,25 @@ failingChecks(Checks) ->
 	end, Checks).
 
 state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap) ->
+	FailingNow = failingChecks(SystemChecks),
 	case maps:get(System, SuppressionMap, undefined) of
 		undefined ->
 			io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
-			notifier:notify(Host, System, failingChecks(SystemChecks), SystemMetrics),
+			loganne:notify(Host, System, FailingNow, false),
+			email:notify(Host, System, FailingNow, SystemMetrics),
 			SuppressionMap;
 		ExpiryTime ->
 			Now = erlang:system_time(second),
 			case Now < ExpiryTime of
 				true ->
 					io:format("Alert suppressed for ~p during deploy window~n", [System]),
+					loganne:notify(Host, System, FailingNow, true),
 					SuppressionMap;
 				false ->
 					io:format("ERROR: Suppression window for ~p expired without being cleared - deploy may have taken longer than 10 minutes~n", [System]),
 					io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
-					notifier:notify(Host, System, failingChecks(SystemChecks), SystemMetrics),
+					loganne:notify(Host, System, FailingNow, false),
+					email:notify(Host, System, FailingNow, SystemMetrics),
 					maps:remove(System, SuppressionMap)
 			end
 	end.
@@ -144,4 +148,5 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap) ->
 		?assertEqual(true, systemExists("lucos_bar", SystemMap)),
 		?assertEqual(false, systemExists("lucos_missing", SystemMap)),
 		?assertEqual(false, systemExists("lucos_foo", #{})).
+
 -endif.
