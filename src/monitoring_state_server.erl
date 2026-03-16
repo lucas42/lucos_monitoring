@@ -100,35 +100,26 @@ failingChecks(Checks) ->
 		maps:get(<<"ok">>, Check, unknown) == false
 	end, Checks).
 
-loganneEvent(Host, System, FailingChecks) ->
-	SystemTitle = lists:flatten(re:replace(System, "_", " ", [global, {return, list}])),
-	case maps:size(FailingChecks) of
-		0 ->
-			{"monitoringRecovery", "All checks healthy on " ++ SystemTitle ++ " (" ++ Host ++ ")"};
-		FailCount ->
-			FailNames = string:join([binary_to_list(K) || K <- maps:keys(FailingChecks)], ", "),
-			{"monitoringAlert", integer_to_list(FailCount) ++ " failing check(s) on " ++ SystemTitle ++ " (" ++ Host ++ "): " ++ FailNames}
-	end.
-
 state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap) ->
 	FailingNow = failingChecks(SystemChecks),
-	{EventType, HumanReadable} = loganneEvent(Host, System, FailingNow),
-	loganne:emit_event(EventType, HumanReadable),
 	case maps:get(System, SuppressionMap, undefined) of
 		undefined ->
 			io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
-			notifier:notify(Host, System, FailingNow, SystemMetrics),
+			loganne:notify(Host, System, FailingNow, false),
+			email:notify(Host, System, FailingNow, SystemMetrics),
 			SuppressionMap;
 		ExpiryTime ->
 			Now = erlang:system_time(second),
 			case Now < ExpiryTime of
 				true ->
 					io:format("Alert suppressed for ~p during deploy window~n", [System]),
+					loganne:notify(Host, System, FailingNow, true),
 					SuppressionMap;
 				false ->
 					io:format("ERROR: Suppression window for ~p expired without being cleared - deploy may have taken longer than 10 minutes~n", [System]),
 					io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
-					notifier:notify(Host, System, FailingNow, SystemMetrics),
+					loganne:notify(Host, System, FailingNow, false),
+					email:notify(Host, System, FailingNow, SystemMetrics),
 					maps:remove(System, SuppressionMap)
 			end
 	end.
@@ -158,15 +149,4 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap) ->
 		?assertEqual(false, systemExists("lucos_missing", SystemMap)),
 		?assertEqual(false, systemExists("lucos_foo", #{})).
 
-	loganneEvent_test() ->
-		%% Recovery: no failing checks
-		?assertEqual(
-			{"monitoringRecovery", "All checks healthy on lucos foo (foo.example.com)"},
-			loganneEvent("foo.example.com", "lucos_foo", #{})
-		),
-		%% Alert: one failing check
-		?assertEqual(
-			{"monitoringAlert", "1 failing check(s) on lucos foo (foo.example.com): ci"},
-			loganneEvent("foo.example.com", "lucos_foo", #{<<"ci">> => #{<<"ok">> => false}})
-		).
 -endif.
