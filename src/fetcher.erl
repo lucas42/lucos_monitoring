@@ -260,7 +260,7 @@ checkWorkflowStatuses(_Slug, [], PipelineUrl, TechDetail) ->
 		<<"debug">> => <<"No workflows found for most recent pipeline">>,
 		<<"link">> => list_to_binary(PipelineUrl)
 	}};
-checkWorkflowStatuses(Slug, Workflows, PipelineUrl, TechDetail) ->
+checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 	LatestWorkflows = keepLatestWorkflowPerName(Workflows),
 	FailedWorkflows = [W || W <- LatestWorkflows, maps:get(<<"status">>, W, null) =:= <<"failed">>],
 	RunningWorkflows = [W || W <- LatestWorkflows, maps:get(<<"status">>, W, null) =:= <<"running">>],
@@ -268,8 +268,7 @@ checkWorkflowStatuses(Slug, Workflows, PipelineUrl, TechDetail) ->
 		[FailedWorkflow | _] ->
 			WorkflowName = maps:get(<<"name">>, FailedWorkflow, <<"unknown">>),
 			WorkflowId = binary_to_list(maps:get(<<"id">>, FailedWorkflow, <<"">>)),
-			WebSlug = re:replace(Slug, "^gh/", "github/", [{return, list}]),
-			WorkflowLink = "https://app.circleci.com/pipelines/"++WebSlug++"/workflows/"++WorkflowId,
+			WorkflowLink = PipelineUrl++"/workflows/"++WorkflowId,
 			#{<<"circleci">> => #{
 				<<"ok">> => false,
 				<<"techDetail">> => TechDetail,
@@ -408,14 +407,14 @@ checkWorkflowStatuses(Slug, Workflows, PipelineUrl, TechDetail) ->
 		}}, Result).
 
 	checkWorkflowStatuses_failed_test() ->
-		% Single failed workflow → not ok, links to workflow
+		% Single failed workflow → not ok, links to workflow (pipeline number included in URL)
 		Workflows = [#{<<"id">> => <<"wf-2">>, <<"name">> => <<"build-deploy">>, <<"status">> => <<"failed">>}],
 		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/github/lucas42/lucos_test/42", <<"Checks status of most recent circleCI pipeline">>),
 		?assertEqual(#{<<"circleci">> => #{
 			<<"ok">> => false,
 			<<"techDetail">> => <<"Checks status of most recent circleCI pipeline">>,
 			<<"debug">> => <<"Workflow \"build-deploy\" failed">>,
-			<<"link">> => <<"https://app.circleci.com/pipelines/github/lucas42/lucos_test/workflows/wf-2">>
+			<<"link">> => <<"https://app.circleci.com/pipelines/github/lucas42/lucos_test/42/workflows/wf-2">>
 		}}, Result).
 
 	checkWorkflowStatuses_failed_wins_over_success_test() ->
