@@ -8,7 +8,8 @@ start(_StartType, _StartArgs) ->
 		SchedulerCount = erlang:system_info(schedulers),
 		Opts = [{active, false},
 				binary,
-				{packet, http_bin}],
+				{packet, http_bin},
+				{reuseaddr, true}],
 		listen_with_retry(Port, Opts, StatePid, SchedulerCount, 30)
 	catch
 		Exception:Reason -> io:format("Startup error occured: ~p ~p ~n",[Exception, Reason])
