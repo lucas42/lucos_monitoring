@@ -6,7 +6,11 @@ notify(Host, System, FailingChecks, Suppressed) ->
 	emit_event(EventType, HumanReadable).
 
 buildEvent(Host, System, FailingChecks, Suppressed) ->
-	SystemTitle = lists:flatten(re:replace(System, "_", " ", [global, {return, list}])),
+	SystemStr = case System of
+		unknown -> "unknown";
+		_ -> System
+	end,
+	SystemTitle = lists:flatten(re:replace(SystemStr, "_", " ", [global, {return, list}])),
 	case {maps:size(FailingChecks), Suppressed} of
 		{0, _} ->
 			{"monitoringRecovery", "All checks healthy on " ++ SystemTitle ++ " (" ++ Host ++ ")"};
@@ -67,6 +71,13 @@ emit_event(EventType, HumanReadable) ->
 		?assertEqual(
 			{"monitoringAlertSuppressed", "1 failing check(s) on lucos foo (foo.example.com): ci (suppressed during deploy window)"},
 			buildEvent("foo.example.com", "lucos_foo", #{<<"ci">> => #{<<"ok">> => false}}, true)
+		).
+
+	buildEvent_unknown_system_test() ->
+		%% System = unknown (atom) should not crash — happens when /_info returns non-200
+		?assertEqual(
+			{"monitoringAlert", "1 failing check(s) on unknown (foo.example.com): fetch-info"},
+			buildEvent("foo.example.com", unknown, #{<<"fetch-info">> => #{<<"ok">> => false}}, false)
 		).
 
 	emit_event_no_endpoint_test() ->
