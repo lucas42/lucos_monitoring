@@ -24,21 +24,20 @@ emit_event(EventType, HumanReadable) ->
 		false ->
 			io:format("LOGANNE_ENDPOINT not set, skipping event ~p~n", [EventType]);
 		_ ->
-			Url = Endpoint ++ "/events",
 			Body = jiffy:encode(#{
 				<<"source">> => <<"lucos_monitoring">>,
 				<<"type">> => list_to_binary(EventType),
 				<<"humanReadable">> => list_to_binary(HumanReadable)
 			}),
-			Request = {Url, [], "application/json", Body},
+			Request = {Endpoint, [], "application/json", Body},
 			case httpc:request(post, Request, [], []) of
 				{ok, {{_, StatusCode, _}, _, _}} when StatusCode >= 200, StatusCode < 300 ->
-					ok;
+					io:format("Loganne event ~p sent successfully to ~p~n", [EventType, Endpoint]);
 				{ok, {{_, StatusCode, _}, _, ResponseBody}} ->
-					io:format("Loganne returned ~p for event ~p: ~p~n", [StatusCode, EventType, ResponseBody]),
+					io:format("Loganne returned ~p posting ~p to ~p: ~p~n", [StatusCode, EventType, Endpoint, ResponseBody]),
 					ok;
 				{error, Reason} ->
-					io:format("Failed to emit Loganne event ~p: ~p~n", [EventType, Reason]),
+					io:format("Failed to emit Loganne event ~p to ~p: ~p~n", [EventType, Endpoint, Reason]),
 					ok
 			end
 	end,
