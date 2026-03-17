@@ -33,12 +33,12 @@ emit_event(EventType, HumanReadable) ->
 			Request = {Url, [], "application/json", Body},
 			case httpc:request(post, Request, [], []) of
 				{ok, {{_, StatusCode, _}, _, _}} when StatusCode >= 200, StatusCode < 300 ->
-					ok;
+					io:format("Loganne event ~p sent successfully to ~p~n", [EventType, Url]);
 				{ok, {{_, StatusCode, _}, _, ResponseBody}} ->
-					io:format("Loganne returned ~p for event ~p: ~p~n", [StatusCode, EventType, ResponseBody]),
+					io:format("Loganne returned ~p posting ~p to ~p: ~p~n", [StatusCode, EventType, Url, ResponseBody]),
 					ok;
 				{error, Reason} ->
-					io:format("Failed to emit Loganne event ~p: ~p~n", [EventType, Reason]),
+					io:format("Failed to emit Loganne event ~p to ~p: ~p~n", [EventType, Url, Reason]),
 					ok
 			end
 	end,
