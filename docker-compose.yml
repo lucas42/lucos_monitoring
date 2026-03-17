@@ -10,6 +10,7 @@ services:
       - SMTP_RELAY
       - TO_ADDRESS
       - PORT
+      - LOGANNE_ENDPOINT
     image: lucas42/lucos_monitoring
     restart: always
     healthcheck:
