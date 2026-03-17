@@ -24,7 +24,7 @@ emit_event(EventType, HumanReadable) ->
 		false ->
 			io:format("LOGANNE_ENDPOINT not set, skipping event ~p~n", [EventType]);
 		_ ->
-			Url = Endpoint ++ "/events",
+			Url = Endpoint,
 			Body = jiffy:encode(#{
 				<<"source">> => <<"lucos_monitoring">>,
 				<<"type">> => list_to_binary(EventType),
