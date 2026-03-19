@@ -11,6 +11,7 @@ services:
       - TO_ADDRESS
       - PORT
       - LOGANNE_ENDPOINT
+      - APP_ORIGIN
     image: lucas42/lucos_monitoring
     restart: always
     healthcheck:
