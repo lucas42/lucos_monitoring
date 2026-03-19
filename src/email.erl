@@ -54,7 +54,8 @@ getFailCountSummary(FailCount, System) ->
 	end.
 
 getSystemLink(Host) ->
-	"https://monitoring.l42.eu/#host-"++Host.
+	AppOrigin = os:getenv("APP_ORIGIN", "https://monitoring.l42.eu"),
+	AppOrigin ++ "/#host-" ++ Host.
 
 getMetricSummary(SystemMetrics) ->
 	case maps:size(SystemMetrics) of

@@ -3,7 +3,9 @@
 
 notify(Host, System, FailingChecks, Suppressed) ->
 	{EventType, HumanReadable} = buildEvent(Host, System, FailingChecks, Suppressed),
-	emit_event(EventType, HumanReadable).
+	AppOrigin = os:getenv("APP_ORIGIN", ""),
+	Url = AppOrigin ++ "/#host-" ++ Host,
+	emit_event(EventType, HumanReadable, Url).
 
 buildEvent(Host, System, FailingChecks, Suppressed) ->
 	SystemStr = case System of
@@ -22,7 +24,7 @@ buildEvent(Host, System, FailingChecks, Suppressed) ->
 			{"monitoringAlert", integer_to_list(FailCount) ++ " failing check(s) on " ++ SystemTitle ++ " (" ++ Host ++ "): " ++ FailNames}
 	end.
 
-emit_event(EventType, HumanReadable) ->
+emit_event(EventType, HumanReadable, Url) ->
 	Endpoint = os:getenv("LOGANNE_ENDPOINT"),
 	case Endpoint of
 		false ->
@@ -31,7 +33,8 @@ emit_event(EventType, HumanReadable) ->
 			Body = jiffy:encode(#{
 				<<"source">> => <<"lucos_monitoring">>,
 				<<"type">> => list_to_binary(EventType),
-				<<"humanReadable">> => list_to_binary(HumanReadable)
+				<<"humanReadable">> => list_to_binary(HumanReadable),
+				<<"url">> => list_to_binary(Url)
 			}),
 			Request = {Endpoint, [], "application/json", Body},
 			case httpc:request(post, Request, [], []) of
@@ -81,8 +84,23 @@ emit_event(EventType, HumanReadable) ->
 		).
 
 	emit_event_no_endpoint_test() ->
-		%% When LOGANNE_ENDPOINT is unset, emit_event/2 should return without crashing
+		%% When LOGANNE_ENDPOINT is unset, emit_event/3 should return without crashing
 		os:unsetenv("LOGANNE_ENDPOINT"),
-		?assertEqual(ok, emit_event("monitoringAlert", "Some alert")).
+		?assertEqual(ok, emit_event("monitoringAlert", "Some alert", "https://monitoring.l42.eu/#host-foo.example.com")).
+
+	notify_builds_url_test() ->
+		%% notify/4 should derive the URL from APP_ORIGIN and Host.
+		%% We can't easily intercept the HTTP call, so we test via emit_event behaviour:
+		%% with no LOGANNE_ENDPOINT set, notify should return ok without crashing.
+		os:unsetenv("LOGANNE_ENDPOINT"),
+		os:putenv("APP_ORIGIN", "https://monitoring.l42.eu"),
+		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, false)),
+		os:unsetenv("APP_ORIGIN").
+
+	notify_missing_app_origin_test() ->
+		%% When APP_ORIGIN is unset, the url field should still be a valid (empty-prefixed) string.
+		os:unsetenv("LOGANNE_ENDPOINT"),
+		os:unsetenv("APP_ORIGIN"),
+		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, false)).
 
 -endif.
