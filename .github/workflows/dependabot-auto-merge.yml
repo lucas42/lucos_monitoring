@@ -4,16 +4,6 @@ on:
     types: [opened, synchronize, reopened]
 
 jobs:
-  check-actor:
-    runs-on: ubuntu-latest
-    outputs:
-      is-dependabot: ${{ steps.check.outputs.result }}
-    steps:
-      - id: check
-        run: echo "result=${{ github.actor == 'dependabot[bot]' }}" >> $GITHUB_OUTPUT
-
   dependabot:
-    needs: check-actor
-    if: needs.check-actor.outputs.is-dependabot == 'true'
     uses: lucas42/.github/.github/workflows/dependabot-auto-merge.yml@main
     secrets: inherit
