@@ -11,12 +11,16 @@ handle_cast(Request, {SystemMap, SuppressionMap}) ->
 	case Request of
 		{updateSystem, Host, System, SystemChecks, SystemMetrics} ->
 			io:format("Received update for system ~p (Host ~p)~n", [System, Host]),
+			IsFirstSeen = not maps:is_key(Host, SystemMap),
 			{_, OldSystemChecks, _} = maps:get(Host, SystemMap, {nil, maps:new(), nil}),
 			NormalisedChecks = normaliseChecks(OldSystemChecks, SystemChecks),
-			NewSuppressionMap = case meaningfulChange(OldSystemChecks, NormalisedChecks) of
-				true ->
+			NewSuppressionMap = case {IsFirstSeen, meaningfulChange(OldSystemChecks, NormalisedChecks)} of
+				{true, _} ->
+					io:format("Warm-up: skipping alert for ~p on first poll~n", [System]),
+					SuppressionMap;
+				{false, true} ->
 					state_change(Host, System, NormalisedChecks, SystemMetrics, SuppressionMap);
-				false ->
+				{false, false} ->
 					SuppressionMap
 			end,
 			NewSystemMap = maps:put(Host, {System, NormalisedChecks, SystemMetrics}, SystemMap),
@@ -160,5 +164,35 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap) ->
 		?assertEqual(true, systemExists("lucos_bar", SystemMap)),
 		?assertEqual(false, systemExists("lucos_missing", SystemMap)),
 		?assertEqual(false, systemExists("lucos_foo", #{})).
+
+	% First update for a host stores its state but doesn't alert (warm-up grace period).
+	% safe_notify/safe_email_notify wrap loganne/email calls in try-catch, so even if
+	% those modules are unavailable the cast still returns without crashing.
+	warmup_first_update_stores_state_test() ->
+		InitialState = {#{}, #{}},
+		Checks = #{<<"fetch-info">> => #{<<"ok">> => false}},
+		{noreply, {SystemMap, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", Checks, #{}},
+			InitialState
+		),
+		% Host should now be in the SystemMap
+		?assert(maps:is_key("host1.example.com", SystemMap)),
+		{"lucos_foo", StoredChecks, _} = maps:get("host1.example.com", SystemMap),
+		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"fetch-info">>, StoredChecks))).
+
+	% Second update for a known host triggers normal alert logic (not warm-up).
+	% Here both updates report the same healthy state, so no meaningful change — no alert.
+	warmup_second_update_not_suppressed_test() ->
+		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		ExistingState = {
+			#{"host1.example.com" => {"lucos_foo", Checks, #{}}},
+			#{}
+		},
+		{noreply, {SystemMap, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", Checks, #{}},
+			ExistingState
+		),
+		% Host is still in the map after second update
+		?assert(maps:is_key("host1.example.com", SystemMap)).
 
 -endif.
