@@ -60,7 +60,7 @@ handleRequest(Socket, Method, RequestUri, Headers, StatePid) ->
 			RequestBody = readBody(Socket, ContentLength),
 			DateTime = calendar:system_time_to_rfc3339(erlang:system_time(second)),
 			ClientIP = getClientIP(Socket),
-			{StatusCode, ContentType, ResponseBody} = tryController(Method, RequestUri, RequestBody, StatePid),
+			{StatusCode, ContentType, ResponseBody} = tryController(Method, RequestUri, RequestBody, Headers, StatePid),
 			Response = getHeaders(StatusCode, ContentType) ++ ResponseBody,
 			gen_tcp:send(Socket, Response),
 			gen_tcp:close(Socket),
@@ -69,6 +69,8 @@ handleRequest(Socket, Method, RequestUri, Headers, StatePid) ->
 		{ok, {http_header, _, 'Content-Length', _, Value}} ->
 			{Length, _} = string:to_integer(binary_to_list(Value)),
 			handleRequest(Socket, Method, RequestUri, maps:put('Content-Length', Length, Headers), StatePid);
+		{ok, {http_header, _, 'Authorization', _, Value}} ->
+			handleRequest(Socket, Method, RequestUri, maps:put('Authorization', binary_to_list(Value), Headers), StatePid);
 		{ok, _Data} ->
 			handleRequest(Socket, Method, RequestUri, Headers, StatePid);
 
@@ -101,6 +103,7 @@ getReasonPhrase(StatusCode) ->
 		200 -> "OK";
 		204 -> "No Content";
 		400 -> "Bad Request";
+		401 -> "Unauthorized";
 		404 -> "Not Found";
 		405 -> "Method Not Allowed";
 		500 -> "Internal Error"
@@ -300,7 +303,22 @@ encodeInfo(Systems) ->
 		show_on_homepage => true
 	}).
 
-controller(Method, RequestUri, Body, StatePid) ->
+% Checks the Authorization header against the SUPPRESS_TOKEN env var.
+% Returns ok if auth passes (or if SUPPRESS_TOKEN is not configured).
+% Returns {error, unauthorized} if the token is wrong or missing.
+checkSuppressAuth(Headers) ->
+	case os:getenv("SUPPRESS_TOKEN") of
+		false -> ok;
+		"" -> ok;
+		ExpectedToken ->
+			AuthHeader = maps:get('Authorization', Headers, ""),
+			case AuthHeader of
+				"Bearer " ++ Token when Token =:= ExpectedToken -> ok;
+				_ -> {error, unauthorized}
+			end
+	end.
+
+controller(Method, RequestUri, Body, Headers, StatePid) ->
 	Path = re:replace(RequestUri, "\\?.*$", "", [{return,list}]),
 	case Path of
 		"/" ->
@@ -370,45 +388,55 @@ controller(Method, RequestUri, Body, StatePid) ->
 			{ok, ScriptFile} = file:read_file("lucos_navbar.js"),
 			{200, "text/javascript", ScriptFile};
 		"/suppress/clear" ->
-			case Method of
-				'POST' ->
-					try jiffy:decode(list_to_binary(Body), [return_maps]) of
-						#{<<"systemDeployed">> := System} ->
-							gen_server:call(StatePid, {unsuppress, binary_to_list(System)}),
-							{204, "text/plain", ""};
+			case checkSuppressAuth(Headers) of
+				{error, unauthorized} ->
+					{401, "text/plain", "Unauthorized"};
+				ok ->
+					case Method of
+						'POST' ->
+							try jiffy:decode(list_to_binary(Body), [return_maps]) of
+								#{<<"systemDeployed">> := System} ->
+									gen_server:call(StatePid, {unsuppress, binary_to_list(System)}),
+									{204, "text/plain", ""};
+								_ ->
+									{400, "text/plain", "Missing systemDeployed field"}
+							catch
+								_:_ ->
+									{400, "text/plain", "Invalid JSON body"}
+							end;
 						_ ->
-							{400, "text/plain", "Missing systemDeployed field"}
-					catch
-						_:_ ->
-							{400, "text/plain", "Invalid JSON body"}
-					end;
-				_ ->
-					{405, "text/plain", "Method Not Allowed"}
+							{405, "text/plain", "Method Not Allowed"}
+					end
 			end;
 		_ ->
 			case string:prefix(Path, "/suppress/") of
 				nomatch ->
 					{404, "text/plain", "Not Found"};
 				System ->
-					case Method of
-						'PUT' ->
-							case gen_server:call(StatePid, {suppress, System}) of
-								ok ->
+					case checkSuppressAuth(Headers) of
+						{error, unauthorized} ->
+							{401, "text/plain", "Unauthorized"};
+						ok ->
+							case Method of
+								'PUT' ->
+									case gen_server:call(StatePid, {suppress, System}) of
+										ok ->
+											{204, "text/plain", ""};
+										{error, not_found} ->
+											{404, "text/plain", "System not found"}
+									end;
+								'DELETE' ->
+									gen_server:call(StatePid, {unsuppress, System}),
 									{204, "text/plain", ""};
-								{error, not_found} ->
-									{404, "text/plain", "System not found"}
-							end;
-						'DELETE' ->
-							gen_server:call(StatePid, {unsuppress, System}),
-							{204, "text/plain", ""};
-						_ ->
-							{405, "text/plain", "Method Not Allowed"}
+								_ ->
+									{405, "text/plain", "Method Not Allowed"}
+							end
 					end
 			end
 	end.
 
-tryController(Method, RequestUri, Body, StatePid) ->
-	try controller(Method, RequestUri, Body, StatePid) of
+tryController(Method, RequestUri, Body, Headers, StatePid) ->
+	try controller(Method, RequestUri, Body, Headers, StatePid) of
 		Response -> Response
 	catch
 		ExceptionClass:Term:StackTrace ->
@@ -507,4 +535,31 @@ tryController(Method, RequestUri, Body, StatePid) ->
 		?assertEqual(1, maps:get(<<"healthy">>, Summary)),
 		?assertEqual(1, maps:get(<<"erroring">>, Summary)),
 		?assertEqual(1, maps:get(<<"unknown">>, Summary)).
+
+	checkSuppressAuth_no_token_configured_test() ->
+		% When SUPPRESS_TOKEN is not set, all requests pass
+		os:unsetenv("SUPPRESS_TOKEN"),
+		?assertEqual(ok, checkSuppressAuth(#{})),
+		?assertEqual(ok, checkSuppressAuth(#{'Authorization' => "Bearer wrong"})).
+
+	checkSuppressAuth_valid_token_test() ->
+		os:putenv("SUPPRESS_TOKEN", "mysecrettoken"),
+		?assertEqual(ok, checkSuppressAuth(#{'Authorization' => "Bearer mysecrettoken"})),
+		os:unsetenv("SUPPRESS_TOKEN").
+
+	checkSuppressAuth_missing_header_test() ->
+		os:putenv("SUPPRESS_TOKEN", "mysecrettoken"),
+		?assertEqual({error, unauthorized}, checkSuppressAuth(#{})),
+		os:unsetenv("SUPPRESS_TOKEN").
+
+	checkSuppressAuth_wrong_token_test() ->
+		os:putenv("SUPPRESS_TOKEN", "mysecrettoken"),
+		?assertEqual({error, unauthorized}, checkSuppressAuth(#{'Authorization' => "Bearer wrongtoken"})),
+		os:unsetenv("SUPPRESS_TOKEN").
+
+	checkSuppressAuth_no_bearer_prefix_test() ->
+		os:putenv("SUPPRESS_TOKEN", "mysecrettoken"),
+		?assertEqual({error, unauthorized}, checkSuppressAuth(#{'Authorization' => "mysecrettoken"})),
+		os:unsetenv("SUPPRESS_TOKEN").
+
 -endif.
