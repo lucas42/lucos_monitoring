@@ -317,39 +317,6 @@ encodeInfo(Systems) ->
 	}).
 
 
-% Parses CLIENT_KEYS (semicolon-separated "name=value" pairs) into a set of valid tokens.
-parseClientKeys(ClientKeysStr) ->
-	Entries = string:tokens(ClientKeysStr, ";"),
-	lists:foldl(
-		fun (Entry, Acc) ->
-			case string:split(Entry, "=", leading) of
-				[_Name, Value] -> sets:add_element(Value, Acc);
-				_ -> Acc
-			end
-		end,
-		sets:new(),
-		Entries
-	).
-
-% Checks the Authorization: Bearer header against CLIENT_KEYS env var.
-% Returns ok if auth passes (or if CLIENT_KEYS is not configured).
-% Returns {error, unauthorized} if the token is wrong or missing.
-checkSuppressAuth(Headers) ->
-	case os:getenv("CLIENT_KEYS") of
-		false -> ok;
-		"" -> ok;
-		ClientKeysStr ->
-			ValidKeys = parseClientKeys(ClientKeysStr),
-			AuthHeader = maps:get('Authorization', Headers, ""),
-			case AuthHeader of
-				"Bearer " ++ Token ->
-					case sets:is_element(Token, ValidKeys) of
-						true -> ok;
-						false -> {error, unauthorized}
-					end;
-				_ -> {error, unauthorized}
-			end
-	end.
 
 controller(Method, RequestUri, Body, Headers, StatePid) ->
 	Path = re:replace(RequestUri, "\\?.*$", "", [{return,list}]),
@@ -420,49 +387,18 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 		"/lucos_navbar.js" ->
 			{ok, ScriptFile} = file:read_file("lucos_navbar.js"),
 			{200, "text/javascript", ScriptFile};
-		"/suppress/clear" ->
-			case checkSuppressAuth(Headers) of
-				{error, unauthorized} ->
-					{401, "text/plain", "Unauthorized"};
-				ok ->
-					case Method of
-						'POST' ->
-							try jiffy:decode(list_to_binary(Body), [return_maps]) of
-								#{<<"systemDeployed">> := System} ->
-									gen_server:call(StatePid, {unsuppress, binary_to_list(System)}),
-									{204, "text/plain", ""};
-								_ ->
-									{400, "text/plain", "Missing systemDeployed field"}
-							catch
-								_:_ ->
-									{400, "text/plain", "Invalid JSON body"}
-							end;
-						_ ->
-							{405, "text/plain", "Method Not Allowed"}
-					end
-			end;
 		_ ->
-			case string:prefix(Path, "/suppress/") of
+			case string:prefix(Path, "/suppress") of
 				nomatch ->
 					{404, "text/plain", "Not Found"};
-				System ->
-					case checkSuppressAuth(Headers) of
+				_ ->
+					case suppression:checkAuth(Headers) of
 						{error, unauthorized} ->
 							{401, "text/plain", "Unauthorized"};
 						ok ->
-							case Method of
-								'PUT' ->
-									case gen_server:call(StatePid, {suppress, System}) of
-										ok ->
-											{204, "text/plain", ""};
-										{error, not_found} ->
-											{404, "text/plain", "System not found"}
-									end;
-								'DELETE' ->
-									gen_server:call(StatePid, {unsuppress, System}),
-									{204, "text/plain", ""};
-								_ ->
-									{405, "text/plain", "Method Not Allowed"}
+							case suppression:handle(Path, Method, Body, StatePid) of
+								nomatch -> {404, "text/plain", "Not Found"};
+								Response -> Response
 							end
 					end
 			end
@@ -601,47 +537,5 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		Result = formatString(<<"debug">>, <<"See https://example.com/path for details">>),
 		?assert(string:str(Result, "<a href=") > 0),
 		?assert(string:str(Result, "https://example.com/path") > 0).
-
-	checkSuppressAuth_no_client_keys_configured_test() ->
-		% When CLIENT_KEYS is not set, all requests pass (no auth enforced)
-		os:unsetenv("CLIENT_KEYS"),
-		?assertEqual(ok, checkSuppressAuth(#{})),
-		?assertEqual(ok, checkSuppressAuth(#{'Authorization' => "Bearer sometoken"})).
-
-	checkSuppressAuth_valid_token_test() ->
-		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		?assertEqual(ok, checkSuppressAuth(#{'Authorization' => "Bearer mysecrettoken"})),
-		os:unsetenv("CLIENT_KEYS").
-
-	checkSuppressAuth_missing_header_test() ->
-		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		?assertEqual({error, unauthorized}, checkSuppressAuth(#{})),
-		os:unsetenv("CLIENT_KEYS").
-
-	checkSuppressAuth_wrong_token_test() ->
-		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		?assertEqual({error, unauthorized}, checkSuppressAuth(#{'Authorization' => "Bearer wrongtoken"})),
-		os:unsetenv("CLIENT_KEYS").
-
-	checkSuppressAuth_no_bearer_prefix_test() ->
-		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		?assertEqual({error, unauthorized}, checkSuppressAuth(#{'Authorization' => "mysecrettoken"})),
-		os:unsetenv("CLIENT_KEYS").
-
-	checkSuppressAuth_multiple_client_keys_test() ->
-		% Multiple keys in CLIENT_KEYS — any valid key passes
-		os:putenv("CLIENT_KEYS", "client_a=tokenA;client_b=tokenB"),
-		?assertEqual(ok, checkSuppressAuth(#{'Authorization' => "Bearer tokenA"})),
-		?assertEqual(ok, checkSuppressAuth(#{'Authorization' => "Bearer tokenB"})),
-		?assertEqual({error, unauthorized}, checkSuppressAuth(#{'Authorization' => "Bearer tokenC"})),
-		os:unsetenv("CLIENT_KEYS").
-
-	checkSuppressAuth_token_with_equals_sign_test() ->
-		% Token values containing = (e.g. base64-encoded) must be handled correctly —
-		% parseClientKeys must split on the first = only, not every =
-		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=abc123=="),
-		?assertEqual(ok, checkSuppressAuth(#{'Authorization' => "Bearer abc123=="})),
-		?assertEqual({error, unauthorized}, checkSuppressAuth(#{'Authorization' => "Bearer abc123"})),
-		os:unsetenv("CLIENT_KEYS").
 
 -endif.
