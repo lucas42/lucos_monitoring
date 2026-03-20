@@ -322,7 +322,7 @@ parseClientKeys(ClientKeysStr) ->
 	Entries = string:tokens(ClientKeysStr, ";"),
 	lists:foldl(
 		fun (Entry, Acc) ->
-			case string:split(Entry, "=") of
+			case string:split(Entry, "=", leading) of
 				[_Name, Value] -> sets:add_element(Value, Acc);
 				_ -> Acc
 			end
@@ -634,6 +634,14 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		?assertEqual(ok, checkSuppressAuth(#{'Authorization' => "Bearer tokenA"})),
 		?assertEqual(ok, checkSuppressAuth(#{'Authorization' => "Bearer tokenB"})),
 		?assertEqual({error, unauthorized}, checkSuppressAuth(#{'Authorization' => "Bearer tokenC"})),
+		os:unsetenv("CLIENT_KEYS").
+
+	checkSuppressAuth_token_with_equals_sign_test() ->
+		% Token values containing = (e.g. base64-encoded) must be handled correctly —
+		% parseClientKeys must split on the first = only, not every =
+		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=abc123=="),
+		?assertEqual(ok, checkSuppressAuth(#{'Authorization' => "Bearer abc123=="})),
+		?assertEqual({error, unauthorized}, checkSuppressAuth(#{'Authorization' => "Bearer abc123"})),
 		os:unsetenv("CLIENT_KEYS").
 
 -endif.
