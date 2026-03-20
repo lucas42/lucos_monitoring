@@ -117,9 +117,22 @@ renderCheckStatus(Health, Link) ->
 formatStringFromInfo(Key, CheckInfo) ->
 	formatString(Key, maps:get(Key, CheckInfo, <<"">>)).
 
+% Escapes HTML special characters to prevent XSS. Must be applied to all
+% external data before inserting into HTML. & must be escaped first to avoid
+% double-escaping the entities introduced by subsequent replacements.
+htmlEscape(Value) ->
+	lists:foldl(
+		fun ({From, To}, Acc) ->
+			re:replace(Acc, From, To, [global, {return, list}])
+		end,
+		Value,
+		[{"&", "\\&amp;"}, {"<", "\\&lt;"}, {">", "\\&gt;"}, {"\"", "\\&quot;"}]
+	).
+
 formatString(Key, BinaryValue) ->
 	RawValue = binary_to_list(BinaryValue),
-	ZWSValue = re:replace(RawValue, "_", "\\&ZeroWidthSpace;_",[global, {return, list}]),
+	EscapedValue = htmlEscape(RawValue),
+	ZWSValue = re:replace(EscapedValue, "_", "\\&ZeroWidthSpace;_",[global, {return, list}]),
 	LinkedValue = re:replace(ZWSValue, "https?:\\S+", "<a href=\"&\" target=\"_blank\">&</a>",[global, {return, list}]),
 	Value = re:replace(LinkedValue, "href=\"([^\"]*)&ZeroWidthSpace;([^\"]*)\"", "href=\"\\g1\\g2\"",[global, {return, list}]),
 	"<td class=\"formattedString "++binary_to_list(Key)++"\">"++Value++"</td>\r\n".
@@ -507,4 +520,38 @@ tryController(Method, RequestUri, Body, StatePid) ->
 		?assertEqual(1, maps:get(<<"healthy">>, Summary)),
 		?assertEqual(1, maps:get(<<"erroring">>, Summary)),
 		?assertEqual(1, maps:get(<<"unknown">>, Summary)).
+
+	htmlEscape_no_special_chars_test() ->
+		?assertEqual("hello world", htmlEscape("hello world")).
+
+	htmlEscape_ampersand_test() ->
+		?assertEqual("foo &amp; bar", htmlEscape("foo & bar")).
+
+	htmlEscape_angle_brackets_test() ->
+		?assertEqual("&lt;script&gt;alert(1)&lt;/script&gt;", htmlEscape("<script>alert(1)</script>")).
+
+	htmlEscape_double_quote_test() ->
+		?assertEqual("say &quot;hello&quot;", htmlEscape("say \"hello\"")).
+
+	htmlEscape_all_special_chars_test() ->
+		?assertEqual("&lt;a href=&quot;x&quot;&gt;foo &amp; bar&lt;/a&gt;", htmlEscape("<a href=\"x\">foo & bar</a>")).
+
+	htmlEscape_no_double_encoding_test() ->
+		% Escaping once should not double-encode on a second pass
+		Escaped = htmlEscape("a & b"),
+		?assertEqual("a &amp; b", Escaped),
+		?assertEqual("a &amp;amp; b", htmlEscape(Escaped)).
+
+	formatString_escapes_html_test() ->
+		% A techDetail containing a script tag should be escaped, not executed
+		Result = formatString(<<"techDetail">>, <<"<script>alert(1)</script>">>),
+		?assertEqual(false, string:str(Result, "<script>") > 0),
+		?assert(string:str(Result, "&lt;script&gt;") > 0).
+
+	formatString_url_still_linkified_test() ->
+		% A plain URL in a value should still be wrapped in an anchor tag
+		Result = formatString(<<"debug">>, <<"See https://example.com/path for details">>),
+		?assert(string:str(Result, "<a href=") > 0),
+		?assert(string:str(Result, "https://example.com/path") > 0).
+
 -endif.
