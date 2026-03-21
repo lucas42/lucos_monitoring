@@ -1,5 +1,5 @@
 -module(fetcher).
--export([start/1, tryRunChecks/2, tryCheckConfigyRepo/2, parseConfigyIds/1]).
+-export([start/1, tryRunChecks/2, parseConfigyRepos/1]).
 -include_lib("eunit/include/eunit.hrl").
 
 start(StatePid) ->
@@ -7,12 +7,12 @@ start(StatePid) ->
 	{ok, Device} = file:open("./service-list", [read]),
 	spawnFetcher(StatePid, Device),
 	file:close(Device),
-	spawnConfigyFetcher(StatePid).
+	spawnCIFetcher(StatePid).
 
 spawnFetcher(StatePid, Device) ->
 	case io:get_line(Device, "") of
 		eof  -> ok;
-		Line -> 
+		Line ->
 			Host = string:trim(Line),
 			spawn(?MODULE, tryRunChecks, [StatePid, Host]),
 			spawnFetcher(StatePid, Device)
@@ -28,74 +28,48 @@ tryRunChecks(StatePid, Host) ->
 	timer:sleep(timer:seconds(60)),
 	tryRunChecks(StatePid, Host).
 
-% Fetches the full repo list from configy, then checks CircleCI for each repo.
-% Runs on a 60-second loop so newly added repos are picked up without restarting.
-spawnConfigyFetcher(StatePid) ->
-	spawn(fun() -> configyFetcherLoop(StatePid) end).
+% Reads the CI repo list (written at build time from configy) and spawns a
+% recurring CI check process for each repo.
+spawnCIFetcher(StatePid) ->
+	{ok, Body} = file:read_file("./ci-repo-list"),
+	Repos = parseConfigyRepos(binary_to_list(Body)),
+	lists:foreach(fun({RepoId, Host}) ->
+		spawn(fun() -> ciRepoLoop(StatePid, RepoId, Host) end)
+	end, Repos).
 
-configyFetcherLoop(StatePid) ->
-	try runConfigyChecks(StatePid) of
-		_ -> ok
+parseConfigyRepos(Body) ->
+	Repos = jiffy:decode(Body, [return_maps]),
+	[{binary_to_list(maps:get(<<"id">>, Repo)),
+	  repoHost(Repo)} || Repo <- Repos].
+
+repoHost(Repo) ->
+	case maps:get(<<"domain">>, Repo, null) of
+		null -> binary_to_list(maps:get(<<"id">>, Repo));
+		Domain -> binary_to_list(Domain)
+	end.
+
+ciRepoLoop(StatePid, RepoId, Host) ->
+	try
+		Slug = list_to_binary("gh/lucas42/" ++ RepoId),
+		CIChecks = checkCIForSlug(Slug, skip),
+		case CIChecks of
+			skip -> ok;
+			_ -> ok = gen_server:cast(StatePid, {updateSystem, Host, RepoId, CIChecks, #{}})
+		end
 	catch
 		ExceptionClass:Term:StackTrace ->
 			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace])
 	end,
 	timer:sleep(timer:seconds(60)),
-	configyFetcherLoop(StatePid).
-
-runConfigyChecks(StatePid) ->
-	ConfigyURLs = [
-		"https://configy.l42.eu/systems",
-		"https://configy.l42.eu/components",
-		"https://configy.l42.eu/scripts"
-	],
-	RepoIds = lists:flatmap(fun fetchConfigyIds/1, ConfigyURLs),
-	lists:foreach(fun(RepoId) ->
-		spawn(?MODULE, tryCheckConfigyRepo, [StatePid, RepoId])
-	end, RepoIds).
-
-fetchConfigyIds(URL) ->
-	case httpc:request(get, {URL, [{"Accept","application/json"}, {"User-Agent", "lucos_monitoring"}]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
-		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
-			parseConfigyIds(Body);
-		_ ->
-			io:format("Failed to fetch configy repo list from ~p~n", [URL]),
-			[]
-	end.
-
-parseConfigyIds(Body) ->
-	Repos = jiffy:decode(Body, [return_maps]),
-	[binary_to_list(maps:get(<<"id">>, Repo)) || Repo <- Repos].
-
-tryCheckConfigyRepo(StatePid, RepoId) ->
-	try checkConfigyRepo(StatePid, RepoId) of
-		_ -> ok
-	catch
-		ExceptionClass:Term:StackTrace ->
-			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace])
-	end.
-
-checkConfigyRepo(StatePid, RepoId) ->
-	Slug = list_to_binary("gh/lucas42/" ++ RepoId),
-	CIChecks = checkCIFromConfigy(Slug),
-	case CIChecks of
-		skip -> ok;
-		_ -> ok = gen_server:cast(StatePid, {updateSystem, "ci-only", RepoId, CIChecks, #{}})
-	end.
-
-checkCIFromConfigy(CircleCISlug) ->
-	checkCIForSlug(CircleCISlug, skip).
+	ciRepoLoop(StatePid, RepoId, Host).
 
 runChecks(StatePid, Host) ->
 	{TLSCheck} = checkTlsExpiry(Host),
-	{InfoCheck, System, Checks, Metrics, CircleCISlug} = fetchInfo(Host),
-	CIChecks = checkCI(CircleCISlug),
-	AllChecks = maps:merge(
-		maps:merge(#{
-			<<"fetch-info">> => InfoCheck,
-			<<"tls-certificate">> => TLSCheck
-		}, CIChecks)
-	, Checks),
+	{InfoCheck, System, Checks, Metrics} = fetchInfo(Host),
+	AllChecks = maps:merge(#{
+		<<"fetch-info">> => InfoCheck,
+		<<"tls-certificate">> => TLSCheck
+	}, Checks),
 	ok = gen_server:cast(StatePid, {updateSystem, Host, System, AllChecks, Metrics}).
 
 checkTlsExpiry(Host) ->
@@ -136,8 +110,7 @@ parseInfo(Body) ->
 	System = binary_to_list(maps:get(<<"system">>, Info)),
 	Checks = maps:merge(#{}, maps:get(<<"checks">>, Info, #{})),
 	Metrics = maps:merge(#{}, maps:get(<<"metrics">>, Info, #{})),
-	CircleCISlug = maps:get(<<"circle">>, maps:get(<<"ci">>, Info, #{}), null),
-	{System, Checks, Metrics, CircleCISlug}.
+	{System, Checks, Metrics}.
 
 
 parseError(Error) ->
@@ -195,12 +168,12 @@ fetchInfo(Host) ->
 	case httpc:request(get, {InfoURL, [{"User-Agent", "lucos_monitoring"}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], [{socket_opts, [{ipfamily, inet6fb4}]}]) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
 			try
-				{System, Checks, Metrics, CircleCISlug} = parseInfo(Body),
+				{System, Checks, Metrics} = parseInfo(Body),
 				InfoCheck = #{
 					<<"ok">> => true,
 					<<"techDetail">> => TechDetail
 				},
-				{InfoCheck, System, Checks, Metrics, CircleCISlug}
+				{InfoCheck, System, Checks, Metrics}
 			catch
 				Exception:Reason ->
 					ErroringInfoCheck = #{
@@ -208,7 +181,7 @@ fetchInfo(Host) ->
 						<<"techDetail">> => TechDetail,
 						<<"debug">> => list_to_binary(lists:flatten(io_lib:format("Couldn't parse response from endpoint.~nError: ~p ~p",[Exception, Reason])))
 					},
-					{ErroringInfoCheck, unknown, #{}, #{}, null}
+					{ErroringInfoCheck, unknown, #{}, #{}}
 			end;
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 			InfoCheck = #{
@@ -216,7 +189,7 @@ fetchInfo(Host) ->
 				<<"techDetail">> => TechDetail,
 				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase)
 			},
-			{InfoCheck, unknown, #{}, #{}, null};
+			{InfoCheck, unknown, #{}, #{}};
 		{error, Error} ->
 			{Ok, Debug} = parseError(Error),
 			InfoCheck = #{
@@ -224,25 +197,11 @@ fetchInfo(Host) ->
 				<<"techDetail">> => TechDetail,
 				<<"debug">> => list_to_binary(Debug)
 			},
-			{InfoCheck, unknown, #{}, #{}, null}
+			{InfoCheck, unknown, #{}, #{}}
 	end.
 
-checkCI(CircleCISlug) ->
-	case CircleCISlug of
-		null -> #{};
-		_ ->
-			Not404 = #{<<"circleci">> => #{
-				<<"ok">> => false,
-				<<"techDetail">> => <<"Checks status of recent circleCI pipelines">>,
-				<<"debug">> => <<"Received HTTP response with status 404 Not Found from pipeline endpoint">>
-			}},
-			checkCIForSlug(CircleCISlug, Not404)
-	end.
-
-% Shared CircleCI pipeline check logic. OnNotFound is the value to return when
-% the project returns 404 — callers supply different values:
-%   - checkCI: a failing check (404 means a slug that was configured but doesn't exist)
-%   - checkCIFromConfigy: the atom `skip` (404 means this repo has no CI configured)
+% CircleCI pipeline check logic. OnNotFound is the value to return when the
+% project returns 404 — pass `skip` to silently ignore repos with no CI.
 checkCIForSlug(CircleCISlug, OnNotFound) ->
 	TechDetail = <<"Checks status of recent circleCI pipelines">>,
 	Token = os:getenv("CIRCLECI_API_TOKEN", ""),
@@ -368,14 +327,12 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 
 -ifdef(TEST).
 	parseInfo_test() ->
-		% Basic: system field only, no checks/metrics/ci
-		?assertEqual({"lucos_test",#{},#{},null}, parseInfo("{\"system\":\"lucos_test\"}")),
+		% Basic: system field only, no checks/metrics
+		?assertEqual({"lucos_test",#{},#{}}, parseInfo("{\"system\":\"lucos_test\"}")),
 		% Checks field is extracted when present
-		?assertEqual({"lucos_test",#{<<"db">> => #{<<"ok">> => true}},#{},null}, parseInfo("{\"system\":\"lucos_test\",\"checks\":{\"db\":{\"ok\":true}}}")),
-		% ci.circle field is extracted correctly
-		?assertEqual({"lucos_test",#{},#{},<<"gh/lucas42/lucos_test">>}, parseInfo("{\"system\":\"lucos_test\",\"ci\":{\"circle\":\"gh/lucas42/lucos_test\"}}")),
-		% ci present but no circle key returns null
-		?assertEqual({"lucos_test",#{},#{},null}, parseInfo("{\"system\":\"lucos_test\",\"ci\":{}}")),
+		?assertEqual({"lucos_test",#{<<"db">> => #{<<"ok">> => true}},#{}}, parseInfo("{\"system\":\"lucos_test\",\"checks\":{\"db\":{\"ok\":true}}}")),
+		% ci field is ignored (CI is now sourced from configy, not /_info)
+		?assertEqual({"lucos_test",#{},#{}}, parseInfo("{\"system\":\"lucos_test\",\"ci\":{\"circle\":\"gh/lucas42/lucos_test\"}}")),
 		% Invalid JSON raises an exception
 		?assertException(error, {2,invalid_json}, parseInfo("{{{{}}}")),
 		% Empty body raises an exception
@@ -385,9 +342,7 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 		% system as integer raises an exception (binary_to_list fails on non-binary)
 		?assertException(error, badarg, parseInfo("{\"system\":42}")),
 		% system as JSON null raises an exception (null becomes atom null, not a binary)
-		?assertException(error, badarg, parseInfo("{\"system\":null}")),
-		% ci as a non-map raises an exception (maps:get fails on non-map)
-		?assertException(error, {badmap,<<"not_a_map">>}, parseInfo("{\"system\":\"lucos_test\",\"ci\":\"not_a_map\"}")).
+		?assertException(error, badarg, parseInfo("{\"system\":null}")).
 
 	% BUG: checks as a non-map string passes through parseInfo without error,
 	% causing runChecks to crash with {badmap,_} when it calls maps:merge.
@@ -572,12 +527,13 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/github/lucas42/lucos_test/44", <<"Checks status of recent circleCI pipelines">>),
 		?assertMatch(#{<<"circleci">> := #{<<"ok">> := false}}, Result).
 
-	parseConfigyIds_test() ->
-		% Verifies that parseConfigyIds correctly extracts id strings from a configy JSON response.
-		Body = "[{\"id\":\"lucos_foo\",\"unsupervisedAgentCode\":false},{\"id\":\"lucos_bar\",\"unsupervisedAgentCode\":true}]",
-		?assertEqual(["lucos_foo", "lucos_bar"], parseConfigyIds(Body)).
+	parseConfigyRepos_test() ->
+		% System with a domain: host is the domain.
+		% Component with no domain: host falls back to the repo id.
+		Body = "[{\"id\":\"lucos_foo\",\"domain\":\"foo.l42.eu\"},{\"id\":\"lucos_bar\",\"domain\":null}]",
+		?assertEqual([{"lucos_foo", "foo.l42.eu"}, {"lucos_bar", "lucos_bar"}], parseConfigyRepos(Body)).
 
-	parseConfigyIds_empty_test() ->
-		?assertEqual([], parseConfigyIds("[]")).
+	parseConfigyRepos_empty_test() ->
+		?assertEqual([], parseConfigyRepos("[]")).
 
 -endif.
