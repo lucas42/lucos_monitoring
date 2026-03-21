@@ -26,7 +26,8 @@ listen_with_retry(Port, Opts, StatePid, SchedulerCount, RetriesLeft) ->
 			end,
 			lists:foreach(Spawn, lists:seq(1, SchedulerCount)),
 			io:format("server listening on port ~b with ~b schedulers~n", [Port, SchedulerCount]),
-			fetcher:start(StatePid),
+			fetcher_info:start(StatePid),
+			fetcher_circleci:start(StatePid),
 			receive
 				Any -> io:format("~p~n", [Any])
 			end;
