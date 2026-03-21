@@ -83,53 +83,8 @@ checkConfigyRepo(StatePid, RepoId) ->
 		_ -> ok = gen_server:cast(StatePid, {updateSystem, "ci-only", RepoId, CIChecks, #{}})
 	end.
 
-% Like checkCI, but treats 404 as "no CI configured" (skip) rather than a failing check.
 checkCIFromConfigy(CircleCISlug) ->
-	TechDetail = <<"Checks status of recent circleCI pipelines">>,
-	Token = os:getenv("CIRCLECI_API_TOKEN", ""),
-	AuthHeader = {"Circle-Token", Token},
-	PipelineUrl = "https://circleci.com/api/v2/project/"++binary_to_list(CircleCISlug)++"/pipeline?branch=main&limit=5",
-	case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
-		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, PipelineBody}} ->
-			PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
-			case maps:get(<<"items">>, PipelineResponse, []) of
-				[] ->
-					#{<<"circleci">> => #{
-						<<"ok">> => true,
-						<<"techDetail">> => TechDetail,
-						<<"debug">> => <<"No recent pipelines found">>
-					}};
-				[LatestPipeline | OtherPipelines] ->
-					PipelineNumber = maps:get(<<"number">>, LatestPipeline),
-					SlugStr = binary_to_list(CircleCISlug),
-					WebSlug = re:replace(SlugStr, "^gh/", "github/", [{return, list}]),
-					LatestPipelineUrl = "https://app.circleci.com/pipelines/"++WebSlug++"/"++integer_to_list(PipelineNumber),
-					AllPipelines = [LatestPipeline | OtherPipelines],
-					AllWorkflows = collectAllWorkflows(AllPipelines, AuthHeader),
-					checkWorkflowStatuses(SlugStr, AllWorkflows, LatestPipelineUrl, TechDetail)
-			end;
-		{ok, {{_Version, 404, _ReasonPhrase}, _Headers, _Body}} ->
-			skip;
-		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} when StatusCode >= 500 ->
-			#{<<"circleci">> => #{
-				<<"ok">> => unknown,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
-			}};
-		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
-			#{<<"circleci">> => #{
-				<<"ok">> => false,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
-			}};
-		{error, Error} ->
-			{Ok, Debug} = parseError(Error),
-			#{<<"circleci">> => #{
-				<<"ok">> => Ok,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary(Debug)
-			}}
-	end.
+	checkCIForSlug(CircleCISlug, skip).
 
 runChecks(StatePid, Host) ->
 	{TLSCheck} = checkTlsExpiry(Host),
@@ -276,51 +231,65 @@ checkCI(CircleCISlug) ->
 	case CircleCISlug of
 		null -> #{};
 		_ ->
-			TechDetail = <<"Checks status of recent circleCI pipelines">>,
-			Token = os:getenv("CIRCLECI_API_TOKEN", ""),
-			AuthHeader = {"Circle-Token", Token},
-			% Fetch the last 5 pipelines so that a failed pipeline followed by a
-			% push-to-fix (which creates a new pipeline) is still detected.
-			PipelineUrl = "https://circleci.com/api/v2/project/"++binary_to_list(CircleCISlug)++"/pipeline?branch=main&limit=5",
-			case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
-				{ok, {{_Version, 200, _ReasonPhrase}, _Headers, PipelineBody}} ->
-					PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
-					case maps:get(<<"items">>, PipelineResponse, []) of
-						[] ->
-							#{<<"circleci">> => #{
-								<<"ok">> => true,
-								<<"techDetail">> => TechDetail,
-								<<"debug">> => <<"No recent pipelines found">>
-							}};
-						[LatestPipeline | OtherPipelines] ->
-							PipelineNumber = maps:get(<<"number">>, LatestPipeline),
-							SlugStr = binary_to_list(CircleCISlug),
-							WebSlug = re:replace(SlugStr, "^gh/", "github/", [{return, list}]),
-							LatestPipelineUrl = "https://app.circleci.com/pipelines/"++WebSlug++"/"++integer_to_list(PipelineNumber),
-							AllPipelines = [LatestPipeline | OtherPipelines],
-							AllWorkflows = collectAllWorkflows(AllPipelines, AuthHeader),
-							checkWorkflowStatuses(SlugStr, AllWorkflows, LatestPipelineUrl, TechDetail)
-					end;
-				{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} when StatusCode >= 500 ->
+			Not404 = #{<<"circleci">> => #{
+				<<"ok">> => false,
+				<<"techDetail">> => <<"Checks status of recent circleCI pipelines">>,
+				<<"debug">> => <<"Received HTTP response with status 404 Not Found from pipeline endpoint">>
+			}},
+			checkCIForSlug(CircleCISlug, Not404)
+	end.
+
+% Shared CircleCI pipeline check logic. OnNotFound is the value to return when
+% the project returns 404 — callers supply different values:
+%   - checkCI: a failing check (404 means a slug that was configured but doesn't exist)
+%   - checkCIFromConfigy: the atom `skip` (404 means this repo has no CI configured)
+checkCIForSlug(CircleCISlug, OnNotFound) ->
+	TechDetail = <<"Checks status of recent circleCI pipelines">>,
+	Token = os:getenv("CIRCLECI_API_TOKEN", ""),
+	AuthHeader = {"Circle-Token", Token},
+	% Fetch the last 5 pipelines so that a failed pipeline followed by a
+	% push-to-fix (which creates a new pipeline) is still detected.
+	PipelineUrl = "https://circleci.com/api/v2/project/"++binary_to_list(CircleCISlug)++"/pipeline?branch=main&limit=5",
+	case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
+		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, PipelineBody}} ->
+			PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
+			case maps:get(<<"items">>, PipelineResponse, []) of
+				[] ->
 					#{<<"circleci">> => #{
-						<<"ok">> => unknown,
+						<<"ok">> => true,
 						<<"techDetail">> => TechDetail,
-						<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
+						<<"debug">> => <<"No recent pipelines found">>
 					}};
-				{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
-					#{<<"circleci">> => #{
-						<<"ok">> => false,
-						<<"techDetail">> => TechDetail,
-						<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
-					}};
-				{error, Error} ->
-					{Ok, Debug} = parseError(Error),
-					#{<<"circleci">> => #{
-						<<"ok">> => Ok,
-						<<"techDetail">> => TechDetail,
-						<<"debug">> => list_to_binary(Debug)
-					}}
-			end
+				[LatestPipeline | OtherPipelines] ->
+					PipelineNumber = maps:get(<<"number">>, LatestPipeline),
+					SlugStr = binary_to_list(CircleCISlug),
+					WebSlug = re:replace(SlugStr, "^gh/", "github/", [{return, list}]),
+					LatestPipelineUrl = "https://app.circleci.com/pipelines/"++WebSlug++"/"++integer_to_list(PipelineNumber),
+					AllPipelines = [LatestPipeline | OtherPipelines],
+					AllWorkflows = collectAllWorkflows(AllPipelines, AuthHeader),
+					checkWorkflowStatuses(SlugStr, AllWorkflows, LatestPipelineUrl, TechDetail)
+			end;
+		{ok, {{_Version, 404, _ReasonPhrase}, _Headers, _Body}} ->
+			OnNotFound;
+		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} when StatusCode >= 500 ->
+			#{<<"circleci">> => #{
+				<<"ok">> => unknown,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
+			}};
+		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
+			#{<<"circleci">> => #{
+				<<"ok">> => false,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
+			}};
+		{error, Error} ->
+			{Ok, Debug} = parseError(Error),
+			#{<<"circleci">> => #{
+				<<"ok">> => Ok,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => list_to_binary(Debug)
+			}}
 	end.
 
 % Fetches workflows for each pipeline in the list and concatenates them into a
