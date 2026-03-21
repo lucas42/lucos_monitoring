@@ -5,6 +5,7 @@
 % Reads the CI repo lists (written at build time from configy) and spawns a
 % recurring CI check process for each repo.
 start(StatePid) ->
+	{ok, _} = application:ensure_all_started([ssl, inets]),
 	{ok, SystemsBody} = file:read_file("./ci-systems-list"),
 	{ok, ComponentsBody} = file:read_file("./ci-components-list"),
 	Repos = parseConfigyRepos(binary_to_list(SystemsBody)) ++
@@ -27,10 +28,9 @@ repoHost(Repo) ->
 ciRepoLoop(StatePid, RepoId, Host) ->
 	try
 		Slug = "github/lucas42/" ++ RepoId,
-		CIChecks = checkCIForSlug(Slug, skip),
-		case CIChecks of
+		case checkCIForSlug(Slug) of
 			skip -> ok;
-			_ -> ok = gen_server:cast(StatePid, {updateSystem, Host, RepoId, CIChecks, #{}})
+			CIChecks -> ok = gen_server:cast(StatePid, {updateSystem, Host, RepoId, CIChecks, #{}})
 		end
 	catch
 		ExceptionClass:Term:StackTrace ->
@@ -39,9 +39,9 @@ ciRepoLoop(StatePid, RepoId, Host) ->
 	timer:sleep(timer:seconds(60)),
 	ciRepoLoop(StatePid, RepoId, Host).
 
-% CircleCI pipeline check logic. OnNotFound is the value to return when the
-% project returns 404 — pass `skip` to silently ignore repos with no CI.
-checkCIForSlug(Slug, OnNotFound) ->
+% CircleCI pipeline check logic. Returns `skip` when the project returns 404
+% (no CI configured), otherwise returns a checks map.
+checkCIForSlug(Slug) ->
 	TechDetail = <<"Checks status of recent circleCI pipelines">>,
 	Token = os:getenv("CIRCLECI_API_TOKEN", ""),
 	AuthHeader = {"Circle-Token", Token},
@@ -66,75 +66,19 @@ checkCIForSlug(Slug, OnNotFound) ->
 					checkWorkflowStatuses(Slug, AllWorkflows, LatestPipelineUrl, TechDetail)
 			end;
 		{ok, {{_Version, 404, _ReasonPhrase}, _Headers, _Body}} ->
-			OnNotFound;
-		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} when StatusCode >= 500 ->
+			skip;
+		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 			#{<<"circleci">> => #{
 				<<"ok">> => unknown,
 				<<"techDetail">> => TechDetail,
 				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
 			}};
-		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
+		{error, _Error} ->
 			#{<<"circleci">> => #{
-				<<"ok">> => false,
+				<<"ok">> => unknown,
 				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
-			}};
-		{error, Error} ->
-			{Ok, Debug} = parseError(Error),
-			#{<<"circleci">> => #{
-				<<"ok">> => Ok,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary(Debug)
+				<<"debug">> => <<"Error making request to CircleCI API">>
 			}}
-	end.
-
-parseError(Error) ->
-	case Error of
-		{failed_connect, [{to_address, {Host, Port}}, {inet,[inet],Ipv4ErrorType}]} ->
-			parseConnectionError(Host, Port, 4, Ipv4ErrorType);
-		{failed_connect, [{to_address, {Host, Port}}, {inet6,[inet6],Ipv6ErrorType}]} ->
-			parseConnectionError(Host, Port, 6, Ipv6ErrorType);
-		{failed_connect, [{to_address, {Host, Port}}, {inet6,[inet6],Ipv6ErrorType}, {inet,[inet],Ipv4ErrorType}]} ->
-			{Status4, Debug4} = parseConnectionError(Host, Port, 4, Ipv4ErrorType),
-			{Status6, Debug6} = parseConnectionError(Host, Port, 6, Ipv6ErrorType),
-			Debug = Debug4++"; "++Debug6,
-			Status = case {Status4, Status6} of
-				{unknown, unknown} ->
-					unknown;
-				{false, false} ->
-					false;
-				{false, unknown} ->
-					false;
-				{unknown, false} ->
-					false
-			end,
-			{Status, Debug};
-		socket_closed_remotely ->
-			{false, "Socket closed remotely"};
-		timeout ->
-			{unknown, "HTTP Request timed out"};
-		_ ->
-			io:format("Unknown error handled: ~p~n",[Error]),
-			{false, "An unknown error occured: "++lists:flatten(io_lib:format("~p",[Error]))}
-	end.
-
-parseConnectionError(Host, Port, IpVersion, ErrorType) ->
-	case ErrorType of
-		nxdomain ->
-			{unknown, "DNS failure when trying to resolve ipv"++integer_to_list(IpVersion)++" address for "++Host};
-		ehostunreach ->
-			{unknown, "No route to host "++Host++" over ipv"++integer_to_list(IpVersion)};
-		econnrefused ->
-			{false, "Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
-		closed ->
-			{false, "TCP connection was closed connecting to host "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
-		etimedout ->
-			{unknown, "TCP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
-		timeout ->
-			{unknown, "HTTP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
-		_ ->
-			io:format("Unknown connection error handled: ~p (ipv~p connection)~n",[ErrorType, IpVersion]),
-			{false, lists:flatten(io_lib:format("An unknown connection error occured: ~p (ipv~p connection)",[ErrorType, IpVersion]))}
 	end.
 
 % Fetches workflows for each pipeline in the list and concatenates them into a
