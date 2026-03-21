@@ -1,12 +1,13 @@
 -module(fetcher).
--export([start/1, tryRunChecks/2]).
+-export([start/1, tryRunChecks/2, tryCheckConfigyRepo/2, parseConfigyIds/1]).
 -include_lib("eunit/include/eunit.hrl").
 
 start(StatePid) ->
 	{ok, _} = application:ensure_all_started([ssl, inets]),
 	{ok, Device} = file:open("./service-list", [read]),
 	spawnFetcher(StatePid, Device),
-	file:close(Device).
+	file:close(Device),
+	spawnConfigyFetcher(StatePid).
 
 spawnFetcher(StatePid, Device) ->
 	case io:get_line(Device, "") of
@@ -26,6 +27,109 @@ tryRunChecks(StatePid, Host) ->
 	end,
 	timer:sleep(timer:seconds(60)),
 	tryRunChecks(StatePid, Host).
+
+% Fetches the full repo list from configy, then checks CircleCI for each repo.
+% Runs on a 60-second loop so newly added repos are picked up without restarting.
+spawnConfigyFetcher(StatePid) ->
+	spawn(fun() -> configyFetcherLoop(StatePid) end).
+
+configyFetcherLoop(StatePid) ->
+	try runConfigyChecks(StatePid) of
+		_ -> ok
+	catch
+		ExceptionClass:Term:StackTrace ->
+			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace])
+	end,
+	timer:sleep(timer:seconds(60)),
+	configyFetcherLoop(StatePid).
+
+runConfigyChecks(StatePid) ->
+	ConfigyURLs = [
+		"https://configy.l42.eu/systems",
+		"https://configy.l42.eu/components",
+		"https://configy.l42.eu/scripts"
+	],
+	RepoIds = lists:flatmap(fun fetchConfigyIds/1, ConfigyURLs),
+	lists:foreach(fun(RepoId) ->
+		spawn(?MODULE, tryCheckConfigyRepo, [StatePid, RepoId])
+	end, RepoIds).
+
+fetchConfigyIds(URL) ->
+	case httpc:request(get, {URL, [{"Accept","application/json"}, {"User-Agent", "lucos_monitoring"}]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
+		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
+			parseConfigyIds(Body);
+		_ ->
+			io:format("Failed to fetch configy repo list from ~p~n", [URL]),
+			[]
+	end.
+
+parseConfigyIds(Body) ->
+	Repos = jiffy:decode(Body, [return_maps]),
+	[binary_to_list(maps:get(<<"id">>, Repo)) || Repo <- Repos].
+
+tryCheckConfigyRepo(StatePid, RepoId) ->
+	try checkConfigyRepo(StatePid, RepoId) of
+		_ -> ok
+	catch
+		ExceptionClass:Term:StackTrace ->
+			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace])
+	end.
+
+checkConfigyRepo(StatePid, RepoId) ->
+	Slug = list_to_binary("gh/lucas42/" ++ RepoId),
+	CIChecks = checkCIFromConfigy(Slug),
+	case CIChecks of
+		skip -> ok;
+		_ -> ok = gen_server:cast(StatePid, {updateSystem, "ci-only", RepoId, CIChecks, #{}})
+	end.
+
+% Like checkCI, but treats 404 as "no CI configured" (skip) rather than a failing check.
+checkCIFromConfigy(CircleCISlug) ->
+	TechDetail = <<"Checks status of recent circleCI pipelines">>,
+	Token = os:getenv("CIRCLECI_API_TOKEN", ""),
+	AuthHeader = {"Circle-Token", Token},
+	PipelineUrl = "https://circleci.com/api/v2/project/"++binary_to_list(CircleCISlug)++"/pipeline?branch=main&limit=5",
+	case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
+		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, PipelineBody}} ->
+			PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
+			case maps:get(<<"items">>, PipelineResponse, []) of
+				[] ->
+					#{<<"circleci">> => #{
+						<<"ok">> => true,
+						<<"techDetail">> => TechDetail,
+						<<"debug">> => <<"No recent pipelines found">>
+					}};
+				[LatestPipeline | OtherPipelines] ->
+					PipelineNumber = maps:get(<<"number">>, LatestPipeline),
+					SlugStr = binary_to_list(CircleCISlug),
+					WebSlug = re:replace(SlugStr, "^gh/", "github/", [{return, list}]),
+					LatestPipelineUrl = "https://app.circleci.com/pipelines/"++WebSlug++"/"++integer_to_list(PipelineNumber),
+					AllPipelines = [LatestPipeline | OtherPipelines],
+					AllWorkflows = collectAllWorkflows(AllPipelines, AuthHeader),
+					checkWorkflowStatuses(SlugStr, AllWorkflows, LatestPipelineUrl, TechDetail)
+			end;
+		{ok, {{_Version, 404, _ReasonPhrase}, _Headers, _Body}} ->
+			skip;
+		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} when StatusCode >= 500 ->
+			#{<<"circleci">> => #{
+				<<"ok">> => unknown,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
+			}};
+		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
+			#{<<"circleci">> => #{
+				<<"ok">> => false,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
+			}};
+		{error, Error} ->
+			{Ok, Debug} = parseError(Error),
+			#{<<"circleci">> => #{
+				<<"ok">> => Ok,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => list_to_binary(Debug)
+			}}
+	end.
 
 runChecks(StatePid, Host) ->
 	{TLSCheck} = checkTlsExpiry(Host),
@@ -498,4 +602,13 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 		],
 		Result = checkWorkflowStatuses("gh/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/github/lucas42/lucos_test/44", <<"Checks status of recent circleCI pipelines">>),
 		?assertMatch(#{<<"circleci">> := #{<<"ok">> := false}}, Result).
+
+	parseConfigyIds_test() ->
+		% Verifies that parseConfigyIds correctly extracts id strings from a configy JSON response.
+		Body = "[{\"id\":\"lucos_foo\",\"unsupervisedAgentCode\":false},{\"id\":\"lucos_bar\",\"unsupervisedAgentCode\":true}]",
+		?assertEqual(["lucos_foo", "lucos_bar"], parseConfigyIds(Body)).
+
+	parseConfigyIds_empty_test() ->
+		?assertEqual([], parseConfigyIds("[]")).
+
 -endif.
