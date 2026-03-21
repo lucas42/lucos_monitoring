@@ -93,7 +93,7 @@ getClientIP(Socket) ->
 
 getHeaders(StatusCode, ContentType) ->
 	getStatusLine(StatusCode) ++
-		"Content-Type: " ++ ContentType ++ "\n" ++
+		"Content-Type: " ++ ContentType ++ "; charset=utf-8\n" ++
 		"\n".
 
 getStatusLine(StatusCode) ->
