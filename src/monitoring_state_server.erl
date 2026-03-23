@@ -58,8 +58,10 @@ handle_call(Request, _From, {SystemMap, SuppressionMap}) ->
 	end.
 
 % Merges checks from all sources into a single flat map.
-% Later sources in the fold override earlier ones for any shared keys,
-% but in practice info and circleci write disjoint key sets.
+% The current sources (info, circleci) write disjoint check key sets,
+% so fold ordering doesn't matter in practice. If a future source shares
+% keys with an existing one, override order will be non-deterministic
+% (map fold order over atom keys is unspecified in Erlang) — revisit then.
 mergeSourceChecks(SourceChecksMap) ->
 	maps:fold(fun(_, Checks, Acc) ->
 		maps:merge(Acc, Checks)
