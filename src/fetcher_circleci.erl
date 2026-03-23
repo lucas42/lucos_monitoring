@@ -30,7 +30,7 @@ ciRepoLoop(StatePid, RepoId, Host) ->
 		Slug = "github/lucas42/" ++ RepoId,
 		case checkCIForSlug(Slug) of
 			skip -> ok;
-			CIChecks -> ok = gen_server:cast(StatePid, {updateSystem, Host, RepoId, CIChecks, #{}})
+			CIChecks -> ok = gen_server:cast(StatePid, {updateSystem, Host, RepoId, circleci, CIChecks, #{}})
 		end
 	catch
 		ExceptionClass:Term:StackTrace ->
