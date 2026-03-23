@@ -9,12 +9,15 @@ init([]) ->
 
 handle_cast(Request, {SystemMap, SuppressionMap}) ->
 	case Request of
-		{updateSystem, Host, System, SystemChecks, SystemMetrics} ->
-			io:format("Received update for system ~p (Host ~p)~n", [System, Host]),
+		{updateSystem, Host, System, Source, SourceChecks, SystemMetrics} ->
+			io:format("Received update for system ~p (Host ~p, Source ~p)~n", [System, Host, Source]),
 			IsFirstSeen = not maps:is_key(Host, SystemMap),
-			{_, OldSystemChecks, _} = maps:get(Host, SystemMap, {nil, maps:new(), nil}),
-			NormalisedChecks = normaliseChecks(OldSystemChecks, SystemChecks),
-			NewSuppressionMap = case {IsFirstSeen, meaningfulChange(OldSystemChecks, NormalisedChecks)} of
+			{_, OldSourceChecksMap, _} = maps:get(Host, SystemMap, {nil, #{}, nil}),
+			OldMergedChecks = mergeSourceChecks(OldSourceChecksMap),
+			NewSourceChecksMap = maps:put(Source, SourceChecks, OldSourceChecksMap),
+			NewMergedChecks = mergeSourceChecks(NewSourceChecksMap),
+			NormalisedChecks = normaliseChecks(OldMergedChecks, NewMergedChecks),
+			NewSuppressionMap = case {IsFirstSeen, meaningfulChange(OldMergedChecks, NormalisedChecks)} of
 				{true, _} ->
 					io:format("Warm-up: skipping alert for ~p on first poll~n", [System]),
 					SuppressionMap;
@@ -23,16 +26,21 @@ handle_cast(Request, {SystemMap, SuppressionMap}) ->
 				{false, false} ->
 					SuppressionMap
 			end,
-			NewSystemMap = maps:put(Host, {System, NormalisedChecks, SystemMetrics}, SystemMap),
+			NewSystemMap = maps:put(Host, {System, NewSourceChecksMap, SystemMetrics}, SystemMap),
 			{noreply, {NewSystemMap, NewSuppressionMap}}
 	end.
 
 handle_call(Request, _From, {SystemMap, SuppressionMap}) ->
 	case Request of
 		{fetch, all} ->
-			{reply, SystemMap, {SystemMap, SuppressionMap}};
+			% Callers expect {System, FlatChecks, Metrics} — merge sources before returning
+			FlatSystemMap = maps:map(fun(_, {System, SourceChecksMap, Metrics}) ->
+				{System, mergeSourceChecks(SourceChecksMap), Metrics}
+			end, SystemMap),
+			{reply, FlatSystemMap, {SystemMap, SuppressionMap}};
 		{fetch, Host} ->
-			{reply, maps:get(Host, SystemMap), {SystemMap, SuppressionMap}};
+			{System, SourceChecksMap, Metrics} = maps:get(Host, SystemMap),
+			{reply, {System, mergeSourceChecks(SourceChecksMap), Metrics}, {SystemMap, SuppressionMap}};
 		{suppress, System} ->
 			case systemExists(System, SystemMap) of
 				true ->
@@ -48,6 +56,16 @@ handle_call(Request, _From, {SystemMap, SuppressionMap}) ->
 			io:format("Suppression window closed for ~p~n", [System]),
 			{reply, ok, {SystemMap, NewSuppressionMap}}
 	end.
+
+% Merges checks from all sources into a single flat map.
+% The current sources (info, circleci) write disjoint check key sets,
+% so fold ordering doesn't matter in practice. If a future source shares
+% keys with an existing one, override order will be non-deterministic
+% (map fold order over atom keys is unspecified in Erlang) — revisit then.
+mergeSourceChecks(SourceChecksMap) ->
+	maps:fold(fun(_, Checks, Acc) ->
+		maps:merge(Acc, Checks)
+	end, #{}, SourceChecksMap).
 
 systemExists(System, SystemMap) ->
 	maps:fold(fun
@@ -165,6 +183,22 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap) ->
 		?assertEqual(false, systemExists("lucos_missing", SystemMap)),
 		?assertEqual(false, systemExists("lucos_foo", #{})).
 
+	mergeSourceChecks_test() ->
+		% Two disjoint sources produce a flat merged map
+		SourceChecksMap = #{
+			info => #{<<"fetch-info">> => #{<<"ok">> => true}, <<"tls-certificate">> => #{<<"ok">> => true}},
+			circleci => #{<<"circleci">> => #{<<"ok">> => false}}
+		},
+		Result = mergeSourceChecks(SourceChecksMap),
+		?assertEqual(#{
+			<<"fetch-info">> => #{<<"ok">> => true},
+			<<"tls-certificate">> => #{<<"ok">> => true},
+			<<"circleci">> => #{<<"ok">> => false}
+		}, Result).
+
+	mergeSourceChecks_empty_test() ->
+		?assertEqual(#{}, mergeSourceChecks(#{})).
+
 	% First update for a host stores its state but doesn't alert (warm-up grace period).
 	% safe_notify/safe_email_notify wrap loganne/email calls in try-catch, so even if
 	% those modules are unavailable the cast still returns without crashing.
@@ -172,12 +206,13 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap) ->
 		InitialState = {#{}, #{}},
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		{noreply, {SystemMap, _}} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", Checks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", info, Checks, #{}},
 			InitialState
 		),
 		% Host should now be in the SystemMap
 		?assert(maps:is_key("host1.example.com", SystemMap)),
-		{"lucos_foo", StoredChecks, _} = maps:get("host1.example.com", SystemMap),
+		{"lucos_foo", SourceChecksMap, _} = maps:get("host1.example.com", SystemMap),
+		StoredChecks = mergeSourceChecks(SourceChecksMap),
 		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"fetch-info">>, StoredChecks))).
 
 	% Second update for a known host triggers normal alert logic (not warm-up).
@@ -185,14 +220,53 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap) ->
 	warmup_second_update_not_suppressed_test() ->
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", Checks, #{}}},
+			#{"host1.example.com" => {"lucos_foo", #{info => Checks}, #{}}},
 			#{}
 		},
 		{noreply, {SystemMap, _}} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", Checks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", info, Checks, #{}},
 			ExistingState
 		),
 		% Host is still in the map after second update
 		?assert(maps:is_key("host1.example.com", SystemMap)).
+
+	% circleci update for a host doesn't clobber info checks, and vice versa.
+	two_sources_dont_clobber_each_other_test() ->
+		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}, <<"tls-certificate">> => #{<<"ok">> => true}},
+		CIChecks = #{<<"circleci">> => #{<<"ok">> => false}},
+		% Start with info checks already stored
+		ExistingState = {
+			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, #{}}},
+			#{}
+		},
+		% circleci update arrives
+		{noreply, {SystemMap, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", circleci, CIChecks, #{}},
+			ExistingState
+		),
+		{"lucos_foo", SourceChecksMap, _} = maps:get("host1.example.com", SystemMap),
+		Merged = mergeSourceChecks(SourceChecksMap),
+		% All three checks must be present
+		?assert(maps:is_key(<<"fetch-info">>, Merged)),
+		?assert(maps:is_key(<<"tls-certificate">>, Merged)),
+		?assert(maps:is_key(<<"circleci">>, Merged)),
+		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"circleci">>, Merged))),
+		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"fetch-info">>, Merged))).
+
+	% When info source updates and drops a check key, it's removed from the merged view.
+	dropped_info_check_is_removed_test() ->
+		OldInfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}, <<"custom-check">> => #{<<"ok">> => true}},
+		NewInfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		ExistingState = {
+			#{"host1.example.com" => {"lucos_foo", #{info => OldInfoChecks}, #{}}},
+			#{}
+		},
+		{noreply, {SystemMap, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", info, NewInfoChecks, #{}},
+			ExistingState
+		),
+		{"lucos_foo", SourceChecksMap, _} = maps:get("host1.example.com", SystemMap),
+		Merged = mergeSourceChecks(SourceChecksMap),
+		?assertNot(maps:is_key(<<"custom-check">>, Merged)).
 
 -endif.

@@ -34,7 +34,7 @@ runChecks(StatePid, Host) ->
 		<<"fetch-info">> => InfoCheck,
 		<<"tls-certificate">> => TLSCheck
 	}, Checks),
-	ok = gen_server:cast(StatePid, {updateSystem, Host, System, AllChecks, Metrics}).
+	ok = gen_server:cast(StatePid, {updateSystem, Host, System, info, AllChecks, Metrics}).
 
 checkTlsExpiry(Host) ->
 	TechDetail = <<"Checks whether the TLS Certificate is valid and not about to expire">>,
