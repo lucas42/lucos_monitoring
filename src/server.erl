@@ -544,4 +544,23 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		?assert(string:str(Result, "<a href=") > 0),
 		?assert(string:str(Result, "https://example.com/path") > 0).
 
+	suppress_clear_bypasses_auth_test() ->
+		% /suppress/clear must succeed without auth even when CLIENT_KEYS is set
+		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
+		{ok, StatePid} = monitoring_state_server:start_link(),
+		Body = "{\"systemDeployed\":\"lucos_test\"}",
+		{StatusCode, _, _} = tryController('POST', "/suppress/clear", Body, #{}, StatePid),
+		gen_server:stop(StatePid),
+		os:unsetenv("CLIENT_KEYS"),
+		?assertEqual(204, StatusCode).
+
+	suppress_other_routes_still_require_auth_test() ->
+		% Other /suppress/* routes must still require auth
+		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
+		{ok, StatePid} = monitoring_state_server:start_link(),
+		{StatusCode, _, _} = tryController('PUT', "/suppress/lucos_test", "", #{}, StatePid),
+		gen_server:stop(StatePid),
+		os:unsetenv("CLIENT_KEYS"),
+		?assertEqual(401, StatusCode).
+
 -endif.
