@@ -388,6 +388,11 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 		"/lucos_navbar.js" ->
 			{ok, ScriptFile} = file:read_file("lucos_navbar.js"),
 			{200, "text/javascript", ScriptFile};
+		"/suppress/clear" ->
+			case suppression:handle(Path, Method, Body, StatePid) of
+				nomatch -> {404, "text/plain", "Not Found"};
+				Response -> Response
+			end;
 		_ ->
 			case string:prefix(Path, "/suppress") of
 				nomatch ->
