@@ -388,6 +388,13 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 		"/lucos_navbar.js" ->
 			{ok, ScriptFile} = file:read_file("lucos_navbar.js"),
 			{200, "text/javascript", ScriptFile};
+		% Auth bypassed: loganne deployComplete webhooks call this endpoint
+		% but don't support authentication. See issue #98.
+		"/suppress/clear" ->
+			case suppression:handle(Path, Method, Body, StatePid) of
+				nomatch -> {404, "text/plain", "Not Found"};
+				Response -> Response
+			end;
 		_ ->
 			case string:prefix(Path, "/suppress") of
 				nomatch ->
@@ -538,5 +545,24 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		Result = formatString(<<"debug">>, <<"See https://example.com/path for details">>),
 		?assert(string:str(Result, "<a href=") > 0),
 		?assert(string:str(Result, "https://example.com/path") > 0).
+
+	suppress_clear_bypasses_auth_test() ->
+		% /suppress/clear must succeed without auth even when CLIENT_KEYS is set
+		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
+		{ok, StatePid} = monitoring_state_server:start_link(),
+		Body = "{\"systemDeployed\":\"lucos_test\"}",
+		{StatusCode, _, _} = tryController('POST', "/suppress/clear", Body, #{}, StatePid),
+		gen_server:stop(StatePid),
+		os:unsetenv("CLIENT_KEYS"),
+		?assertEqual(204, StatusCode).
+
+	suppress_other_routes_still_require_auth_test() ->
+		% Other /suppress/* routes must still require auth
+		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
+		{ok, StatePid} = monitoring_state_server:start_link(),
+		{StatusCode, _, _} = tryController('PUT', "/suppress/lucos_test", "", #{}, StatePid),
+		gen_server:stop(StatePid),
+		os:unsetenv("CLIENT_KEYS"),
+		?assertEqual(401, StatusCode).
 
 -endif.
