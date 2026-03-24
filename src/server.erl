@@ -388,6 +388,8 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 		"/lucos_navbar.js" ->
 			{ok, ScriptFile} = file:read_file("lucos_navbar.js"),
 			{200, "text/javascript", ScriptFile};
+		% Auth bypassed: loganne deployComplete webhooks call this endpoint
+		% but don't support authentication. See issue #98.
 		"/suppress/clear" ->
 			case suppression:handle(Path, Method, Body, StatePid) of
 				nomatch -> {404, "text/plain", "Not Found"};
