@@ -1,7 +1,7 @@
 services:
   monitoring:
     build: .
-    container_name: monitoring
+    container_name: lucos_monitoring
     ports: 
       - $PORT:$PORT
     environment:
