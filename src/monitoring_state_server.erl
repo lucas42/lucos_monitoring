@@ -12,21 +12,28 @@ handle_cast(Request, {SystemMap, SuppressionMap}) ->
 		{updateSystem, Host, System, Source, SourceChecks, SystemMetrics} ->
 			io:format("Received update for system ~p (Host ~p, Source ~p)~n", [System, Host, Source]),
 			IsFirstSeen = not maps:is_key(Host, SystemMap),
-			{_, OldSourceChecksMap, _} = maps:get(Host, SystemMap, {nil, #{}, nil}),
+			{_, OldSourceChecksMap, OldMetrics} = maps:get(Host, SystemMap, {nil, #{}, #{}}),
 			OldMergedChecks = mergeSourceChecks(OldSourceChecksMap),
 			NewSourceChecksMap = maps:put(Source, SourceChecks, OldSourceChecksMap),
 			NewMergedChecks = mergeSourceChecks(NewSourceChecksMap),
 			NormalisedChecks = normaliseChecks(OldMergedChecks, NewMergedChecks),
+			% Only overwrite metrics when the source provides them; sources
+			% without metrics (e.g. circleci) pass #{} and should not wipe
+			% metrics previously stored by the info fetcher.
+			NewMetrics = case maps:size(SystemMetrics) of
+				0 -> OldMetrics;
+				_ -> SystemMetrics
+			end,
 			NewSuppressionMap = case {IsFirstSeen, meaningfulChange(OldMergedChecks, NormalisedChecks)} of
 				{true, _} ->
 					io:format("Warm-up: skipping alert for ~p on first poll~n", [System]),
 					SuppressionMap;
 				{false, true} ->
-					state_change(Host, System, NormalisedChecks, SystemMetrics, SuppressionMap);
+					state_change(Host, System, NormalisedChecks, NewMetrics, SuppressionMap);
 				{false, false} ->
 					SuppressionMap
 			end,
-			NewSystemMap = maps:put(Host, {System, NewSourceChecksMap, SystemMetrics}, SystemMap),
+			NewSystemMap = maps:put(Host, {System, NewSourceChecksMap, NewMetrics}, SystemMap),
 			{noreply, {NewSystemMap, NewSuppressionMap}}
 	end.
 
@@ -268,5 +275,37 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap) ->
 		{"lucos_foo", SourceChecksMap, _} = maps:get("host1.example.com", SystemMap),
 		Merged = mergeSourceChecks(SourceChecksMap),
 		?assertNot(maps:is_key(<<"custom-check">>, Merged)).
+
+	% When a source with no metrics (e.g. circleci) updates a host that already
+	% has metrics from the info fetcher, the existing metrics are preserved.
+	empty_metrics_do_not_overwrite_test() ->
+		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		Metrics = #{<<"agent-count">> => #{<<"value">> => 42, <<"techDetail">> => <<"count">>}},
+		ExistingState = {
+			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, Metrics}},
+			#{}
+		},
+		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
+		{noreply, {SystemMap, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", circleci, CIChecks, #{}},
+			ExistingState
+		),
+		{"lucos_foo", _, StoredMetrics} = maps:get("host1.example.com", SystemMap),
+		?assertEqual(Metrics, StoredMetrics).
+
+	% When a source provides non-empty metrics, they replace the existing ones.
+	nonempty_metrics_do_overwrite_test() ->
+		OldMetrics = #{<<"agent-count">> => #{<<"value">> => 42, <<"techDetail">> => <<"count">>}},
+		NewMetrics = #{<<"agent-count">> => #{<<"value">> => 99, <<"techDetail">> => <<"count">>}},
+		ExistingState = {
+			#{"host1.example.com" => {"lucos_foo", #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, OldMetrics}},
+			#{}
+		},
+		{noreply, {SystemMap, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", info, #{<<"fetch-info">> => #{<<"ok">> => true}}, NewMetrics},
+			ExistingState
+		),
+		{"lucos_foo", _, StoredMetrics} = maps:get("host1.example.com", SystemMap),
+		?assertEqual(NewMetrics, StoredMetrics).
 
 -endif.
