@@ -72,9 +72,26 @@ checkTlsExpiry(Host) ->
 parseInfo(Body) ->
 	Info = jiffy:decode(Body, [return_maps]),
 	System = binary_to_list(maps:get(<<"system">>, Info)),
-	Checks = maps:merge(#{}, maps:get(<<"checks">>, Info, #{})),
-	Metrics = maps:merge(#{}, maps:get(<<"metrics">>, Info, #{})),
+	RawChecks = maps:get(<<"checks">>, Info, #{}),
+	RawMetrics = maps:get(<<"metrics">>, Info, #{}),
+	true = is_map(RawChecks),
+	true = is_map(RawMetrics),
+	Checks = validateEntries(System, <<"checks">>, RawChecks),
+	Metrics = validateEntries(System, <<"metrics">>, RawMetrics),
 	{System, Checks, Metrics}.
+
+validateEntries(System, Section, Entries) ->
+	maps:map(fun (Key, Value) ->
+		case is_map(Value) of
+			true -> Value;
+			false ->
+				io:format("WARNING: ~s has non-map ~s entry '~s': ~p~n", [System, Section, Key, Value]),
+				#{
+					<<"value">> => Value,
+					<<"techDetail">> => list_to_binary(io_lib:format("WARNING: entry is not in standard format (expected a map, got ~p)", [Value]))
+				}
+		end
+	end, Entries).
 
 parseError(Error) ->
 	case Error of
@@ -182,21 +199,54 @@ fetchInfo(Host) ->
 		% system as JSON null raises an exception (null becomes atom null, not a binary)
 		?assertException(error, badarg, parseInfo("{\"system\":null}")).
 
-	% BUG: checks as a non-map string passes through parseInfo without error,
-	% causing runChecks to crash with {badmap,_} when it calls maps:merge.
-	% parseInfo should validate checks is a map so fetchInfo's try-catch handles it.
-	parseInfo_checks_nonmap_bug_test() ->
+	% checks as a non-map string is rejected by the is_map guard
+	parseInfo_checks_nonmap_test() ->
 		?assertException(error, _, parseInfo("{\"system\":\"lucos_test\",\"checks\":\"not_a_map\"}")).
 
-	% BUG: checks as JSON null passes through parseInfo without error,
-	% causing runChecks to crash with {badmap,null} when it calls maps:merge.
-	parseInfo_checks_null_bug_test() ->
+	% checks as JSON null is rejected by the is_map guard
+	parseInfo_checks_null_test() ->
 		?assertException(error, _, parseInfo("{\"system\":\"lucos_test\",\"checks\":null}")).
 
-	% BUG: metrics as a non-map value passes through parseInfo without error,
-	% causing runChecks to crash when the state server tries to handle it.
-	parseInfo_metrics_nonmap_bug_test() ->
+	% metrics as a non-map value is rejected by the is_map guard
+	parseInfo_metrics_nonmap_test() ->
 		?assertException(error, _, parseInfo("{\"system\":\"lucos_test\",\"metrics\":42}")).
+
+	% Individual check entry that is not a map gets replaced with a warning entry
+	parseInfo_individual_check_nonmap_test() ->
+		{System, Checks, _} = parseInfo("{\"system\":\"lucos_test\",\"checks\":{\"good\":{\"ok\":true},\"bad\":\"not_a_map\"}}"),
+		?assertEqual("lucos_test", System),
+		% Good check is preserved as-is
+		?assertEqual(#{<<"ok">> => true}, maps:get(<<"good">>, Checks)),
+		% Bad check is replaced with a warning map
+		BadCheck = maps:get(<<"bad">>, Checks),
+		?assert(is_map(BadCheck)),
+		?assert(is_binary(maps:get(<<"techDetail">>, BadCheck))).
+
+	% Individual metric entry that is not a map gets replaced with a warning entry
+	parseInfo_individual_metric_nonmap_test() ->
+		{System, _, Metrics} = parseInfo("{\"system\":\"lucos_test\",\"metrics\":{\"good\":{\"value\":42,\"techDetail\":\"count\"},\"bad\":\"just_a_string\"}}"),
+		?assertEqual("lucos_test", System),
+		% Good metric is preserved as-is
+		?assertEqual(#{<<"value">> => 42, <<"techDetail">> => <<"count">>}, maps:get(<<"good">>, Metrics)),
+		% Bad metric is replaced with a warning map containing the original value
+		BadMetric = maps:get(<<"bad">>, Metrics),
+		?assert(is_map(BadMetric)),
+		?assertEqual(<<"just_a_string">>, maps:get(<<"value">>, BadMetric)),
+		?assert(is_binary(maps:get(<<"techDetail">>, BadMetric))).
+
+	% Metric entry as a number (not a map) gets replaced with a warning entry
+	parseInfo_individual_metric_number_test() ->
+		{_, _, Metrics} = parseInfo("{\"system\":\"lucos_test\",\"metrics\":{\"bad\":123}}"),
+		BadMetric = maps:get(<<"bad">>, Metrics),
+		?assert(is_map(BadMetric)),
+		?assertEqual(123, maps:get(<<"value">>, BadMetric)).
+
+	% Check entry as null gets replaced with a warning entry
+	parseInfo_individual_check_null_test() ->
+		{_, Checks, _} = parseInfo("{\"system\":\"lucos_test\",\"checks\":{\"bad\":null}}"),
+		BadCheck = maps:get(<<"bad">>, Checks),
+		?assert(is_map(BadCheck)),
+		?assert(is_binary(maps:get(<<"techDetail">>, BadCheck))).
 
 	parseError_test() ->
 		% IPv4+IPv6: IPv4 HTTP timeout (unknown) + IPv6 connection refused (false) → false
