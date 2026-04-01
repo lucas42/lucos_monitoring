@@ -10,4 +10,3 @@ permissions:
 jobs:
   dependabot:
     uses: lucas42/.github/.github/workflows/dependabot-auto-merge.yml@d514cd6d51a8b82e1ae57d2047d14f46570eaefe
-    secrets: inherit
