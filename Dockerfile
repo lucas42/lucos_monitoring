@@ -1,4 +1,4 @@
-FROM lucas42/lucos_navbar:2.1.30 AS navbar
+FROM lucas42/lucos_navbar:2.1.34 AS navbar
 FROM erlang:28.4.1.0 AS build
 
 WORKDIR /lucos_monitoring
