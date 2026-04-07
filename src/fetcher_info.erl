@@ -1,40 +1,51 @@
 -module(fetcher_info).
--export([start/1, tryRunChecks/2]).
+-export([start/1, tryRunChecks/3]).
 -include_lib("eunit/include/eunit.hrl").
 
 start(StatePid) ->
 	{ok, _} = application:ensure_all_started([ssl, inets]),
-	{ok, Device} = file:open("./service-list", [read]),
-	spawnFetcher(StatePid, Device),
-	file:close(Device).
+	{ok, SystemsBody} = file:read_file("./info-systems-list"),
+	{ok, HostsBody} = file:read_file("./info-hosts-list"),
+	Systems = parseInfoSystems(binary_to_list(SystemsBody)) ++
+	          parseInfoSystems(binary_to_list(HostsBody)),
+	lists:foreach(fun({Id, Host}) ->
+		spawn(?MODULE, tryRunChecks, [StatePid, Id, Host])
+	end, Systems).
 
-spawnFetcher(StatePid, Device) ->
-	case io:get_line(Device, "") of
-		eof  -> ok;
-		Line ->
-			Host = string:trim(Line),
-			spawn(?MODULE, tryRunChecks, [StatePid, Host]),
-			spawnFetcher(StatePid, Device)
+parseInfoSystems(Body) ->
+	Entries = jiffy:decode(Body, [return_maps]),
+	[{systemId(Entry), systemHost(Entry)} || Entry <- Entries].
+
+systemId(Entry) ->
+	case maps:get(<<"id">>, Entry, null) of
+		null -> binary_to_list(maps:get(<<"domain">>, Entry, <<"">>));
+		Id -> binary_to_list(Id)
 	end.
 
-tryRunChecks(StatePid, Host) ->
-	try runChecks(StatePid, Host) of
+systemHost(Entry) ->
+	case maps:get(<<"domain">>, Entry, null) of
+		null -> binary_to_list(maps:get(<<"id">>, Entry));
+		Domain -> binary_to_list(Domain)
+	end.
+
+tryRunChecks(StatePid, Id, Host) ->
+	try runChecks(StatePid, Id, Host) of
 		_ -> ok
 	catch
 		ExceptionClass:Term:StackTrace ->
 			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace])
 	end,
 	timer:sleep(timer:seconds(60)),
-	tryRunChecks(StatePid, Host).
+	tryRunChecks(StatePid, Id, Host).
 
-runChecks(StatePid, Host) ->
+runChecks(StatePid, Id, Host) ->
 	{TLSCheck} = checkTlsExpiry(Host),
-	{InfoCheck, System, Checks, Metrics} = fetchInfo(Host),
+	{InfoCheck, _System, Checks, Metrics} = fetchInfo(Host),
 	AllChecks = maps:merge(#{
 		<<"fetch-info">> => InfoCheck,
 		<<"tls-certificate">> => TLSCheck
 	}, Checks),
-	ok = gen_server:cast(StatePid, {updateSystem, Host, System, info, AllChecks, Metrics}).
+	ok = gen_server:cast(StatePid, {updateSystem, Host, Id, info, AllChecks, Metrics}).
 
 checkTlsExpiry(Host) ->
 	TechDetail = <<"Checks whether the TLS Certificate is valid and not about to expire">>,
@@ -195,6 +206,20 @@ fetchInfo(Host) ->
 	end.
 
 -ifdef(TEST).
+	parseInfoSystems_test() ->
+		% System with a domain: host is the domain.
+		% System without a domain: host falls back to the id.
+		Body = "[{\"id\":\"lucos_foo\",\"domain\":\"foo.l42.eu\"},{\"id\":\"lucos_bar\",\"domain\":null}]",
+		?assertEqual([{"lucos_foo", "foo.l42.eu"}, {"lucos_bar", "lucos_bar"}], parseInfoSystems(Body)).
+
+	parseInfoSystems_empty_test() ->
+		?assertEqual([], parseInfoSystems("[]")).
+
+	parseInfoSystems_no_id_test() ->
+		% Entry with no id field: falls back to domain for both id and host.
+		Body = "[{\"domain\":\"host.l42.eu\"}]",
+		?assertEqual([{"host.l42.eu", "host.l42.eu"}], parseInfoSystems(Body)).
+
 	parseInfo_test() ->
 		% Basic: system field only, no checks/metrics
 		?assertEqual({"lucos_test",#{},#{}}, parseInfo("{\"system\":\"lucos_test\"}")),
