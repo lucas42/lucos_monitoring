@@ -28,10 +28,8 @@ repoHost(Repo) ->
 ciRepoLoop(StatePid, RepoId, Host) ->
 	try
 		Slug = "github/lucas42/" ++ RepoId,
-		case checkCIForSlug(Slug) of
-			skip -> ok;
-			CIChecks -> ok = gen_server:cast(StatePid, {updateSystem, Host, RepoId, circleci, CIChecks, #{}})
-		end
+		CIChecks = checkCIForSlug(Slug),
+		ok = gen_server:cast(StatePid, {updateSystem, Host, RepoId, circleci, CIChecks, #{}})
 	catch
 		ExceptionClass:Term:StackTrace ->
 			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace])
@@ -39,8 +37,9 @@ ciRepoLoop(StatePid, RepoId, Host) ->
 	timer:sleep(timer:seconds(60)),
 	ciRepoLoop(StatePid, RepoId, Host).
 
-% CircleCI pipeline check logic. Returns `skip` when the project returns 404
-% (no CI configured), otherwise returns a checks map.
+% CircleCI pipeline check logic. Returns a checks map — empty #{} when the
+% project returns 404 (no CI configured), so that any stale state from a
+% previous transient error is cleared in the state server.
 checkCIForSlug(Slug) ->
 	TechDetail = <<"Checks status of recent circleCI pipelines">>,
 	Token = os:getenv("CIRCLECI_API_TOKEN", ""),
@@ -66,7 +65,9 @@ checkCIForSlug(Slug) ->
 					checkWorkflowStatuses(Slug, AllWorkflows, LatestPipelineUrl, TechDetail)
 			end;
 		{ok, {{_Version, 404, _ReasonPhrase}, _Headers, _Body}} ->
-			skip;
+			% No CI configured for this repo. Return empty map so the state
+			% server removes any circleci check left over from a transient error.
+			#{};
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 			#{<<"circleci">> => #{
 				<<"ok">> => unknown,
