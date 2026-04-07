@@ -14,19 +14,8 @@ start(StatePid) ->
 
 parseInfoSystems(Body) ->
 	Entries = jiffy:decode(Body, [return_maps]),
-	[{systemId(Entry), systemHost(Entry)} || Entry <- Entries].
-
-systemId(Entry) ->
-	case maps:get(<<"id">>, Entry, null) of
-		null -> binary_to_list(maps:get(<<"domain">>, Entry, <<"">>));
-		Id -> binary_to_list(Id)
-	end.
-
-systemHost(Entry) ->
-	case maps:get(<<"domain">>, Entry, null) of
-		null -> binary_to_list(maps:get(<<"id">>, Entry));
-		Domain -> binary_to_list(Domain)
-	end.
+	[{binary_to_list(maps:get(<<"id">>, Entry)),
+	  binary_to_list(maps:get(<<"domain">>, Entry))} || Entry <- Entries].
 
 tryRunChecks(StatePid, Id, Host) ->
 	try runChecks(StatePid, Id, Host) of
@@ -207,18 +196,12 @@ fetchInfo(Host) ->
 
 -ifdef(TEST).
 	parseInfoSystems_test() ->
-		% System with a domain: host is the domain.
-		% System without a domain: host falls back to the id.
-		Body = "[{\"id\":\"lucos_foo\",\"domain\":\"foo.l42.eu\"},{\"id\":\"lucos_bar\",\"domain\":null}]",
-		?assertEqual([{"lucos_foo", "foo.l42.eu"}, {"lucos_bar", "lucos_bar"}], parseInfoSystems(Body)).
+		% Both id and domain are always present — id becomes the system identifier, domain the host.
+		Body = "[{\"id\":\"lucos_foo\",\"domain\":\"foo.l42.eu\"},{\"id\":\"lucos_bar\",\"domain\":\"bar.l42.eu\"}]",
+		?assertEqual([{"lucos_foo", "foo.l42.eu"}, {"lucos_bar", "bar.l42.eu"}], parseInfoSystems(Body)).
 
 	parseInfoSystems_empty_test() ->
 		?assertEqual([], parseInfoSystems("[]")).
-
-	parseInfoSystems_no_id_test() ->
-		% Entry with no id field: falls back to domain for both id and host.
-		Body = "[{\"domain\":\"host.l42.eu\"}]",
-		?assertEqual([{"host.l42.eu", "host.l42.eu"}], parseInfoSystems(Body)).
 
 	parseInfo_test() ->
 		% Basic: system field only, no checks/metrics
