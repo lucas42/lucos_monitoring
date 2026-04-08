@@ -1,16 +1,17 @@
 -module(monitoring_state_server).
 -behaviour(gen_server).
--export([start_link/0, init/1, handle_cast/2, handle_call/3]).
--ifdef(TEST).
--export([check_unhealthy_after_unsuppress/2]).
--endif.
+-export([start_link/0, start_link/1, init/1, handle_cast/2, handle_call/3]).
 
-start_link() -> gen_server:start_link(?MODULE, [], []).
+start_link() ->
+	start_link([fun loganne:notify/5, fun email:notify/5]).
 
-init([]) ->
-	{ok, {#{}, #{}}}.
+start_link(Notifiers) ->
+	gen_server:start_link(?MODULE, Notifiers, []).
 
-handle_cast(Request, {SystemMap, SuppressionMap}) ->
+init(Notifiers) ->
+	{ok, {#{}, #{}, Notifiers}}.
+
+handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 	case Request of
 		{updateSystem, Host, System, Source, SourceChecks, SystemMetrics} ->
 			io:format("Received update for system ~p (Host ~p, Source ~p)~n", [System, Host, Source]),
@@ -32,34 +33,34 @@ handle_cast(Request, {SystemMap, SuppressionMap}) ->
 					io:format("Warm-up: skipping alert for ~p on first poll~n", [System]),
 					SuppressionMap;
 				{false, true} ->
-					state_change(Host, System, NormalisedChecks, NewMetrics, SuppressionMap);
+					state_change(Host, System, NormalisedChecks, NewMetrics, SuppressionMap, Notifiers);
 				{false, false} ->
 					SuppressionMap
 			end,
 			NewSystemMap = maps:put(Host, {System, NewSourceChecksMap, NewMetrics}, SystemMap),
-			{noreply, {NewSystemMap, NewSuppressionMap}}
+			{noreply, {NewSystemMap, NewSuppressionMap, Notifiers}}
 	end.
 
-handle_call(Request, _From, {SystemMap, SuppressionMap}) ->
+handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers}) ->
 	case Request of
 		{fetch, all} ->
 			% Callers expect {System, FlatChecks, Metrics} — merge sources before returning
 			FlatSystemMap = maps:map(fun(_, {System, SourceChecksMap, Metrics}) ->
 				{System, mergeSourceChecks(SourceChecksMap), Metrics}
 			end, SystemMap),
-			{reply, FlatSystemMap, {SystemMap, SuppressionMap}};
+			{reply, FlatSystemMap, {SystemMap, SuppressionMap, Notifiers}};
 		{fetch, Host} ->
 			{System, SourceChecksMap, Metrics} = maps:get(Host, SystemMap),
-			{reply, {System, mergeSourceChecks(SourceChecksMap), Metrics}, {SystemMap, SuppressionMap}};
+			{reply, {System, mergeSourceChecks(SourceChecksMap), Metrics}, {SystemMap, SuppressionMap, Notifiers}};
 		{suppress, System} ->
 			case systemExists(System, SystemMap) of
 				true ->
 					ExpiryTime = erlang:system_time(second) + 600,
 					NewSuppressionMap = maps:put(System, ExpiryTime, SuppressionMap),
 					io:format("Suppression window opened for ~p~n", [System]),
-					{reply, ok, {SystemMap, NewSuppressionMap}};
+					{reply, ok, {SystemMap, NewSuppressionMap, Notifiers}};
 				false ->
-					{reply, {error, not_found}, {SystemMap, SuppressionMap}}
+					{reply, {error, not_found}, {SystemMap, SuppressionMap, Notifiers}}
 			end;
 		{unsuppress, System} ->
 			NewSuppressionMap = maps:remove(System, SuppressionMap),
@@ -68,8 +69,8 @@ handle_call(Request, _From, {SystemMap, SuppressionMap}) ->
 			% Without this, a service that failed during suppression and stays
 			% failed would never trigger an alert: the next poll sees
 			% unhealthy→unhealthy (no change), so meaningfulChange returns false.
-			alert_if_unhealthy_after_unsuppress(System, SystemMap),
-			{reply, ok, {SystemMap, NewSuppressionMap}}
+			alert_if_unhealthy_after_unsuppress(System, SystemMap, Notifiers),
+			{reply, ok, {SystemMap, NewSuppressionMap, Notifiers}}
 	end.
 
 % Merges checks from all sources into a single flat map.
@@ -137,67 +138,55 @@ failingChecks(Checks) ->
 		maps:get(<<"ok">>, Check, unknown) == false
 	end, Checks).
 
-safe_notify(Host, System, FailingNow, Suppressed) ->
-	try loganne:notify(Host, System, FailingNow, Suppressed)
-	catch ExClass:ExReason ->
-		io:format("Loganne notify failed for ~p on ~p: ~p ~p~n", [System, Host, ExClass, ExReason])
-	end.
+% Calls every notifier in Notifiers, catching any errors so a single
+% failing notifier cannot prevent the others from running.
+notify_all(Host, System, FailingNow, Suppressed, Metrics, Notifiers) ->
+	lists:foreach(fun(NotifyFn) ->
+		try NotifyFn(Host, System, FailingNow, Suppressed, Metrics)
+		catch ExClass:ExReason ->
+			io:format("Notify failed for ~p on ~p: ~p ~p~n", [System, Host, ExClass, ExReason])
+		end
+	end, Notifiers).
 
-safe_email_notify(Host, System, FailingNow, SystemMetrics) ->
-	try email:notify(Host, System, FailingNow, SystemMetrics)
-	catch ExClass:ExReason ->
-		io:format("Email notify failed for ~p on ~p: ~p ~p~n", [System, Host, ExClass, ExReason])
-	end.
-
-state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap) ->
+state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifiers) ->
 	FailingNow = failingChecks(SystemChecks),
 	case maps:get(System, SuppressionMap, undefined) of
 		undefined ->
 			io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
-			safe_notify(Host, System, FailingNow, false),
-			safe_email_notify(Host, System, FailingNow, SystemMetrics),
+			notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
 			SuppressionMap;
 		ExpiryTime ->
 			Now = erlang:system_time(second),
 			case Now < ExpiryTime of
 				true ->
 					io:format("Alert suppressed for ~p during deploy window~n", [System]),
-					safe_notify(Host, System, FailingNow, true),
+					notify_all(Host, System, FailingNow, true, SystemMetrics, Notifiers),
 					SuppressionMap;
 				false ->
 					io:format("ERROR: Suppression window for ~p expired without being cleared - deploy may have taken longer than 10 minutes~n", [System]),
 					io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
-					safe_notify(Host, System, FailingNow, false),
-					safe_email_notify(Host, System, FailingNow, SystemMetrics),
+					notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
 					maps:remove(System, SuppressionMap)
 			end
 	end.
 
-
-% Pure function: returns {alert, Host, FailingChecks, Metrics} if the system
-% currently has failing checks, or ok if it is healthy (or not found).
-check_unhealthy_after_unsuppress(System, SystemMap) ->
-	maps:fold(fun
-		(Host, {S, SourceChecksMap, Metrics}, ok) when S =:= System ->
-			MergedChecks = mergeSourceChecks(SourceChecksMap),
-			FailingNow = failingChecks(MergedChecks),
-			case maps:size(FailingNow) > 0 of
-				true -> {alert, Host, FailingNow, Metrics};
-				false -> ok
-			end;
-		(_, _, Acc) ->
-			Acc
+alert_if_unhealthy_after_unsuppress(System, SystemMap, Notifiers) ->
+	maps:fold(fun(Host, {S, SourceChecksMap, Metrics}, _) ->
+		case S =:= System of
+			true ->
+				MergedChecks = mergeSourceChecks(SourceChecksMap),
+				FailingNow = failingChecks(MergedChecks),
+				case maps:size(FailingNow) > 0 of
+					true ->
+						io:format("Service ~p still unhealthy after suppression lifted — alerting~n", [System]),
+						notify_all(Host, System, FailingNow, false, Metrics, Notifiers);
+					false ->
+						ok
+				end;
+			false ->
+				ok
+		end
 	end, ok, SystemMap).
-
-alert_if_unhealthy_after_unsuppress(System, SystemMap) ->
-	case check_unhealthy_after_unsuppress(System, SystemMap) of
-		{alert, Host, FailingNow, Metrics} ->
-			io:format("Service ~p still unhealthy after suppression lifted — alerting~n", [System]),
-			safe_notify(Host, System, FailingNow, false),
-			safe_email_notify(Host, System, FailingNow, Metrics);
-		ok ->
-			ok
-	end.
 
 -ifdef(TEST).
 	-include_lib("eunit/include/eunit.hrl").
@@ -240,12 +229,10 @@ alert_if_unhealthy_after_unsuppress(System, SystemMap) ->
 		?assertEqual(#{}, mergeSourceChecks(#{})).
 
 	% First update for a host stores its state but doesn't alert (warm-up grace period).
-	% safe_notify/safe_email_notify wrap loganne/email calls in try-catch, so even if
-	% those modules are unavailable the cast still returns without crashing.
 	warmup_first_update_stores_state_test() ->
-		InitialState = {#{}, #{}},
+		InitialState = {#{}, #{}, []},
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => false}},
-		{noreply, {SystemMap, _}} = handle_cast(
+		{noreply, {SystemMap, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", info, Checks, #{}},
 			InitialState
 		),
@@ -261,9 +248,10 @@ alert_if_unhealthy_after_unsuppress(System, SystemMap) ->
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingState = {
 			#{"host1.example.com" => {"lucos_foo", #{info => Checks}, #{}}},
-			#{}
+			#{},
+			[]
 		},
-		{noreply, {SystemMap, _}} = handle_cast(
+		{noreply, {SystemMap, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", info, Checks, #{}},
 			ExistingState
 		),
@@ -277,10 +265,11 @@ alert_if_unhealthy_after_unsuppress(System, SystemMap) ->
 		% Start with info checks already stored
 		ExistingState = {
 			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, #{}}},
-			#{}
+			#{},
+			[]
 		},
 		% circleci update arrives
-		{noreply, {SystemMap, _}} = handle_cast(
+		{noreply, {SystemMap, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", circleci, CIChecks, #{}},
 			ExistingState
 		),
@@ -299,9 +288,10 @@ alert_if_unhealthy_after_unsuppress(System, SystemMap) ->
 		NewInfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingState = {
 			#{"host1.example.com" => {"lucos_foo", #{info => OldInfoChecks}, #{}}},
-			#{}
+			#{},
+			[]
 		},
-		{noreply, {SystemMap, _}} = handle_cast(
+		{noreply, {SystemMap, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", info, NewInfoChecks, #{}},
 			ExistingState
 		),
@@ -316,10 +306,11 @@ alert_if_unhealthy_after_unsuppress(System, SystemMap) ->
 		Metrics = #{<<"agent-count">> => #{<<"value">> => 42, <<"techDetail">> => <<"count">>}},
 		ExistingState = {
 			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, Metrics}},
-			#{}
+			#{},
+			[]
 		},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
-		{noreply, {SystemMap, _}} = handle_cast(
+		{noreply, {SystemMap, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", circleci, CIChecks, #{}},
 			ExistingState
 		),
@@ -332,62 +323,69 @@ alert_if_unhealthy_after_unsuppress(System, SystemMap) ->
 		NewMetrics = #{<<"agent-count">> => #{<<"value">> => 99, <<"techDetail">> => <<"count">>}},
 		ExistingState = {
 			#{"host1.example.com" => {"lucos_foo", #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, OldMetrics}},
-			#{}
+			#{},
+			[]
 		},
-		{noreply, {SystemMap, _}} = handle_cast(
+		{noreply, {SystemMap, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", info, #{<<"fetch-info">> => #{<<"ok">> => true}}, NewMetrics},
 			ExistingState
 		),
 		{"lucos_foo", _, StoredMetrics} = maps:get("host1.example.com", SystemMap),
 		?assertEqual(NewMetrics, StoredMetrics).
 
-	% check_unhealthy_after_unsuppress returns ok for a healthy system — no alert would fire.
-	check_unhealthy_after_unsuppress_healthy_test() ->
-		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
-		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => HealthyChecks}, #{}}},
-		?assertEqual(ok, check_unhealthy_after_unsuppress("lucos_foo", SystemMap)).
+	% Helper to build a recording notifier and retrieve what it captured.
+	% The notifier sends {notified, Args} to the calling test process.
+	recording_notifier(TestPid) ->
+		fun(Host, System, FailingNow, Suppressed, Metrics) ->
+			TestPid ! {notified, Host, System, FailingNow, Suppressed, Metrics}
+		end.
 
-	% check_unhealthy_after_unsuppress returns {alert, ...} for a failing system — alert would fire.
-	check_unhealthy_after_unsuppress_failing_test() ->
-		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
-		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => FailingChecks}, #{}}},
-		{alert, Host, FailingNow, _Metrics} = check_unhealthy_after_unsuppress("lucos_foo", SystemMap),
-		?assertEqual("host1.example.com", Host),
-		?assert(maps:is_key(<<"fetch-info">>, FailingNow)).
+	% Drain all pending {notified, ...} messages from the mailbox.
+	drain_notifications() ->
+		receive
+			{notified, _, _, _, _, _} -> drain_notifications()
+		after 0 ->
+			ok
+		end.
 
-	% check_unhealthy_after_unsuppress returns ok when the system is not in the map.
-	check_unhealthy_after_unsuppress_unknown_system_test() ->
-		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
-		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => HealthyChecks}, #{}}},
-		?assertEqual(ok, check_unhealthy_after_unsuppress("lucos_other", SystemMap)).
-
-	% Unsuppressing a healthy system clears suppression and does not trigger an alert.
+	% Unsuppressing a healthy system clears suppression and does NOT fire an alert.
 	unsuppress_healthy_system_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => HealthyChecks}, #{}}},
-		State = {SystemMap, #{"lucos_foo" => erlang:system_time(second) + 600}},
-		{reply, ok, {_, NewSuppressionMap}} = handle_call(
+		Notifier = recording_notifier(self()),
+		State = {SystemMap, #{"lucos_foo" => erlang:system_time(second) + 600}, [Notifier]},
+		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
 			{unsuppress, "lucos_foo"}, from, State
 		),
 		?assertEqual(#{}, NewSuppressionMap),
-		?assertEqual(ok, check_unhealthy_after_unsuppress("lucos_foo", SystemMap)).
+		receive
+			{notified, _, _, _, _, _} -> ?assert(false, "Unexpected alert fired for healthy system")
+		after 100 ->
+			ok  % No notification — correct
+		end.
 
-	% Unsuppressing an unhealthy system clears suppression and triggers an alert.
+	% Unsuppressing an unhealthy system clears suppression and fires an alert immediately.
 	unsuppress_unhealthy_system_test() ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => FailingChecks}, #{}}},
-		State = {SystemMap, #{"lucos_foo" => erlang:system_time(second) + 600}},
-		{reply, ok, {_, NewSuppressionMap}} = handle_call(
+		Notifier = recording_notifier(self()),
+		State = {SystemMap, #{"lucos_foo" => erlang:system_time(second) + 600}, [Notifier]},
+		drain_notifications(),
+		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
 			{unsuppress, "lucos_foo"}, from, State
 		),
 		?assertEqual(#{}, NewSuppressionMap),
-		{alert, _Host, FailingNow, _} = check_unhealthy_after_unsuppress("lucos_foo", SystemMap),
-		?assert(maps:is_key(<<"fetch-info">>, FailingNow)).
+		receive
+			{notified, "host1.example.com", "lucos_foo", FailingNow, false, _Metrics} ->
+				?assert(maps:is_key(<<"fetch-info">>, FailingNow))
+		after 100 ->
+			?assert(false, "Expected alert was not fired after unsuppression")
+		end.
 
 	% Unsuppressing a system that isn't in the map is a no-op (idempotent).
 	unsuppress_unknown_system_is_noop_test() ->
-		State = {#{}, #{}},
-		{reply, ok, {_, NewSuppressionMap}} = handle_call(
+		State = {#{}, #{}, []},
+		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
 			{unsuppress, "lucos_unknown"}, from, State
 		),
 		?assertEqual(#{}, NewSuppressionMap).

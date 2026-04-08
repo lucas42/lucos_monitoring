@@ -1,8 +1,11 @@
 -module(email).
--export([notify/4]).
+-export([notify/5]).
 
 
-notify(Host, SystemName, FailingChecks, SystemMetrics) ->
+notify(_Host, _SystemName, _FailingChecks, true, _SystemMetrics) ->
+	% Do not send emails during a suppressed deploy window
+	ok;
+notify(Host, SystemName, FailingChecks, _Suppressed, SystemMetrics) ->
 	System = getSystemTitle(Host, SystemName),
 	% Use Host for consistent Subject lines so things get bundled into nice threads
 	EmailSubject = "Monitoring issue on "++Host,
