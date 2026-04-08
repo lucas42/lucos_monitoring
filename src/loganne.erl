@@ -1,7 +1,7 @@
 -module(loganne).
--export([notify/4]).
+-export([notify/5]).
 
-notify(Host, System, FailingChecks, Suppressed) ->
+notify(Host, System, FailingChecks, Suppressed, _Metrics) ->
 	{EventType, HumanReadable} = buildEvent(Host, System, FailingChecks, Suppressed),
 	AppOrigin = os:getenv("APP_ORIGIN", ""),
 	Url = AppOrigin ++ "/#host-" ++ Host,
@@ -89,18 +89,18 @@ emit_event(EventType, HumanReadable, Url) ->
 		?assertEqual(ok, emit_event("monitoringAlert", "Some alert", "https://monitoring.l42.eu/#host-foo.example.com")).
 
 	notify_builds_url_test() ->
-		%% notify/4 should derive the URL from APP_ORIGIN and Host.
+		%% notify/5 should derive the URL from APP_ORIGIN and Host.
 		%% We can't easily intercept the HTTP call, so we test via emit_event behaviour:
 		%% with no LOGANNE_ENDPOINT set, notify should return ok without crashing.
 		os:unsetenv("LOGANNE_ENDPOINT"),
 		os:putenv("APP_ORIGIN", "https://monitoring.l42.eu"),
-		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, false)),
+		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, false, #{})),
 		os:unsetenv("APP_ORIGIN").
 
 	notify_missing_app_origin_test() ->
 		%% When APP_ORIGIN is unset, the url field should still be a valid (empty-prefixed) string.
 		os:unsetenv("LOGANNE_ENDPOINT"),
 		os:unsetenv("APP_ORIGIN"),
-		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, false)).
+		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, false, #{})).
 
 -endif.
