@@ -193,12 +193,6 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 			io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
 			notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
 			SuppressionMap;
-		{pending_verification, _} ->
-			% A meaningful change arrived while we were waiting for fresh data.
-			% The service is clearly in flux — alert now and clear the pending state.
-			io:format("Checks' state changed for ~p on ~p (clearing pending verification)~n", [System, Host]),
-			notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
-			maps:remove(System, SuppressionMap);
 		ExpiryTime ->
 			Now = erlang:system_time(second),
 			case Now < ExpiryTime of
