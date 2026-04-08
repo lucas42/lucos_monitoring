@@ -28,14 +28,38 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 				0 -> OldMetrics;
 				_ -> SystemMetrics
 			end,
-			NewSuppressionMap = case {IsFirstSeen, meaningfulChange(OldMergedChecks, NormalisedChecks)} of
-				{true, _} ->
+			NewSuppressionMap = case IsFirstSeen of
+				true ->
 					io:format("Warm-up: skipping alert for ~p on first poll~n", [System]),
 					SuppressionMap;
-				{false, true} ->
-					state_change(Host, System, NormalisedChecks, NewMetrics, SuppressionMap, Notifiers);
-				{false, false} ->
-					SuppressionMap
+				false ->
+					case maps:get(System, SuppressionMap, undefined) of
+						{pending_verification, PendingSources} ->
+							% Suppression was recently lifted. Defer the alert decision until
+							% all sources have reported fresh post-deploy data.
+							Remaining = sets:del_element(Source, PendingSources),
+							case sets:size(Remaining) =:= 0 of
+								true ->
+									FailingNow = failingChecks(NormalisedChecks),
+									case maps:size(FailingNow) > 0 of
+										true ->
+											io:format("Service ~p still unhealthy after deploy — alerting~n", [System]),
+											notify_all(Host, System, FailingNow, false, NewMetrics, Notifiers);
+										false ->
+											io:format("Service ~p healthy after deploy~n", [System])
+									end,
+									maps:remove(System, SuppressionMap);
+								false ->
+									maps:put(System, {pending_verification, Remaining}, SuppressionMap)
+							end;
+						_ ->
+							case meaningfulChange(OldMergedChecks, NormalisedChecks) of
+								true ->
+									state_change(Host, System, NormalisedChecks, NewMetrics, SuppressionMap, Notifiers);
+								false ->
+									SuppressionMap
+							end
+					end
 			end,
 			NewSystemMap = maps:put(Host, {System, NewSourceChecksMap, NewMetrics}, SystemMap),
 			{noreply, {NewSystemMap, NewSuppressionMap, Notifiers}}
@@ -63,14 +87,19 @@ handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers}) ->
 					{reply, {error, not_found}, {SystemMap, SuppressionMap, Notifiers}}
 			end;
 		{unsuppress, System} ->
-			NewSuppressionMap = maps:remove(System, SuppressionMap),
-			io:format("Suppression window closed for ~p~n", [System]),
-			% If the system is currently unhealthy, alert immediately.
-			% Without this, a service that failed during suppression and stays
-			% failed would never trigger an alert: the next poll sees
-			% unhealthy→unhealthy (no change), so meaningfulChange returns false.
-			alert_if_unhealthy_after_unsuppress(System, SystemMap, Notifiers),
-			{reply, ok, {SystemMap, NewSuppressionMap, Notifiers}}
+			% Instead of alerting immediately on stale pre-unsuppress health data,
+			% enter pending_verification so the alert decision is deferred until all
+			% sources have reported fresh post-deploy results.
+			case maps:is_key(System, SuppressionMap) of
+				true ->
+					Sources = collect_active_sources(System, SystemMap),
+					NewSuppressionMap = maps:put(System, {pending_verification, Sources}, SuppressionMap),
+					io:format("Suppression window closed for ~p — awaiting verification poll~n", [System]),
+					{reply, ok, {SystemMap, NewSuppressionMap, Notifiers}};
+				false ->
+					io:format("Suppression window closed for ~p (was not suppressed)~n", [System]),
+					{reply, ok, {SystemMap, SuppressionMap, Notifiers}}
+			end
 	end.
 
 % Merges checks from all sources into a single flat map.
@@ -88,6 +117,15 @@ systemExists(System, SystemMap) ->
 		(_, {S, _, _}, _) when S =:= System -> true;
 		(_, _, Acc) -> Acc
 	end, false, SystemMap).
+
+% Returns the set of source keys that have reported for a given system,
+% across all hosts. Used to build the PendingSources set on unsuppress.
+collect_active_sources(System, SystemMap) ->
+	maps:fold(fun
+		(_, {S, SourceChecksMap, _}, Acc) when S =:= System ->
+			sets:union(Acc, sets:from_list(maps:keys(SourceChecksMap)));
+		(_, _, Acc) -> Acc
+	end, sets:new([{version, 2}]), SystemMap).
 
 % Replaces any unknown "ok" with whichever the value was there previously, until 3 consecutive unknowns are recieved at which point ok is set to false
 replaceUnknowns(OldChecks, NewChecks, Iterator) ->
@@ -155,6 +193,12 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 			io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
 			notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
 			SuppressionMap;
+		{pending_verification, _} ->
+			% A meaningful change arrived while we were waiting for fresh data.
+			% The service is clearly in flux — alert now and clear the pending state.
+			io:format("Checks' state changed for ~p on ~p (clearing pending verification)~n", [System, Host]),
+			notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
+			maps:remove(System, SuppressionMap);
 		ExpiryTime ->
 			Now = erlang:system_time(second),
 			case Now < ExpiryTime of
@@ -169,24 +213,6 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 					maps:remove(System, SuppressionMap)
 			end
 	end.
-
-alert_if_unhealthy_after_unsuppress(System, SystemMap, Notifiers) ->
-	maps:fold(fun(Host, {S, SourceChecksMap, Metrics}, _) ->
-		case S =:= System of
-			true ->
-				MergedChecks = mergeSourceChecks(SourceChecksMap),
-				FailingNow = failingChecks(MergedChecks),
-				case maps:size(FailingNow) > 0 of
-					true ->
-						io:format("Service ~p still unhealthy after suppression lifted — alerting~n", [System]),
-						notify_all(Host, System, FailingNow, false, Metrics, Notifiers);
-					false ->
-						ok
-				end;
-			false ->
-				ok
-		end
-	end, ok, SystemMap).
 
 -ifdef(TEST).
 	-include_lib("eunit/include/eunit.hrl").
@@ -348,7 +374,7 @@ alert_if_unhealthy_after_unsuppress(System, SystemMap, Notifiers) ->
 			ok
 		end.
 
-	% Unsuppressing a healthy system clears suppression and does NOT fire an alert.
+	% Unsuppressing a healthy system enters pending_verification and does NOT fire an immediate alert.
 	unsuppress_healthy_system_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => HealthyChecks}, #{}}},
@@ -357,14 +383,15 @@ alert_if_unhealthy_after_unsuppress(System, SystemMap, Notifiers) ->
 		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
 			{unsuppress, "lucos_foo"}, from, State
 		),
-		?assertEqual(#{}, NewSuppressionMap),
+		% System should be in pending_verification, not removed from the map
+		?assertMatch({pending_verification, _}, maps:get("lucos_foo", NewSuppressionMap)),
 		receive
 			{notified, _, _, _, _, _} -> ?assert(false, "Unexpected alert fired for healthy system")
 		after 100 ->
-			ok  % No notification — correct
+			ok  % No immediate notification — correct
 		end.
 
-	% Unsuppressing an unhealthy system clears suppression and fires an alert immediately.
+	% Unsuppressing an unhealthy system enters pending_verification; alert is deferred, not immediate.
 	unsuppress_unhealthy_system_test() ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => FailingChecks}, #{}}},
@@ -374,12 +401,12 @@ alert_if_unhealthy_after_unsuppress(System, SystemMap, Notifiers) ->
 		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
 			{unsuppress, "lucos_foo"}, from, State
 		),
-		?assertEqual(#{}, NewSuppressionMap),
+		% System should be in pending_verification (not cleared)
+		?assertMatch({pending_verification, _}, maps:get("lucos_foo", NewSuppressionMap)),
 		receive
-			{notified, "host1.example.com", "lucos_foo", FailingNow, false, _Metrics} ->
-				?assert(maps:is_key(<<"fetch-info">>, FailingNow))
+			{notified, _, _, _, _, _} -> ?assert(false, "Alert must not fire immediately on unsuppress")
 		after 100 ->
-			?assert(false, "Expected alert was not fired after unsuppression")
+			ok  % No immediate notification — correct
 		end.
 
 	% Unsuppressing a system that isn't in the map is a no-op (idempotent).
@@ -389,5 +416,81 @@ alert_if_unhealthy_after_unsuppress(System, SystemMap, Notifiers) ->
 			{unsuppress, "lucos_unknown"}, from, State
 		),
 		?assertEqual(#{}, NewSuppressionMap).
+
+	% After unsuppress, a fresh poll reporting unhealthy fires an alert and clears pending state.
+	pending_verification_fires_alert_when_unhealthy_test() ->
+		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
+		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => FailingChecks}, #{}}},
+		PendingSources = sets:from_list([info], [{version, 2}]),
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier]},
+		{noreply, {_, NewSuppressionMap, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", info, FailingChecks, #{}},
+			State
+		),
+		% Suppression entry should be cleared
+		?assertEqual(#{}, NewSuppressionMap),
+		receive
+			{notified, "host1.example.com", "lucos_foo", FailingNow, false, _Metrics} ->
+				?assert(maps:is_key(<<"fetch-info">>, FailingNow))
+		after 100 ->
+			?assert(false, "Expected alert was not fired after verification poll")
+		end.
+
+	% After unsuppress, a fresh poll reporting healthy clears pending state without alerting.
+	pending_verification_no_alert_when_healthy_test() ->
+		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => HealthyChecks}, #{}}},
+		PendingSources = sets:from_list([info], [{version, 2}]),
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier]},
+		{noreply, {_, NewSuppressionMap, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", info, HealthyChecks, #{}},
+			State
+		),
+		% Suppression entry should be cleared
+		?assertEqual(#{}, NewSuppressionMap),
+		receive
+			{notified, _, _, _, _, _} -> ?assert(false, "No alert expected for healthy service after verify")
+		after 100 ->
+			ok
+		end.
+
+	% With two sources pending, the first poll keeps pending state; the second evaluates.
+	pending_verification_waits_for_all_sources_test() ->
+		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
+		CIChecks = #{<<"circleci">> => #{<<"ok">> => false}},
+		SystemMap = #{
+			"host1.example.com" => {"lucos_foo", #{info => FailingChecks, circleci => CIChecks}, #{}}
+		},
+		PendingSources = sets:from_list([info, circleci], [{version, 2}]),
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier]},
+		% First source (info) reports — should still be pending
+		{noreply, State2} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", info, FailingChecks, #{}},
+			State
+		),
+		{_, SuppressionMap2, _} = State2,
+		?assertMatch({pending_verification, _}, maps:get("lucos_foo", SuppressionMap2)),
+		receive
+			{notified, _, _, _, _, _} -> ?assert(false, "No alert expected after first source only")
+		after 100 ->
+			ok
+		end,
+		% Second source (circleci) reports — should evaluate and alert
+		{noreply, {_, SuppressionMap3, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", circleci, CIChecks, #{}},
+			State2
+		),
+		?assertEqual(#{}, SuppressionMap3),
+		receive
+			{notified, "host1.example.com", "lucos_foo", _, false, _} -> ok
+		after 100 ->
+			?assert(false, "Expected alert after all sources reported")
+		end.
 
 -endif.
