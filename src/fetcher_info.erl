@@ -159,7 +159,7 @@ parseConnectionError(Host, Port, IpVersion, ErrorType) ->
 fetchInfo(Host) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
 	TechDetail = list_to_binary("Makes HTTP request to "++InfoURL++""),
-	case httpc:request(get, {InfoURL, [{"User-Agent", "lucos_monitoring"}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], [{socket_opts, [{ipfamily, inet6fb4}]}]) of
+	case httpc:request(get, {InfoURL, [{"User-Agent", "lucos_monitoring"}]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], [{socket_opts, [{ipfamily, inet6fb4}]}]) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
 			try
 				{System, Checks, Metrics} = parseInfo(Body),
