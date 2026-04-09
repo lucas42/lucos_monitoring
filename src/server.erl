@@ -388,12 +388,17 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 		"/lucos_navbar.js" ->
 			{ok, ScriptFile} = file:read_file("lucos_navbar.js"),
 			{200, "text/javascript", ScriptFile};
-		% Auth bypassed: loganne deployComplete webhooks call this endpoint
-		% but don't support authentication. See issue #98.
+		% Phase 1 migration: validate token if present, accept unauthenticated.
+		% Once Loganne is sending tokens (Phase 2), Phase 3 will require auth.
 		"/suppress/clear" ->
-			case suppression:handle(Path, Method, Body, StatePid) of
-				nomatch -> {404, "text/plain", "Not Found"};
-				Response -> Response
+			case suppression:checkAuthIfPresent(Headers) of
+				{error, unauthorized} ->
+					{401, "text/plain", "Unauthorized"};
+				ok ->
+					case suppression:handle(Path, Method, Body, StatePid) of
+						nomatch -> {404, "text/plain", "Not Found"};
+						Response -> Response
+					end
 			end;
 		_ ->
 			case string:prefix(Path, "/suppress") of
@@ -546,8 +551,8 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		?assert(string:str(Result, "<a href=") > 0),
 		?assert(string:str(Result, "https://example.com/path") > 0).
 
-	suppress_clear_bypasses_auth_test() ->
-		% /suppress/clear must succeed without auth even when CLIENT_KEYS is set
+	suppress_clear_no_auth_accepted_during_migration_test() ->
+		% Phase 1: /suppress/clear must accept unauthenticated requests
 		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
 		{ok, StatePid} = monitoring_state_server:start_link(),
 		Body = "{\"systemDeployed\":\"lucos_test\"}",
@@ -555,6 +560,16 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		gen_server:stop(StatePid),
 		os:unsetenv("CLIENT_KEYS"),
 		?assertEqual(204, StatusCode).
+
+	suppress_clear_invalid_token_rejected_test() ->
+		% Phase 1: /suppress/clear must reject requests with an invalid token
+		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
+		{ok, StatePid} = monitoring_state_server:start_link(),
+		Body = "{\"systemDeployed\":\"lucos_test\"}",
+		{StatusCode, _, _} = tryController('POST', "/suppress/clear", Body, #{'Authorization' => "Bearer wrongtoken"}, StatePid),
+		gen_server:stop(StatePid),
+		os:unsetenv("CLIENT_KEYS"),
+		?assertEqual(401, StatusCode).
 
 	suppress_other_routes_still_require_auth_test() ->
 		% Other /suppress/* routes must still require auth
