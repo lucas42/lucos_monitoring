@@ -44,10 +44,11 @@ checkCIForSlug(Slug) ->
 	TechDetail = <<"Checks status of recent circleCI pipelines">>,
 	Token = os:getenv("CIRCLECI_API_TOKEN", ""),
 	AuthHeader = {"Circle-Token", Token},
+	UAHeader = {"User-Agent", os:getenv("SYSTEM", "")},
 	% Fetch the last 5 pipelines so that a failed pipeline followed by a
 	% push-to-fix (which creates a new pipeline) is still detected.
 	PipelineUrl = "https://circleci.com/api/v2/project/"++Slug++"/pipeline?branch=main&limit=5",
-	case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
+	case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader, UAHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, PipelineBody}} ->
 			PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
 			case maps:get(<<"items">>, PipelineResponse, []) of
@@ -61,7 +62,7 @@ checkCIForSlug(Slug) ->
 					PipelineNumber = maps:get(<<"number">>, LatestPipeline),
 					LatestPipelineUrl = "https://app.circleci.com/pipelines/"++Slug++"/"++integer_to_list(PipelineNumber),
 					AllPipelines = [LatestPipeline | OtherPipelines],
-					AllWorkflows = collectAllWorkflows(AllPipelines, AuthHeader),
+					AllWorkflows = collectAllWorkflows(AllPipelines, AuthHeader, UAHeader),
 					checkWorkflowStatuses(Slug, AllWorkflows, LatestPipelineUrl, TechDetail)
 			end;
 		{ok, {{_Version, 404, _ReasonPhrase}, _Headers, _Body}} ->
@@ -85,18 +86,18 @@ checkCIForSlug(Slug) ->
 % Fetches workflows for each pipeline in the list and concatenates them into a
 % single flat list. Errors fetching a pipeline's workflows are silently skipped
 % so that a transient API failure on one pipeline doesn't hide results from others.
-collectAllWorkflows([], _AuthHeader) -> [];
-collectAllWorkflows([Pipeline | Rest], AuthHeader) ->
+collectAllWorkflows([], _AuthHeader, _UAHeader) -> [];
+collectAllWorkflows([Pipeline | Rest], AuthHeader, UAHeader) ->
 	PipelineId = binary_to_list(maps:get(<<"id">>, Pipeline)),
 	WorkflowUrl = "https://circleci.com/api/v2/pipeline/"++PipelineId++"/workflow",
-	Workflows = case httpc:request(get, {WorkflowUrl, [{"Accept","application/json"}, AuthHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
+	Workflows = case httpc:request(get, {WorkflowUrl, [{"Accept","application/json"}, AuthHeader, UAHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, WorkflowBody}} ->
 			WorkflowResponse = jiffy:decode(WorkflowBody, [return_maps]),
 			maps:get(<<"items">>, WorkflowResponse, []);
 		_ ->
 			[]
 	end,
-	Workflows ++ collectAllWorkflows(Rest, AuthHeader).
+	Workflows ++ collectAllWorkflows(Rest, AuthHeader, UAHeader).
 
 % For each workflow name, keep only the most recent workflow (by created_at).
 % This ensures that a successful retry supersedes an earlier failure with the same name.

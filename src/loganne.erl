@@ -36,7 +36,7 @@ emit_event(EventType, HumanReadable, Url) ->
 				<<"humanReadable">> => list_to_binary(HumanReadable),
 				<<"url">> => list_to_binary(Url)
 			}),
-			Request = {Endpoint, [], "application/json", Body},
+			Request = {Endpoint, [{"User-Agent", os:getenv("SYSTEM", "")}], "application/json", Body},
 			case httpc:request(post, Request, [], []) of
 				{ok, {{_, StatusCode, _}, _, _}} when StatusCode >= 200, StatusCode < 300 ->
 					io:format("Loganne event ~p sent successfully to ~p~n", [EventType, Endpoint]);
