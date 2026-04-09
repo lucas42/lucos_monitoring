@@ -16,11 +16,10 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 		{updateSystem, Host, System, Source, SourceChecks, SystemMetrics} ->
 			io:format("Received update for system ~p (Host ~p, Source ~p)~n", [System, Host, Source]),
 			IsFirstSeen = not maps:is_key(Host, SystemMap),
-			{_, OldSourceChecksMap, OldMetrics} = maps:get(Host, SystemMap, {nil, #{}, #{}}),
-			OldMergedChecks = mergeSourceChecks(OldSourceChecksMap),
+			{_, OldSourceChecksMap, OldNormalisedCache, OldMetrics} = maps:get(Host, SystemMap, {nil, #{}, #{}, #{}}),
 			NewSourceChecksMap = maps:put(Source, SourceChecks, OldSourceChecksMap),
 			NewMergedChecks = mergeSourceChecks(NewSourceChecksMap),
-			NormalisedChecks = normaliseChecks(OldMergedChecks, NewMergedChecks),
+			NormalisedChecks = normaliseChecks(OldNormalisedCache, NewMergedChecks),
 			% Only overwrite metrics when the source provides them; sources
 			% without metrics (e.g. circleci) pass #{} and should not wipe
 			% metrics previously stored by the info fetcher.
@@ -53,7 +52,7 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 									maps:put(System, {pending_verification, Remaining}, SuppressionMap)
 							end;
 						_ ->
-							case meaningfulChange(OldMergedChecks, NormalisedChecks) of
+							case meaningfulChange(OldNormalisedCache, NormalisedChecks) of
 								true ->
 									state_change(Host, System, NormalisedChecks, NewMetrics, SuppressionMap, Notifiers);
 								false ->
@@ -61,21 +60,21 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 							end
 					end
 			end,
-			NewSystemMap = maps:put(Host, {System, NewSourceChecksMap, NewMetrics}, SystemMap),
+			NewSystemMap = maps:put(Host, {System, NewSourceChecksMap, NormalisedChecks, NewMetrics}, SystemMap),
 			{noreply, {NewSystemMap, NewSuppressionMap, Notifiers}}
 	end.
 
 handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers}) ->
 	case Request of
 		{fetch, all} ->
-			% Callers expect {System, FlatChecks, Metrics} — merge sources before returning
-			FlatSystemMap = maps:map(fun(_, {System, SourceChecksMap, Metrics}) ->
-				{System, mergeSourceChecks(SourceChecksMap), Metrics}
+			% Callers expect {System, FlatChecks, Metrics} — return the normalised cache directly
+			FlatSystemMap = maps:map(fun(_, {System, _SourceChecksMap, NormalisedCache, Metrics}) ->
+				{System, NormalisedCache, Metrics}
 			end, SystemMap),
 			{reply, FlatSystemMap, {SystemMap, SuppressionMap, Notifiers}};
 		{fetch, Host} ->
-			{System, SourceChecksMap, Metrics} = maps:get(Host, SystemMap),
-			{reply, {System, mergeSourceChecks(SourceChecksMap), Metrics}, {SystemMap, SuppressionMap, Notifiers}};
+			{System, _SourceChecksMap, NormalisedCache, Metrics} = maps:get(Host, SystemMap),
+			{reply, {System, NormalisedCache, Metrics}, {SystemMap, SuppressionMap, Notifiers}};
 		{suppress, System} ->
 			case systemExists(System, SystemMap) of
 				true ->
@@ -114,7 +113,7 @@ mergeSourceChecks(SourceChecksMap) ->
 
 systemExists(System, SystemMap) ->
 	maps:fold(fun
-		(_, {S, _, _}, _) when S =:= System -> true;
+		(_, {S, _, _, _}, _) when S =:= System -> true;
 		(_, _, Acc) -> Acc
 	end, false, SystemMap).
 
@@ -122,7 +121,7 @@ systemExists(System, SystemMap) ->
 % across all hosts. Used to build the PendingSources set on unsuppress.
 collect_active_sources(System, SystemMap) ->
 	maps:fold(fun
-		(_, {S, SourceChecksMap, _}, Acc) when S =:= System ->
+		(_, {S, SourceChecksMap, _, _}, Acc) when S =:= System ->
 			sets:union(Acc, sets:from_list(maps:keys(SourceChecksMap)));
 		(_, _, Acc) -> Acc
 	end, sets:new([{version, 2}]), SystemMap).
@@ -160,10 +159,37 @@ mergeMissingInfoChecks(OldChecks, NewChecks) ->
 			maps:merge(OldChecks, NewChecks)
 	end.
 
+% Applies failThreshold logic: holds the previous ok state until N consecutive
+% failures are seen. The fail_count counter resets to 0 on recovery.
+% failThreshold defaults to 1 (alert immediately on first failure).
+applyFailThreshold(OldChecks, NewChecks) ->
+	maps:map(fun(Key, NewCheck) ->
+		case maps:get(<<"ok">>, NewCheck, unknown) of
+			false ->
+				FailThreshold = maps:get(<<"failThreshold">>, NewCheck, 1),
+				OldCheck = maps:get(Key, OldChecks, #{}),
+				OldFailCount = maps:get(<<"fail_count">>, OldCheck, 0),
+				NewFailCount = OldFailCount + 1,
+				CheckWithCount = maps:put(<<"fail_count">>, NewFailCount, NewCheck),
+				case NewFailCount < FailThreshold of
+					true ->
+						% Not yet at threshold — hold the previous ok value
+						OldOk = maps:get(<<"ok">>, OldCheck, unknown),
+						maps:put(<<"ok">>, OldOk, CheckWithCount);
+					false ->
+						CheckWithCount
+				end;
+			_ ->
+				% Healthy or unknown — reset the failure counter
+				maps:put(<<"fail_count">>, 0, NewCheck)
+		end
+	end, NewChecks).
+
 % Reduce monitoring flapiness by using existing check data to bolster new checks which may be facing a temporary blip
 normaliseChecks(OldChecks, NewChecks) ->
 	MergedChecks = mergeMissingInfoChecks(OldChecks, NewChecks),
-	replaceUnknowns(OldChecks, MergedChecks, maps:iterator(MergedChecks, reversed)).
+	AfterUnknowns = replaceUnknowns(OldChecks, MergedChecks, maps:iterator(MergedChecks, reversed)),
+	applyFailThreshold(OldChecks, AfterUnknowns).
 
 % Decides whether the checks have changed in a meaningful way (ie ignore "unknown" states)
 meaningfulChange(OldChecks, NewChecks) ->
@@ -211,10 +237,10 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 -ifdef(TEST).
 	-include_lib("eunit/include/eunit.hrl").
 	nomaliseChecks_test() ->
-		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
-		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
-		?assertEqual(#{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 3}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
-		?assertEqual(#{<<"item-count">> => #{<<"ok">> => false, <<"unknown_count">> => 0}, <<"api-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true,  <<"unknown_count">> => 1}}, normaliseChecks(#{<<"item-count">> => #{<<"ok">> => false}, <<"api-check">> => #{<<"ok">> => true}, <<"fetch-info">> => #{<<"ok">> => true}}, #{<<"fetch-info">> => #{<<"ok">> => unknown}})).
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 3, <<"fail_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
+		?assertEqual(#{<<"item-count">> => #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1}, <<"api-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true,  <<"unknown_count">> => 1, <<"fail_count">> => 0}}, normaliseChecks(#{<<"item-count">> => #{<<"ok">> => false}, <<"api-check">> => #{<<"ok">> => true}, <<"fetch-info">> => #{<<"ok">> => true}}, #{<<"fetch-info">> => #{<<"ok">> => unknown}})).
 
 	meaningfulChange_test() ->
 		?assertEqual(false, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}})),
@@ -224,8 +250,8 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 
 	systemExists_test() ->
 		SystemMap = #{
-			"host1.example.com" => {"lucos_foo", #{}, #{}},
-			"host2.example.com" => {"lucos_bar", #{}, #{}}
+			"host1.example.com" => {"lucos_foo", #{}, #{}, #{}},
+			"host2.example.com" => {"lucos_bar", #{}, #{}, #{}}
 		},
 		?assertEqual(true, systemExists("lucos_foo", SystemMap)),
 		?assertEqual(true, systemExists("lucos_bar", SystemMap)),
@@ -258,7 +284,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		),
 		% Host should now be in the SystemMap
 		?assert(maps:is_key("host1.example.com", SystemMap)),
-		{"lucos_foo", SourceChecksMap, _} = maps:get("host1.example.com", SystemMap),
+		{"lucos_foo", SourceChecksMap, _, _} = maps:get("host1.example.com", SystemMap),
 		StoredChecks = mergeSourceChecks(SourceChecksMap),
 		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"fetch-info">>, StoredChecks))).
 
@@ -267,7 +293,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 	warmup_second_update_not_suppressed_test() ->
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => Checks}, #{}}},
+			#{"host1.example.com" => {"lucos_foo", #{info => Checks}, #{}, #{}}},
 			#{},
 			[]
 		},
@@ -284,7 +310,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => false}},
 		% Start with info checks already stored
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, #{}}},
+			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, #{}, #{}}},
 			#{},
 			[]
 		},
@@ -293,7 +319,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 			{updateSystem, "host1.example.com", "lucos_foo", circleci, CIChecks, #{}},
 			ExistingState
 		),
-		{"lucos_foo", SourceChecksMap, _} = maps:get("host1.example.com", SystemMap),
+		{"lucos_foo", SourceChecksMap, _, _} = maps:get("host1.example.com", SystemMap),
 		Merged = mergeSourceChecks(SourceChecksMap),
 		% All three checks must be present
 		?assert(maps:is_key(<<"fetch-info">>, Merged)),
@@ -307,7 +333,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		OldInfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}, <<"custom-check">> => #{<<"ok">> => true}},
 		NewInfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => OldInfoChecks}, #{}}},
+			#{"host1.example.com" => {"lucos_foo", #{info => OldInfoChecks}, #{}, #{}}},
 			#{},
 			[]
 		},
@@ -315,7 +341,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 			{updateSystem, "host1.example.com", "lucos_foo", info, NewInfoChecks, #{}},
 			ExistingState
 		),
-		{"lucos_foo", SourceChecksMap, _} = maps:get("host1.example.com", SystemMap),
+		{"lucos_foo", SourceChecksMap, _, _} = maps:get("host1.example.com", SystemMap),
 		Merged = mergeSourceChecks(SourceChecksMap),
 		?assertNot(maps:is_key(<<"custom-check">>, Merged)).
 
@@ -325,7 +351,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		Metrics = #{<<"agent-count">> => #{<<"value">> => 42, <<"techDetail">> => <<"count">>}},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, Metrics}},
+			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, #{}, Metrics}},
 			#{},
 			[]
 		},
@@ -334,7 +360,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 			{updateSystem, "host1.example.com", "lucos_foo", circleci, CIChecks, #{}},
 			ExistingState
 		),
-		{"lucos_foo", _, StoredMetrics} = maps:get("host1.example.com", SystemMap),
+		{"lucos_foo", _, _, StoredMetrics} = maps:get("host1.example.com", SystemMap),
 		?assertEqual(Metrics, StoredMetrics).
 
 	% When a source provides non-empty metrics, they replace the existing ones.
@@ -342,7 +368,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		OldMetrics = #{<<"agent-count">> => #{<<"value">> => 42, <<"techDetail">> => <<"count">>}},
 		NewMetrics = #{<<"agent-count">> => #{<<"value">> => 99, <<"techDetail">> => <<"count">>}},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, OldMetrics}},
+			#{"host1.example.com" => {"lucos_foo", #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, OldMetrics}},
 			#{},
 			[]
 		},
@@ -350,7 +376,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 			{updateSystem, "host1.example.com", "lucos_foo", info, #{<<"fetch-info">> => #{<<"ok">> => true}}, NewMetrics},
 			ExistingState
 		),
-		{"lucos_foo", _, StoredMetrics} = maps:get("host1.example.com", SystemMap),
+		{"lucos_foo", _, _, StoredMetrics} = maps:get("host1.example.com", SystemMap),
 		?assertEqual(NewMetrics, StoredMetrics).
 
 	% Helper to build a recording notifier and retrieve what it captured.
@@ -371,7 +397,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 	% Unsuppressing a healthy system enters pending_verification and does NOT fire an immediate alert.
 	unsuppress_healthy_system_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
-		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => HealthyChecks}, #{}}},
+		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => HealthyChecks}, #{}, #{}}},
 		Notifier = recording_notifier(self()),
 		State = {SystemMap, #{"lucos_foo" => erlang:system_time(second) + 600}, [Notifier]},
 		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
@@ -388,7 +414,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 	% Unsuppressing an unhealthy system enters pending_verification; alert is deferred, not immediate.
 	unsuppress_unhealthy_system_test() ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
-		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => FailingChecks}, #{}}},
+		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => FailingChecks}, #{}, #{}}},
 		Notifier = recording_notifier(self()),
 		State = {SystemMap, #{"lucos_foo" => erlang:system_time(second) + 600}, [Notifier]},
 		drain_notifications(),
@@ -414,7 +440,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 	% After unsuppress, a fresh poll reporting unhealthy fires an alert and clears pending state.
 	pending_verification_fires_alert_when_unhealthy_test() ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
-		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => FailingChecks}, #{}}},
+		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => FailingChecks}, #{}, #{}}},
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
@@ -435,7 +461,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 	% After unsuppress, a fresh poll reporting healthy clears pending state without alerting.
 	pending_verification_no_alert_when_healthy_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
-		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => HealthyChecks}, #{}}},
+		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => HealthyChecks}, #{}, #{}}},
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
@@ -457,7 +483,7 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => false}},
 		SystemMap = #{
-			"host1.example.com" => {"lucos_foo", #{info => FailingChecks, circleci => CIChecks}, #{}}
+			"host1.example.com" => {"lucos_foo", #{info => FailingChecks, circleci => CIChecks}, #{}, #{}}
 		},
 		PendingSources = sets:from_list([info, circleci], [{version, 2}]),
 		Notifier = recording_notifier(self()),
@@ -486,5 +512,39 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		after 100 ->
 			?assert(false, "Expected alert after all sources reported")
 		end.
+
+	% With default failThreshold (1), a single failure is reported immediately.
+	failThreshold_default_alerts_immediately_test() ->
+		OldChecks = #{<<"db-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}},
+		NewChecks = #{<<"db-check">> => #{<<"ok">> => false}},
+		Result = normaliseChecks(OldChecks, NewChecks),
+		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result))),
+		?assertEqual(1, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result))).
+
+	% With failThreshold 3, failures 1 and 2 hold the previous ok state.
+	% On the third consecutive failure, ok flips to false.
+	failThreshold_holds_until_threshold_test() ->
+		NewChecks = #{<<"db-check">> => #{<<"ok">> => false, <<"failThreshold">> => 3}},
+		% First failure — fail_count goes to 1, ok stays true (held from old)
+		OldChecks1 = #{<<"db-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}},
+		Result1 = normaliseChecks(OldChecks1, NewChecks),
+		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result1))),
+		?assertEqual(1, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result1))),
+		% Second failure — fail_count goes to 2, still held
+		Result2 = normaliseChecks(Result1, NewChecks),
+		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result2))),
+		?assertEqual(2, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result2))),
+		% Third failure — fail_count goes to 3, now ok flips to false
+		Result3 = normaliseChecks(Result2, NewChecks),
+		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result3))),
+		?assertEqual(3, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result3))).
+
+	% Recovery (ok: true) resets fail_count to 0.
+	failThreshold_recovery_resets_count_test() ->
+		OldChecks = #{<<"db-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 2, <<"failThreshold">> => 3}},
+		NewChecks = #{<<"db-check">> => #{<<"ok">> => true, <<"failThreshold">> => 3}},
+		Result = normaliseChecks(OldChecks, NewChecks),
+		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result))),
+		?assertEqual(0, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result))).
 
 -endif.
