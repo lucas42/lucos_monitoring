@@ -388,18 +388,6 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 		"/lucos_navbar.js" ->
 			{ok, ScriptFile} = file:read_file("lucos_navbar.js"),
 			{200, "text/javascript", ScriptFile};
-		% Phase 1 migration: validate token if present, accept unauthenticated.
-		% Once Loganne is sending tokens (Phase 2), Phase 3 will require auth.
-		"/suppress/clear" ->
-			case suppression:checkAuthIfPresent(Headers) of
-				{error, unauthorized} ->
-					{401, "text/plain", "Unauthorized"};
-				ok ->
-					case suppression:handle(Path, Method, Body, StatePid) of
-						nomatch -> {404, "text/plain", "Not Found"};
-						Response -> Response
-					end
-			end;
 		_ ->
 			case string:prefix(Path, "/suppress") of
 				nomatch ->
@@ -551,15 +539,17 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		?assert(string:str(Result, "<a href=") > 0),
 		?assert(string:str(Result, "https://example.com/path") > 0).
 
-	suppress_clear_no_auth_accepted_during_migration_test() ->
-		% Phase 1: /suppress/clear must accept unauthenticated requests
+	suppress_clear_requires_auth_test() ->
+		% Phase 3: /suppress/clear requires a valid token
 		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
 		{ok, StatePid} = monitoring_state_server:start_link(),
 		Body = "{\"systemDeployed\":\"lucos_test\"}",
-		{StatusCode, _, _} = tryController('POST', "/suppress/clear", Body, #{}, StatePid),
+		{UnauthStatus, _, _} = tryController('POST', "/suppress/clear", Body, #{}, StatePid),
+		{AuthStatus, _, _} = tryController('POST', "/suppress/clear", Body, #{'Authorization' => "Bearer mysecrettoken"}, StatePid),
 		gen_server:stop(StatePid),
 		os:unsetenv("CLIENT_KEYS"),
-		?assertEqual(204, StatusCode).
+		?assertEqual(401, UnauthStatus),
+		?assertEqual(204, AuthStatus).
 
 	suppress_clear_invalid_token_rejected_test() ->
 		% Phase 1: /suppress/clear must reject requests with an invalid token
