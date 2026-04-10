@@ -51,20 +51,7 @@ checkCIForSlug(Slug) ->
 	case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader, UAHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, PipelineBody}} ->
 			PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
-			case maps:get(<<"items">>, PipelineResponse, []) of
-				[] ->
-					#{<<"circleci">> => #{
-						<<"ok">> => true,
-						<<"techDetail">> => TechDetail,
-						<<"debug">> => <<"No recent pipelines found">>
-					}};
-				[LatestPipeline | OtherPipelines] ->
-					PipelineNumber = maps:get(<<"number">>, LatestPipeline),
-					LatestPipelineUrl = "https://app.circleci.com/pipelines/"++Slug++"/"++integer_to_list(PipelineNumber),
-					AllPipelines = [LatestPipeline | OtherPipelines],
-					AllWorkflows = collectAllWorkflows(AllPipelines, AuthHeader, UAHeader),
-					checkWorkflowStatuses(Slug, AllWorkflows, LatestPipelineUrl, TechDetail)
-			end;
+			handlePipelineItems(Slug, maps:get(<<"items">>, PipelineResponse, []), AuthHeader, UAHeader, TechDetail);
 		{ok, {{_Version, 404, _ReasonPhrase}, _Headers, _Body}} ->
 			% No CI configured for this repo. Return empty map so the state
 			% server removes any circleci check left over from a transient error.
@@ -82,6 +69,19 @@ checkCIForSlug(Slug) ->
 				<<"debug">> => <<"Error making request to CircleCI API">>
 			}}
 	end.
+
+% Processes the list of pipeline items returned by the CircleCI API.
+% An empty list means no active CircleCI project — treat as exempt (no check).
+% A non-empty list means we fetch workflows and evaluate their status.
+handlePipelineItems(Slug, [], _AuthHeader, _UAHeader, _TechDetail) ->
+	io:format("No recent pipelines for ~p — CircleCI project may not be active~n", [Slug]),
+	#{};
+handlePipelineItems(Slug, [LatestPipeline | OtherPipelines], AuthHeader, UAHeader, TechDetail) ->
+	PipelineNumber = maps:get(<<"number">>, LatestPipeline),
+	LatestPipelineUrl = "https://app.circleci.com/pipelines/"++Slug++"/"++integer_to_list(PipelineNumber),
+	AllPipelines = [LatestPipeline | OtherPipelines],
+	AllWorkflows = collectAllWorkflows(AllPipelines, AuthHeader, UAHeader),
+	checkWorkflowStatuses(Slug, AllWorkflows, LatestPipelineUrl, TechDetail).
 
 % Fetches workflows for each pipeline in the list and concatenates them into a
 % single flat list. Errors fetching a pipeline's workflows are silently skipped
@@ -166,6 +166,12 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 
 	parseConfigyRepos_empty_test() ->
 		?assertEqual([], parseConfigyRepos("[]")).
+
+	handlePipelineItems_no_pipelines_test() ->
+		% 0 pipelines → exempt (no check). Repos with no active CircleCI project
+		% should not appear as passing or failing — they should be invisible.
+		Result = handlePipelineItems("github/lucas42/lucos_test", [], {}, {}, <<"tech">>),
+		?assertEqual(#{}, Result).
 
 	checkWorkflowStatuses_empty_test() ->
 		% No workflows → ok with debug note
