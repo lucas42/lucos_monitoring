@@ -62,7 +62,8 @@ checkCIForSlug(Slug) ->
 				<<"techDetail">> => TechDetail,
 				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
 			}};
-		{error, _Error} ->
+		{error, Error} ->
+			io:format("CircleCI API request failed for ~p: ~p~n", [Slug, Error]),
 			#{<<"circleci">> => #{
 				<<"ok">> => unknown,
 				<<"techDetail">> => TechDetail,
