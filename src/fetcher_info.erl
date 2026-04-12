@@ -4,8 +4,8 @@
 
 start(StatePid) ->
 	{ok, _} = application:ensure_all_started([ssl, inets]),
-	{ok, SystemsBody} = file:read_file("./info-systems-list"),
-	{ok, HostsBody} = file:read_file("./info-hosts-list"),
+	{ok, SystemsBody} = file:read_file("./config/info-systems-list.json"),
+	{ok, HostsBody} = file:read_file("./config/info-hosts-list.json"),
 	Systems = parseInfoSystems(binary_to_list(SystemsBody)) ++
 	          parseInfoSystems(binary_to_list(HostsBody)),
 	lists:foreach(fun({Id, Host}) ->

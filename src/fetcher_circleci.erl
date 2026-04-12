@@ -6,8 +6,8 @@
 % recurring CI check process for each repo.
 start(StatePid) ->
 	{ok, _} = application:ensure_all_started([ssl, inets]),
-	{ok, SystemsBody} = file:read_file("./ci-systems-list"),
-	{ok, ComponentsBody} = file:read_file("./ci-components-list"),
+	{ok, SystemsBody} = file:read_file("./config/ci-systems-list.json"),
+	{ok, ComponentsBody} = file:read_file("./config/ci-components-list.json"),
 	Repos = parseConfigyRepos(binary_to_list(SystemsBody)) ++
 	        parseConfigyRepos(binary_to_list(ComponentsBody)),
 	lists:foreach(fun({RepoId, Host}) ->

@@ -13,10 +13,11 @@ RUN mkdir src
 COPY src/* src/
 RUN rebar3 as prod release
 
-RUN curl -s "https://configy.l42.eu/systems/http" -H "Accept: application/json" > info-systems-list
-RUN curl -s "https://configy.l42.eu/hosts/http" -H "Accept: application/json" > info-hosts-list
-RUN curl -s "https://configy.l42.eu/systems" -H "Accept: application/json" > ci-systems-list
-RUN curl -s "https://configy.l42.eu/components" -H "Accept: application/json" > ci-components-list
+RUN mkdir -p config
+RUN curl -s "https://configy.l42.eu/systems/http" -H "Accept: application/json" > config/info-systems-list.json
+RUN curl -s "https://configy.l42.eu/hosts/http" -H "Accept: application/json" > config/info-hosts-list.json
+RUN curl -s "https://configy.l42.eu/systems" -H "Accept: application/json" > config/ci-systems-list.json
+RUN curl -s "https://configy.l42.eu/components" -H "Accept: application/json" > config/ci-components-list.json
 
 FROM debian:trixie
 
@@ -26,9 +27,6 @@ RUN apt-get update && apt-get install -y ca-certificates wget
 COPY --from=build /lucos_monitoring/_build/prod/rel/prod/ ./
 COPY --from=navbar lucos_navbar.js .
 COPY resources ./
-COPY --from=build /lucos_monitoring/info-systems-list ./
-COPY --from=build /lucos_monitoring/info-hosts-list ./
-COPY --from=build /lucos_monitoring/ci-systems-list ./
-COPY --from=build /lucos_monitoring/ci-components-list ./
+COPY --from=build /lucos_monitoring/config/ ./config
 
 CMD ["bin/prod", "foreground"]
