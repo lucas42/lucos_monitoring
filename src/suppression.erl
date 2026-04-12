@@ -1,5 +1,5 @@
 -module(suppression).
--export([handle/4, checkAuth/1, checkAuthIfPresent/1]).
+-export([handle/4, checkAuth/1]).
 
 % Parses CLIENT_KEYS (semicolon-separated "name=value" pairs) into a set of valid tokens.
 parseClientKeys(ClientKeysStr) ->
@@ -16,7 +16,7 @@ parseClientKeys(ClientKeysStr) ->
 	).
 
 % Checks the Authorization: Bearer header against CLIENT_KEYS env var.
-% Returns ok if auth passes (or if CLIENT_KEYS is not configured/empty).
+% Returns ok if auth passes.
 % Returns {error, unauthorized} if the token is wrong or missing.
 checkAuth(Headers) ->
 	ValidKeys = parseClientKeys(os:getenv("CLIENT_KEYS", "")),
@@ -30,15 +30,6 @@ checkAuth(Headers) ->
 		_ -> {error, unauthorized}
 	end.
 
-% Checks the Authorization: Bearer header, but only if one is present.
-% Returns ok if auth passes, no header is present, or CLIENT_KEYS is not configured.
-% Returns {error, unauthorized} only if a header is present but the token is invalid.
-% Used during Phase 1 migration window before Loganne starts sending tokens.
-checkAuthIfPresent(Headers) ->
-	case maps:get('Authorization', Headers, undefined) of
-		undefined -> ok;  % No header: accept during migration
-		_ -> checkAuth(Headers)
-	end.
 
 % Handles all /suppress/* routes. Returns {StatusCode, ContentType, Body}.
 handle(Path, Method, Body, StatePid) ->
@@ -124,24 +115,6 @@ handle(Path, Method, Body, StatePid) ->
 		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=abc123=="),
 		?assertEqual(ok, checkAuth(#{'Authorization' => "Bearer abc123=="})),
 		?assertEqual({error, unauthorized}, checkAuth(#{'Authorization' => "Bearer abc123"})),
-		os:unsetenv("CLIENT_KEYS").
-
-	checkAuthIfPresent_no_header_test() ->
-		% No Authorization header: accept (backwards-compatible during Phase 1)
-		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		?assertEqual(ok, checkAuthIfPresent(#{})),
-		os:unsetenv("CLIENT_KEYS").
-
-	checkAuthIfPresent_valid_token_test() ->
-		% Valid token: accept
-		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		?assertEqual(ok, checkAuthIfPresent(#{'Authorization' => "Bearer mysecrettoken"})),
-		os:unsetenv("CLIENT_KEYS").
-
-	checkAuthIfPresent_invalid_token_test() ->
-		% Invalid token: reject (even in Phase 1, a bad token is rejected)
-		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		?assertEqual({error, unauthorized}, checkAuthIfPresent(#{'Authorization' => "Bearer wrongtoken"})),
 		os:unsetenv("CLIENT_KEYS").
 
 -endif.
