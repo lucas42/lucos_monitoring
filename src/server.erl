@@ -65,7 +65,7 @@ handleRequest(Socket, Method, RequestUri, Headers, StatePid) ->
 			Response = getHeaders(StatusCode, ContentType) ++ ResponseBody,
 			gen_tcp:send(Socket, Response),
 			gen_tcp:close(Socket),
-			io:format("~p ~p ~p ~p ~p~n", [ClientIP, DateTime, Method, StatusCode, RequestUri]),
+			io:format("[~s] ~p ~p ~p ~p~n", [DateTime, ClientIP, Method, StatusCode, RequestUri]),
 			ok;
 		{ok, {http_header, _, 'Content-Length', _, Value}} ->
 			{Length, _} = string:to_integer(binary_to_list(Value)),
