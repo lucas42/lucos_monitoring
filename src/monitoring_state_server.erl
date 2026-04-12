@@ -138,8 +138,10 @@ replaceUnknowns(OldChecks, NewChecks, Iterator) ->
 					IncrementedCheck = maps:put(<<"unknown_count">>, NewCount, NewCheck),
 					case NewCount >= 3 of
 						true ->
-							 maps:put(<<"ok">>, false, IncrementedCheck);
+							maps:put(<<"ok">>, false, IncrementedCheck);
 						false ->
+							DateTime = calendar:system_time_to_rfc3339(erlang:system_time(second)),
+							io:format("[~s] Not sending alert for ~p as there has only been ~p recurring failures so far.~n", [DateTime, Key, NewCount]),
 							maps:put(<<"ok">>, maps:get(<<"ok">>, OldCheck, unknown), IncrementedCheck)
 					end;
 				_ ->
