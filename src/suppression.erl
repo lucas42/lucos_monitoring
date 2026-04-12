@@ -19,20 +19,15 @@ parseClientKeys(ClientKeysStr) ->
 % Returns ok if auth passes (or if CLIENT_KEYS is not configured/empty).
 % Returns {error, unauthorized} if the token is wrong or missing.
 checkAuth(Headers) ->
-	case os:getenv("CLIENT_KEYS") of
-		false -> ok;
-		"" -> ok;  % empty string means no auth configured — same as unset
-		ClientKeysStr ->
-			ValidKeys = parseClientKeys(ClientKeysStr),
-			AuthHeader = maps:get('Authorization', Headers, ""),
-			case AuthHeader of
-				"Bearer " ++ Token ->
-					case sets:is_element(Token, ValidKeys) of
-						true -> ok;
-						false -> {error, unauthorized}
-					end;
-				_ -> {error, unauthorized}
-			end
+	ValidKeys = parseClientKeys(os:getenv("CLIENT_KEYS", "")),
+	AuthHeader = maps:get('Authorization', Headers, ""),
+	case AuthHeader of
+		"Bearer " ++ Token ->
+			case sets:is_element(Token, ValidKeys) of
+				true -> ok;
+				false -> {error, unauthorized}
+			end;
+		_ -> {error, unauthorized}
 	end.
 
 % Checks the Authorization: Bearer header, but only if one is present.
@@ -92,8 +87,8 @@ handle(Path, Method, Body, StatePid) ->
 	checkAuth_no_client_keys_configured_test() ->
 		% When CLIENT_KEYS is not set, all requests pass (no auth enforced)
 		os:unsetenv("CLIENT_KEYS"),
-		?assertEqual(ok, checkAuth(#{})),
-		?assertEqual(ok, checkAuth(#{'Authorization' => "Bearer sometoken"})).
+		?assertEqual({error, unauthorized}, checkAuth(#{})),
+		?assertEqual({error, unauthorized}, checkAuth(#{'Authorization' => "Bearer sometoken"})).
 
 	checkAuth_valid_token_test() ->
 		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
