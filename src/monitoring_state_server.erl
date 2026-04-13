@@ -205,19 +205,9 @@ applyFailThreshold(OldChecks, NewChecks) ->
 	end, NewChecks).
 
 % Reduce monitoring flapiness by using existing check data to bolster new checks which may be facing a temporary blip.
-% CountableKeys limits which checks can have their unknown_count incremented (see replaceUnknowns).
-% The 2-argument form treats all unknown checks in the merged state as countable (used in unit tests).
-normaliseChecks(OldChecks, NewChecks) ->
-	MergedChecks = mergeMissingInfoChecks(OldChecks, NewChecks),
-	AllUnknownKeys = maps:fold(fun(Key, Check, Acc) ->
-		case maps:get(<<"ok">>, Check, unknown) of
-			unknown -> sets:add_element(Key, Acc);
-			_ -> Acc
-		end
-	end, sets:new([{version, 2}]), MergedChecks),
-	AfterUnknowns = replaceUnknowns(OldChecks, MergedChecks, maps:iterator(MergedChecks, reversed), AllUnknownKeys),
-	applyFailThreshold(OldChecks, AfterUnknowns).
-
+% CountableKeys is the set of check keys from the current source update that are reporting unknown.
+% Only those keys can increment their unknown_count — this prevents double-counting when checks
+% from one source are carried forward in the merged view during another source's update.
 normaliseChecks(OldChecks, NewChecks, CountableKeys) ->
 	MergedChecks = mergeMissingInfoChecks(OldChecks, NewChecks),
 	AfterUnknowns = replaceUnknowns(OldChecks, MergedChecks, maps:iterator(MergedChecks, reversed), CountableKeys),
@@ -269,10 +259,16 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 -ifdef(TEST).
 	-include_lib("eunit/include/eunit.hrl").
 	nomaliseChecks_test() ->
-		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
-		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
-		?assertEqual(#{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 3, <<"fail_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}})),
-		?assertEqual(#{<<"item-count">> => #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1}, <<"api-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true,  <<"unknown_count">> => 1, <<"fail_count">> => 0}}, normaliseChecks(#{<<"item-count">> => #{<<"ok">> => false}, <<"api-check">> => #{<<"ok">> => true}, <<"fetch-info">> => #{<<"ok">> => true}}, #{<<"fetch-info">> => #{<<"ok">> => unknown}})).
+		CiCountable = sets:from_list([<<"ci">>], [{version, 2}]),
+		FetchInfoCountable = sets:from_list([<<"fetch-info">>], [{version, 2}]),
+		% Single unknown check: ci goes from ok to unknown (count 0→1, ok held as true)
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
+		% Second consecutive unknown for ci (count 1→2, ok still held as true)
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
+		% Third consecutive unknown for ci (count 2→3, ok flips to false and alerts)
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 3, <<"fail_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
+		% fetch-info goes unknown while other checks are carried forward from old state
+		?assertEqual(#{<<"item-count">> => #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1}, <<"api-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true,  <<"unknown_count">> => 1, <<"fail_count">> => 0}}, normaliseChecks(#{<<"item-count">> => #{<<"ok">> => false}, <<"api-check">> => #{<<"ok">> => true}, <<"fetch-info">> => #{<<"ok">> => true}}, #{<<"fetch-info">> => #{<<"ok">> => unknown}}, FetchInfoCountable)).
 
 	meaningfulChange_test() ->
 		?assertEqual(false, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}})),
@@ -549,7 +545,8 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 	failThreshold_default_alerts_immediately_test() ->
 		OldChecks = #{<<"db-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}},
 		NewChecks = #{<<"db-check">> => #{<<"ok">> => false}},
-		Result = normaliseChecks(OldChecks, NewChecks),
+		% db-check is false (not unknown), so CountableKeys is empty
+		Result = normaliseChecks(OldChecks, NewChecks, sets:new([{version, 2}])),
 		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result))),
 		?assertEqual(1, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result))).
 
@@ -557,17 +554,19 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 	% On the third consecutive failure, ok flips to false.
 	failThreshold_holds_until_threshold_test() ->
 		NewChecks = #{<<"db-check">> => #{<<"ok">> => false, <<"failThreshold">> => 3}},
+		% db-check is false (not unknown), so CountableKeys is empty
+		EmptyCountable = sets:new([{version, 2}]),
 		% First failure — fail_count goes to 1, ok stays true (held from old)
 		OldChecks1 = #{<<"db-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}},
-		Result1 = normaliseChecks(OldChecks1, NewChecks),
+		Result1 = normaliseChecks(OldChecks1, NewChecks, EmptyCountable),
 		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result1))),
 		?assertEqual(1, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result1))),
 		% Second failure — fail_count goes to 2, still held
-		Result2 = normaliseChecks(Result1, NewChecks),
+		Result2 = normaliseChecks(Result1, NewChecks, EmptyCountable),
 		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result2))),
 		?assertEqual(2, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result2))),
 		% Third failure — fail_count goes to 3, now ok flips to false
-		Result3 = normaliseChecks(Result2, NewChecks),
+		Result3 = normaliseChecks(Result2, NewChecks, EmptyCountable),
 		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result3))),
 		?assertEqual(3, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result3))).
 
@@ -575,7 +574,8 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 	failThreshold_recovery_resets_count_test() ->
 		OldChecks = #{<<"db-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 2, <<"failThreshold">> => 3}},
 		NewChecks = #{<<"db-check">> => #{<<"ok">> => true, <<"failThreshold">> => 3}},
-		Result = normaliseChecks(OldChecks, NewChecks),
+		% db-check is true (not unknown), so CountableKeys is empty
+		Result = normaliseChecks(OldChecks, NewChecks, sets:new([{version, 2}])),
 		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result))),
 		?assertEqual(0, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result))).
 
