@@ -19,7 +19,17 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 			{_, OldSourceChecksMap, OldNormalisedCache, OldMetrics} = maps:get(Host, SystemMap, {nil, #{}, #{}, #{}}),
 			NewSourceChecksMap = maps:put(Source, SourceChecks, OldSourceChecksMap),
 			NewMergedChecks = mergeSourceChecks(NewSourceChecksMap),
-			NormalisedChecks = normaliseChecks(OldNormalisedCache, NewMergedChecks),
+			% Only count checks as "newly unknown" if they were included in the current
+			% source update — not checks carried forward from other sources. This prevents
+			% double-incrementing unknown_count when two sources (e.g. circleci + info)
+			% update within the same monitoring cycle.
+			CountableKeys = maps:fold(fun(Key, Check, Acc) ->
+				case maps:get(<<"ok">>, Check, unknown) of
+					unknown -> sets:add_element(Key, Acc);
+					_ -> Acc
+				end
+			end, sets:new([{version, 2}]), SourceChecks),
+			NormalisedChecks = normaliseChecks(OldNormalisedCache, NewMergedChecks, CountableKeys),
 			% Only overwrite metrics when the source provides them; sources
 			% without metrics (e.g. circleci) pass #{} and should not wipe
 			% metrics previously stored by the info fetcher.
@@ -126,28 +136,21 @@ collect_active_sources(System, SystemMap) ->
 		(_, _, Acc) -> Acc
 	end, sets:new([{version, 2}]), SystemMap).
 
-% Replaces any unknown "ok" with whichever the value was there previously, until 3 consecutive unknowns are recieved at which point ok is set to false
-replaceUnknowns(OldChecks, NewChecks, Iterator) ->
+% Replaces any unknown "ok" with whichever the value was there previously, until 3 consecutive unknowns are recieved at which point ok is set to false.
+% CountableKeys is the set of check keys that should be considered for incrementing.
+% Only keys in this set increment their unknown_count — this prevents double-counting when
+% one source's unknown checks are carried forward in the merged view and processed again
+% during another source's update.
+replaceUnknowns(OldChecks, NewChecks, Iterator, CountableKeys) ->
 	case maps:next(Iterator) of
 		{Key, NewCheck, NextIterator} ->
 			NormalisedCheck = case maps:get(<<"ok">>, NewCheck, unknown) of
 				unknown ->
-					% Only increment unknown_count if transitioning from a known state to unknown.
-					% This prevents double-counting when a check from an earlier source update
-					% is carried forward in the merged view and processed again by a later source update.
-					case maps:find(Key, OldChecks) of
-						{ok, OldCheck} ->
-							% Check existed in previous state — check if it was known or unknown
-							OldOk = maps:get(<<"ok">>, OldCheck, unknown),
-							OldCount = maps:get(<<"unknown_count">>, OldCheck, 0),
-							NewCount = case OldOk of
-								unknown -> OldCount;  % Was already unknown, don't re-increment
-								_ -> OldCount + 1  % Was known (ok/false), now unknown — increment
-							end;
-						error ->
-							% Check is new (first time seeing it) — it's unknown, so count = 1
-							NewCount = 1,
-							OldCheck = #{<<"ok">> => unknown}
+					OldCheck = maps:get(Key, OldChecks, #{<<"ok">> => unknown}),
+					OldCount = maps:get(<<"unknown_count">>, OldCheck, 0),
+					NewCount = case sets:is_element(Key, CountableKeys) of
+						true -> OldCount + 1;  % This check was in the current source update
+						false -> OldCount  % Carried over from a previous source, don't re-increment
 					end,
 					IncrementedCheck = maps:put(<<"unknown_count">>, NewCount, NewCheck),
 					case NewCount >= 3 of
@@ -161,7 +164,7 @@ replaceUnknowns(OldChecks, NewChecks, Iterator) ->
 				_ ->
 					maps:put(<<"unknown_count">>, 0, NewCheck)
 			end,
-			maps:put(Key, NormalisedCheck, replaceUnknowns(OldChecks, NewChecks, NextIterator));
+			maps:put(Key, NormalisedCheck, replaceUnknowns(OldChecks, NewChecks, NextIterator, CountableKeys));
 		none ->
 			maps:new()
 	end.
@@ -201,10 +204,23 @@ applyFailThreshold(OldChecks, NewChecks) ->
 		end
 	end, NewChecks).
 
-% Reduce monitoring flapiness by using existing check data to bolster new checks which may be facing a temporary blip
+% Reduce monitoring flapiness by using existing check data to bolster new checks which may be facing a temporary blip.
+% CountableKeys limits which checks can have their unknown_count incremented (see replaceUnknowns).
+% The 2-argument form treats all unknown checks in the merged state as countable (used in unit tests).
 normaliseChecks(OldChecks, NewChecks) ->
 	MergedChecks = mergeMissingInfoChecks(OldChecks, NewChecks),
-	AfterUnknowns = replaceUnknowns(OldChecks, MergedChecks, maps:iterator(MergedChecks, reversed)),
+	AllUnknownKeys = maps:fold(fun(Key, Check, Acc) ->
+		case maps:get(<<"ok">>, Check, unknown) of
+			unknown -> sets:add_element(Key, Acc);
+			_ -> Acc
+		end
+	end, sets:new([{version, 2}]), MergedChecks),
+	AfterUnknowns = replaceUnknowns(OldChecks, MergedChecks, maps:iterator(MergedChecks, reversed), AllUnknownKeys),
+	applyFailThreshold(OldChecks, AfterUnknowns).
+
+normaliseChecks(OldChecks, NewChecks, CountableKeys) ->
+	MergedChecks = mergeMissingInfoChecks(OldChecks, NewChecks),
+	AfterUnknowns = replaceUnknowns(OldChecks, MergedChecks, maps:iterator(MergedChecks, reversed), CountableKeys),
 	applyFailThreshold(OldChecks, AfterUnknowns).
 
 % Decides whether the checks have changed in a meaningful way (ie ignore "unknown" states)
@@ -563,19 +579,36 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result))),
 		?assertEqual(0, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result))).
 
-	% Bug fix: multiple source updates in the same cycle should not double-increment unknown_count.
-	% Scenario: circleci reports unknown (count=1), then info updates separately (carried-forward circleci should not increment again).
+	% Bug fix: multiple source updates in the same monitoring cycle must not double-increment unknown_count.
+	% Scenario: circleci reports unknown, then info reports ok in the same cycle.
+	% The circleci check is carried forward in the merged view during info's update.
+	% With the fix, circleci's count should only increment when circleci itself reports — not when info reports.
 	multiple_sources_same_cycle_no_double_increment_test() ->
-		% After circleci reports unknown, the state is stored with circleci count=1
-		StateAfterFirstSource = #{<<"circleci">> => #{<<"ok">> => unknown, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}},
-		% Now info sends an update (fetch-info remains ok). The merged view includes circleci (carried from previous).
-		% The bug was: replaceUnknowns would see circleci:unknown in the merged view and increment again to 2.
-		% The fix: check that old circleci was already unknown, so don't increment.
-		NewChecksFromInfo = #{<<"fetch-info">> => #{<<"ok">> => true}},
-		Result = normaliseChecks(StateAfterFirstSource, NewChecksFromInfo),
-		% circleci should still be 1 (not incremented to 2), since it was already unknown
-		CircleciCheck = maps:get(<<"circleci">>, Result, #{}),
-		?assertEqual(1, maps:get(<<"unknown_count">>, CircleciCheck, -1)),
-		?assertEqual(unknown, maps:get(<<"ok">>, CircleciCheck, undefined)).
+		Notifiers = [],
+		% Start with a system already known (non-first-seen)
+		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
+		ExistingState = {
+			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks, circleci => CIChecks}, #{}, #{}}},
+			#{},
+			Notifiers
+		},
+		% circleci reports unknown
+		{noreply, State2} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", circleci, #{<<"circleci">> => #{<<"ok">> => unknown}}, #{}},
+			ExistingState
+		),
+		{SystemMap2, _, _} = State2,
+		{"lucos_foo", _, NormalisedAfterCI, _} = maps:get("host1.example.com", SystemMap2),
+		?assertEqual(1, maps:get(<<"unknown_count">>, maps:get(<<"circleci">>, NormalisedAfterCI, #{}), -1)),
+		% Now info reports (ok, no change) — circleci check is carried over in the merged view
+		{noreply, State3} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", info, InfoChecks, #{}},
+			State2
+		),
+		{SystemMap3, _, _} = State3,
+		{"lucos_foo", _, NormalisedAfterInfo, _} = maps:get("host1.example.com", SystemMap3),
+		% circleci count must still be 1, NOT 2 — info's update must not re-increment it
+		?assertEqual(1, maps:get(<<"unknown_count">>, maps:get(<<"circleci">>, NormalisedAfterInfo, #{}), -1)).
 
 -endif.
