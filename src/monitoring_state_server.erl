@@ -132,9 +132,23 @@ replaceUnknowns(OldChecks, NewChecks, Iterator) ->
 		{Key, NewCheck, NextIterator} ->
 			NormalisedCheck = case maps:get(<<"ok">>, NewCheck, unknown) of
 				unknown ->
-					OldCheck = maps:get(Key, OldChecks, #{<<"ok">> => unknown}),
-					OldCount = maps:get(<<"unknown_count">>, OldCheck, 0),
-					NewCount = OldCount + 1,
+					% Only increment unknown_count if transitioning from a known state to unknown.
+					% This prevents double-counting when a check from an earlier source update
+					% is carried forward in the merged view and processed again by a later source update.
+					case maps:find(Key, OldChecks) of
+						{ok, OldCheck} ->
+							% Check existed in previous state — check if it was known or unknown
+							OldOk = maps:get(<<"ok">>, OldCheck, unknown),
+							OldCount = maps:get(<<"unknown_count">>, OldCheck, 0),
+							NewCount = case OldOk of
+								unknown -> OldCount;  % Was already unknown, don't re-increment
+								_ -> OldCount + 1  % Was known (ok/false), now unknown — increment
+							end;
+						error ->
+							% Check is new (first time seeing it) — it's unknown, so count = 1
+							NewCount = 1,
+							OldCheck = #{<<"ok">> => unknown}
+					end,
 					IncrementedCheck = maps:put(<<"unknown_count">>, NewCount, NewCheck),
 					case NewCount >= 3 of
 						true ->
@@ -548,5 +562,20 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		Result = normaliseChecks(OldChecks, NewChecks),
 		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result))),
 		?assertEqual(0, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result))).
+
+	% Bug fix: multiple source updates in the same cycle should not double-increment unknown_count.
+	% Scenario: circleci reports unknown (count=1), then info updates separately (carried-forward circleci should not increment again).
+	multiple_sources_same_cycle_no_double_increment_test() ->
+		% After circleci reports unknown, the state is stored with circleci count=1
+		StateAfterFirstSource = #{<<"circleci">> => #{<<"ok">> => unknown, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}},
+		% Now info sends an update (fetch-info remains ok). The merged view includes circleci (carried from previous).
+		% The bug was: replaceUnknowns would see circleci:unknown in the merged view and increment again to 2.
+		% The fix: check that old circleci was already unknown, so don't increment.
+		NewChecksFromInfo = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		Result = normaliseChecks(StateAfterFirstSource, NewChecksFromInfo),
+		% circleci should still be 1 (not incremented to 2), since it was already unknown
+		CircleciCheck = maps:get(<<"circleci">>, Result, #{}),
+		?assertEqual(1, maps:get(<<"unknown_count">>, CircleciCheck, -1)),
+		?assertEqual(unknown, maps:get(<<"ok">>, CircleciCheck, undefined)).
 
 -endif.
