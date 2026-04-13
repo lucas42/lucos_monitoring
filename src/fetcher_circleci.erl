@@ -25,12 +25,6 @@ repoHost(Repo) ->
 		Domain -> binary_to_list(Domain)
 	end.
 
-% Repos confirmed to have no active CircleCI project and never will.
-% These may hit transport errors instead of HTTP 404s due to URL parsing issues
-% or other httpc quirks. Treat any error from these repos as "no CI configured".
-isKnownTohaveNoCIProject(RepoId) ->
-	lists:member(RepoId, [".github", "vue-leaflet-antimeridian"]).
-
 ciRepoLoop(StatePid, RepoId, Host) ->
 	try
 		Slug = "github/lucas42/" ++ RepoId,
@@ -44,8 +38,11 @@ ciRepoLoop(StatePid, RepoId, Host) ->
 	ciRepoLoop(StatePid, RepoId, Host).
 
 % CircleCI pipeline check logic. Returns a checks map — empty #{} when the
-% project returns 404 (no CI configured), so that any stale state from a
-% previous transient error is cleared in the state server.
+% project has no CI configured (404) or a transport error occurs, so that any
+% stale state from a previous transient error is cleared in the state server.
+% Transport errors are treated the same as 404 because repos without a CircleCI
+% project may produce httpc transport errors rather than a clean HTTP 404
+% (e.g. due to URL parsing quirks with certain repo name patterns).
 checkCIForSlug(Slug) ->
 	TechDetail = <<"Checks status of recent circleCI pipelines">>,
 	Token = os:getenv("CIRCLECI_API_TOKEN", ""),
@@ -54,15 +51,12 @@ checkCIForSlug(Slug) ->
 	% Fetch the last 5 pipelines so that a failed pipeline followed by a
 	% push-to-fix (which creates a new pipeline) is still detected.
 	PipelineUrl = "https://circleci.com/api/v2/project/"++Slug++"/pipeline?branch=main&limit=5",
-	% Extract repo ID from "github/lucas42/repoId" by splitting and taking the third part
-	[_GitHub, _Lucas42, RepoId] = string:split(Slug, "/", all),
 	case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader, UAHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, PipelineBody}} ->
 			PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
 			handlePipelineItems(Slug, maps:get(<<"items">>, PipelineResponse, []), AuthHeader, UAHeader, TechDetail);
 		{ok, {{_Version, 404, _ReasonPhrase}, _Headers, _Body}} ->
-			% No CI configured for this repo. Return empty map so the state
-			% server removes any circleci check left over from a transient error.
+			% No CI configured for this repo.
 			#{};
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 			#{<<"circleci">> => #{
@@ -71,19 +65,12 @@ checkCIForSlug(Slug) ->
 				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
 			}};
 		{error, Error} ->
+			% Transport error — treat the same as 404 (no CI configured).
+			% Repos without a CircleCI project sometimes produce transport errors
+			% instead of a clean 404, so we cannot distinguish "no CI" from a
+			% transient network blip here. Returning #{} clears any stale state.
 			io:format("CircleCI API request failed for ~p: ~p~n", [Slug, Error]),
-			% For repos known to have no active CI project, treat transport errors
-			% the same as 404s (repos without CI configured). This handles cases where
-			% certain URL patterns cause httpc to fail instead of returning 404.
-			case isKnownTohaveNoCIProject(RepoId) of
-				true -> #{};
-				false ->
-					#{<<"circleci">> => #{
-						<<"ok">> => unknown,
-						<<"techDetail">> => TechDetail,
-						<<"debug">> => <<"Error making request to CircleCI API">>
-					}}
-			end
+			#{}
 	end.
 
 % Processes the list of pipeline items returned by the CircleCI API.
@@ -188,14 +175,6 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 		% should not appear as passing or failing — they should be invisible.
 		Result = handlePipelineItems("github/lucas42/lucos_test", [], {}, {}, <<"tech">>),
 		?assertEqual(#{}, Result).
-
-	isKnownTohaveNoCIProject_test() ->
-		% .github and vue-leaflet-antimeridian are known to have no CI project
-		?assert(isKnownTohaveNoCIProject(".github")),
-		?assert(isKnownTohaveNoCIProject("vue-leaflet-antimeridian")),
-		% Other repos are not known to have no CI project
-		?assertNot(isKnownTohaveNoCIProject("lucos_test")),
-		?assertNot(isKnownTohaveNoCIProject("another_repo")).
 
 	checkWorkflowStatuses_empty_test() ->
 		% No workflows → ok with debug note
