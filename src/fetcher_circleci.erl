@@ -25,6 +25,12 @@ repoHost(Repo) ->
 		Domain -> binary_to_list(Domain)
 	end.
 
+% Repos confirmed to have no active CircleCI project and never will.
+% These may hit transport errors instead of HTTP 404s due to URL parsing issues
+% or other httpc quirks. Treat any error from these repos as "no CI configured".
+isKnownTohaveNoCIProject(RepoId) ->
+	lists:member(RepoId, [".github", "vue-leaflet-antimeridian"]).
+
 ciRepoLoop(StatePid, RepoId, Host) ->
 	try
 		Slug = "github/lucas42/" ++ RepoId,
@@ -48,6 +54,7 @@ checkCIForSlug(Slug) ->
 	% Fetch the last 5 pipelines so that a failed pipeline followed by a
 	% push-to-fix (which creates a new pipeline) is still detected.
 	PipelineUrl = "https://circleci.com/api/v2/project/"++Slug++"/pipeline?branch=main&limit=5",
+	RepoId = string:sub_string(Slug, string:str(Slug, "/") + 7),  % Extract repo ID from "github/lucas42/repoId"
 	case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader, UAHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, PipelineBody}} ->
 			PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
@@ -64,11 +71,18 @@ checkCIForSlug(Slug) ->
 			}};
 		{error, Error} ->
 			io:format("CircleCI API request failed for ~p: ~p~n", [Slug, Error]),
-			#{<<"circleci">> => #{
-				<<"ok">> => unknown,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => <<"Error making request to CircleCI API">>
-			}}
+			% For repos known to have no active CI project, treat transport errors
+			% the same as 404s (repos without CI configured). This handles cases where
+			% certain URL patterns cause httpc to fail instead of returning 404.
+			case isKnownTohaveNoCIProject(RepoId) of
+				true -> #{};
+				false ->
+					#{<<"circleci">> => #{
+						<<"ok">> => unknown,
+						<<"techDetail">> => TechDetail,
+						<<"debug">> => <<"Error making request to CircleCI API">>
+					}}
+			end
 	end.
 
 % Processes the list of pipeline items returned by the CircleCI API.
@@ -173,6 +187,14 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 		% should not appear as passing or failing — they should be invisible.
 		Result = handlePipelineItems("github/lucas42/lucos_test", [], {}, {}, <<"tech">>),
 		?assertEqual(#{}, Result).
+
+	isKnownTohaveNoCIProject_test() ->
+		% .github and vue-leaflet-antimeridian are known to have no CI project
+		?assert(isKnownTohaveNoCIProject(".github")),
+		?assert(isKnownTohaveNoCIProject("vue-leaflet-antimeridian")),
+		% Other repos are not known to have no CI project
+		?assertNot(isKnownTohaveNoCIProject("lucos_test")),
+		?assertNot(isKnownTohaveNoCIProject("another_repo")).
 
 	checkWorkflowStatuses_empty_test() ->
 		% No workflows → ok with debug note
