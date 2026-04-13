@@ -54,7 +54,8 @@ checkCIForSlug(Slug) ->
 	% Fetch the last 5 pipelines so that a failed pipeline followed by a
 	% push-to-fix (which creates a new pipeline) is still detected.
 	PipelineUrl = "https://circleci.com/api/v2/project/"++Slug++"/pipeline?branch=main&limit=5",
-	RepoId = string:sub_string(Slug, string:str(Slug, "/") + 7),  % Extract repo ID from "github/lucas42/repoId"
+	% Extract repo ID from "github/lucas42/repoId" by splitting and taking the third part
+	[_GitHub, _Lucas42, RepoId] = string:split(Slug, "/", all),
 	case httpc:request(get, {PipelineUrl, [{"Accept","application/json"}, AuthHeader, UAHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, PipelineBody}} ->
 			PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
