@@ -144,7 +144,8 @@ renderSystemChecks(SystemChecks) ->
 			UnknownCount = maps:get(<<"unknown_count">>, CheckInfo, 0),
 			FailCount = maps:get(<<"fail_count">>, CheckInfo, 0),
 			FailThreshold = maps:get(<<"failThreshold">>, CheckInfo, 1),
-			IsBuffering = (UnknownCount > 0) orelse (FailCount > 0 andalso FailThreshold > 1),
+			IsBuffering = CheckHealthy =/= false andalso
+				((UnknownCount > 0) orelse (FailCount > 0 andalso FailThreshold > 1)),
 			CheckClass = case IsBuffering of
 				true -> "check buffering";
 				false -> getCssClass("check", CheckHealthy)
