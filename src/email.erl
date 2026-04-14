@@ -10,7 +10,7 @@ notify(Host, SystemName, FailingChecks, _Suppressed, SystemMetrics) ->
 	% Use Host for consistent Subject lines so things get bundled into nice threads
 	EmailSubject = "Monitoring issue on "++Host,
 	EmailBody = getEmailBody(Host, System, FailingChecks, SystemMetrics),
-	io:format("Send notifications for ~p~n", [System]),
+	logger:notice("Send notifications for ~p", [System]),
 	sendEmail(EmailSubject, EmailBody).
 
 
@@ -92,12 +92,12 @@ sendEmail(Subject, Body) ->
 			{ok, _ } ->
 				ok;
 			{error, send, {permanent_failure, _, ErrorMessage}} ->
-				io:format("Error Sending Email: ~p~n", [binary_to_list(ErrorMessage)]);
+				logger:error("Error Sending Email: ~p", [binary_to_list(ErrorMessage)]);
 			{error, send, Error} ->
-				io:format("Unhandled Error Sending Email.  ~p~n", [Error]);
+				logger:error("Unhandled Error Sending Email.  ~p", [Error]);
 			{error, Type, Error} ->
-				io:format("Unhandled Email Error of Type ~p.  ~p~n", [Type, Error]);
+				logger:error("Unhandled Email Error of Type ~p.  ~p", [Type, Error]);
 			_ ->
-				io:format("Unexpected Response from sending email. ~p.~n", [Response])
+				logger:error("Unexpected Response from sending email. ~p.", [Response])
 		end
 	end).

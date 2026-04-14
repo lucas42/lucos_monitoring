@@ -2,6 +2,7 @@
 -export([start/2, accept/3, handleRequest/2]).
 
 start(_StartType, _StartArgs) ->
+	configureLogLevel(),
 	try
 		{Port, _} = string:to_integer(os:getenv("PORT", "8080")),
 		{ok, StatePid} = monitoring_state_server:start_link(),
@@ -12,11 +13,16 @@ start(_StartType, _StartArgs) ->
 				{reuseaddr, true}],
 		listen_with_retry(Port, Opts, StatePid, SchedulerCount, 30)
 	catch
-		Exception:Reason -> io:format("Startup error occured: ~p ~p ~n",[Exception, Reason])
+		Exception:Reason -> logger:emergency("Startup error occured: ~p ~p", [Exception, Reason])
 	end.
 
+configureLogLevel() ->
+	LevelStr = os:getenv("LOG_LEVEL", "notice"),
+	Level = list_to_atom(LevelStr),
+	logger:set_primary_config(level, Level).
+
 listen_with_retry(Port, _Opts, _StatePid, _SchedulerCount, 0) ->
-	io:format("Can't listen on port ~p: eaddrinuse (all retries exhausted)~n", [Port]),
+	logger:emergency("Can't listen on port ~p: eaddrinuse (all retries exhausted)", [Port]),
 	{error, {eaddrinuse, Port}};
 listen_with_retry(Port, Opts, StatePid, SchedulerCount, RetriesLeft) ->
 	case gen_tcp:listen(Port, Opts) of
@@ -25,18 +31,18 @@ listen_with_retry(Port, Opts, StatePid, SchedulerCount, RetriesLeft) ->
 				spawn_opt(?MODULE, accept, [ListenSocket, SchedulerID, StatePid], [link, {scheduler, SchedulerID}])
 			end,
 			lists:foreach(Spawn, lists:seq(1, SchedulerCount)),
-			io:format("server listening on port ~b with ~b schedulers~n", [Port, SchedulerCount]),
+			logger:notice("server listening on port ~b with ~b schedulers", [Port, SchedulerCount]),
 			fetcher_info:start(StatePid),
 			fetcher_circleci:start(StatePid),
 			receive
-				Any -> io:format("~p~n", [Any])
+				Any -> logger:notice("~p", [Any])
 			end;
 		{error, eaddrinuse} ->
-			io:format("Can't listen on port ~p: eaddrinuse (~p retries left, retrying in 1s)~n", [Port, RetriesLeft]),
+			logger:warning("Can't listen on port ~p: eaddrinuse (~p retries left, retrying in 1s)", [Port, RetriesLeft]),
 			timer:sleep(1000),
 			listen_with_retry(Port, Opts, StatePid, SchedulerCount, RetriesLeft - 1);
 		{error, Error} ->
-			io:format("Can't listen on port ~p: ~p ~n",[Port, Error]),
+			logger:emergency("Can't listen on port ~p: ~p", [Port, Error]),
 			{error, Error}
 	end.
 
@@ -59,13 +65,13 @@ handleRequest(Socket, Method, RequestUri, Headers, StatePid) ->
 		{ok, http_eoh} ->
 			ContentLength = maps:get('Content-Length', Headers, 0),
 			RequestBody = readBody(Socket, ContentLength),
-			DateTime = calendar:system_time_to_rfc3339(erlang:system_time(second)),
 			ClientIP = getClientIP(Socket),
 			{StatusCode, ContentType, ResponseBody} = tryController(Method, RequestUri, RequestBody, Headers, StatePid),
 			Response = getHeaders(StatusCode, ContentType) ++ ResponseBody,
 			gen_tcp:send(Socket, Response),
 			gen_tcp:close(Socket),
-			io:format("[~s] ~p ~p ~p ~p~n", [DateTime, ClientIP, Method, StatusCode, RequestUri]),
+			AccessLogLevel = accessLogLevel(RequestUri),
+			logger:log(AccessLogLevel, "~p ~p ~p ~p", [ClientIP, Method, StatusCode, RequestUri]),
 			ok;
 		{ok, {http_header, _, 'Content-Length', _, Value}} ->
 			{Length, _} = string:to_integer(binary_to_list(Value)),
@@ -90,6 +96,13 @@ readBody(Socket, Length) ->
 getClientIP(Socket) ->
 	{ok, {ClientIP, _}} = inet:peername(Socket),
 	inet:ntoa(ClientIP).
+
+accessLogLevel(RequestUri) ->
+	Path = re:replace(RequestUri, "\\?.*$", "", [{return, list}]),
+	case Path of
+		"/_info" -> info;
+		_ -> notice
+	end.
 
 getHeaders(StatusCode, ContentType) ->
 	getStatusLine(StatusCode) ++
@@ -446,7 +459,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		Response -> Response
 	catch
 		ExceptionClass:Term:StackTrace ->
-			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace]),
+			logger:error("ExceptionClass: ~p Term: ~p StackTrace: ~p", [ExceptionClass, Term, StackTrace]),
 			{500, "text/plain", "An Error occurred whilst generating this page."}
 	end.
 
