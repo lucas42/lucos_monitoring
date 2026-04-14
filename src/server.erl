@@ -98,7 +98,7 @@ getClientIP(Socket) ->
 	inet:ntoa(ClientIP).
 
 accessLogLevel(RequestUri) ->
-	Path = re:replace(RequestUri, "\\?.*$", "", [{return, list}]),
+	Path = lists:flatten(re:replace(RequestUri, "\\?.*$", "", [{return, list}])),
 	case Path of
 		"/_info" -> info;
 		_ -> notice
