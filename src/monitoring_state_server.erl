@@ -120,7 +120,15 @@ handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers}) ->
 					Sources = collect_active_sources(System, SystemMap),
 					NewSuppressionMap = maps:put(System, {pending_verification, Sources}, SuppressionMap),
 					io:format("Suppression window closed for ~p — awaiting verification poll~n", [System]),
-					{reply, ok, {SystemMap, NewSuppressionMap, Notifiers}};
+					% Cascade pending_verification to systems that have checks depending on this system.
+					% Single-hop only: we do not follow dependsOn chains transitively.
+					DependentSystems = find_dependent_systems(System, SystemMap),
+					FinalSuppressionMap = lists:foldl(fun(DepSystem, SM) ->
+						DepSources = collect_active_sources(DepSystem, SystemMap),
+						io:format("Cascading pending_verification to ~p (has checks depending on ~p)~n", [DepSystem, System]),
+						maps:put(DepSystem, {pending_verification, DepSources}, SM)
+					end, NewSuppressionMap, DependentSystems),
+					{reply, ok, {SystemMap, FinalSuppressionMap, Notifiers}};
 				false ->
 					io:format("Suppression window closed for ~p (was not suppressed)~n", [System]),
 					{reply, ok, {SystemMap, SuppressionMap, Notifiers}}
@@ -251,26 +259,83 @@ notify_all(Host, System, FailingNow, Suppressed, Metrics, Notifiers) ->
 	end, Notifiers).
 
 state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifiers) ->
-	FailingNow = failingChecks(SystemChecks),
-	case maps:get(System, SuppressionMap, undefined) of
-		undefined ->
-			io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
-			notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
+	AllFailing = failingChecks(SystemChecks),
+	% Filter out checks whose dependsOn system is currently under an active suppression window.
+	% Single-hop only: we never follow dependsOn chains transitively.
+	FailingNow = maps:filter(fun(_, Check) ->
+		not is_dependency_suppressed(Check, System, SuppressionMap)
+	end, AllFailing),
+	case maps:size(AllFailing) > 0 andalso maps:size(FailingNow) =:= 0 of
+		true ->
+			% All failing checks are dependency-suppressed — notify as suppressed (no email alert).
+			io:format("All failing checks on ~p suppressed via dependency: ~p~n", [System, maps:keys(AllFailing)]),
+			notify_all(Host, System, AllFailing, true, SystemMetrics, Notifiers),
 			SuppressionMap;
-		ExpiryTime ->
-			Now = erlang:system_time(second),
-			case Now < ExpiryTime of
-				true ->
-					io:format("Alert suppressed for ~p during deploy window~n", [System]),
-					notify_all(Host, System, FailingNow, true, SystemMetrics, Notifiers),
-					SuppressionMap;
-				false ->
-					io:format("ERROR: Suppression window for ~p expired without being cleared - deploy may have taken longer than 10 minutes~n", [System]),
+		false ->
+			% FailingNow contains only non-dep-suppressed checks. Apply system-level suppression logic.
+			case maps:get(System, SuppressionMap, undefined) of
+				undefined ->
 					io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
 					notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
-					maps:remove(System, SuppressionMap)
+					SuppressionMap;
+				ExpiryTime ->
+					Now = erlang:system_time(second),
+					case Now < ExpiryTime of
+						true ->
+							io:format("Alert suppressed for ~p during deploy window~n", [System]),
+							notify_all(Host, System, FailingNow, true, SystemMetrics, Notifiers),
+							SuppressionMap;
+						false ->
+							io:format("ERROR: Suppression window for ~p expired without being cleared - deploy may have taken longer than 10 minutes~n", [System]),
+							io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
+							notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
+							maps:remove(System, SuppressionMap)
+					end
 			end
 	end.
+
+% Returns true if this check's dependsOn system is currently under an active suppression window.
+% Guards against self-references (CurrentSystem == dependsOn) and treats pending_verification
+% as "suppression lifted" (returns false). Does NOT follow transitive dependsOn chains.
+is_dependency_suppressed(Check, CurrentSystem, SuppressionMap) ->
+	case maps:get(<<"dependsOn">>, Check, undefined) of
+		undefined -> false;
+		DependsOn when is_binary(DependsOn) ->
+			DependsOnStr = binary_to_list(DependsOn),
+			% Guard: ignore self-references to prevent circular evaluation
+			case DependsOnStr =:= CurrentSystem of
+				true -> false;
+				false ->
+					case maps:get(DependsOnStr, SuppressionMap, undefined) of
+						undefined -> false;
+						{pending_verification, _} -> false;  % Suppression has been lifted
+						ExpiryTime ->
+							Now = erlang:system_time(second),
+							Now < ExpiryTime
+					end
+			end;
+		_ -> false  % Non-binary dependsOn value — ignore
+	end.
+
+% Returns a list of system IDs whose normalised checks include a dependsOn pointing at TargetSystem.
+% Used to cascade pending_verification when TargetSystem unsuppresses.
+% Excludes TargetSystem itself (self-reference guard).
+find_dependent_systems(TargetSystem, SystemMap) ->
+	TargetBin = list_to_binary(TargetSystem),
+	lists:usort(maps:fold(fun(_Host, {System, SourceChecksMap, _, _}, Acc) ->
+		case System =:= TargetSystem of
+			true -> Acc;  % Guard: skip self
+			false ->
+				MergedChecks = mergeSourceChecks(SourceChecksMap),
+				HasDependency = maps:fold(fun(_, Check, Found) ->
+					Found orelse (maps:get(<<"dependsOn">>, Check, undefined) =:= TargetBin)
+				end, false, MergedChecks),
+				case HasDependency of
+					true -> [System | Acc];
+					false -> Acc
+				end
+		end
+	end, [], SystemMap)).
 
 -ifdef(TEST).
 	-include_lib("eunit/include/eunit.hrl").
@@ -697,5 +762,142 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		{"lucos_foo", _, NormalisedAfterInfo, _} = maps:get("host1.example.com", SystemMap3),
 		% circleci count must still be 1, NOT 2 — info's update must not re-increment it
 		?assertEqual(1, maps:get(<<"unknown_count">>, maps:get(<<"circleci">>, NormalisedAfterInfo, #{}), -1)).
+
+	% is_dependency_suppressed: check with no dependsOn field → false
+	is_dependency_suppressed_no_field_test() ->
+		?assertEqual(false, is_dependency_suppressed(#{<<"ok">> => false}, "lucos_foo", #{})).
+
+	% is_dependency_suppressed: dependsOn system is not in SuppressionMap → false
+	is_dependency_suppressed_system_not_suppressed_test() ->
+		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>},
+		?assertEqual(false, is_dependency_suppressed(Check, "lucos_time", #{})).
+
+	% is_dependency_suppressed: dependsOn system has an active suppression window → true
+	is_dependency_suppressed_active_suppression_test() ->
+		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>},
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
+		?assertEqual(true, is_dependency_suppressed(Check, "lucos_time", SuppressionMap)).
+
+	% is_dependency_suppressed: dependsOn system is in pending_verification (suppression lifted) → false
+	is_dependency_suppressed_pending_verification_test() ->
+		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>},
+		PendingSources = sets:from_list([info], [{version, 2}]),
+		SuppressionMap = #{"lucos_eolas" => {pending_verification, PendingSources}},
+		?assertEqual(false, is_dependency_suppressed(Check, "lucos_time", SuppressionMap)).
+
+	% is_dependency_suppressed: self-reference guard — dependsOn points to the same system → false
+	is_dependency_suppressed_self_reference_test() ->
+		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_foo">>},
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{"lucos_foo" => FutureExpiry},
+		?assertEqual(false, is_dependency_suppressed(Check, "lucos_foo", SuppressionMap)).
+
+	% is_dependency_suppressed: suppression window has expired → false
+	is_dependency_suppressed_expired_test() ->
+		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>},
+		PastExpiry = erlang:system_time(second) - 1,
+		SuppressionMap = #{"lucos_eolas" => PastExpiry},
+		?assertEqual(false, is_dependency_suppressed(Check, "lucos_time", SuppressionMap)).
+
+	% find_dependent_systems: returns system IDs with checks declaring dependsOn TargetSystem
+	find_dependent_systems_basic_test() ->
+		SystemMap = #{
+			"host1.example.com" => {"lucos_time", #{info => #{
+				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
+			}}, #{}, #{}},
+			"host2.example.com" => {"lucos_arachne", #{info => #{
+				<<"triplestore">> => #{<<"ok">> => true}
+			}}, #{}, #{}}
+		},
+		?assertEqual(["lucos_time"], find_dependent_systems("lucos_eolas", SystemMap)).
+
+	% find_dependent_systems: no systems depend on target → empty list
+	find_dependent_systems_none_test() ->
+		SystemMap = #{
+			"host1.example.com" => {"lucos_time", #{info => #{
+				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
+			}}, #{}, #{}}
+		},
+		?assertEqual([], find_dependent_systems("some.other.system", SystemMap)).
+
+	% find_dependent_systems: self-reference is excluded
+	find_dependent_systems_excludes_self_test() ->
+		SystemMap = #{
+			"host1.example.com" => {"lucos_eolas", #{info => #{
+				<<"db">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
+			}}, #{}, #{}}
+		},
+		?assertEqual([], find_dependent_systems("lucos_eolas", SystemMap)).
+
+	% find_dependent_systems: multiple systems can depend on the same target
+	find_dependent_systems_multiple_test() ->
+		SystemMap = #{
+			"host1.example.com" => {"lucos_time", #{info => #{
+				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
+			}}, #{}, #{}},
+			"host2.example.com" => {"lucos_arachne", #{info => #{
+				<<"eolas-data">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
+			}}, #{}, #{}}
+		},
+		Deps = find_dependent_systems("lucos_eolas", SystemMap),
+		?assertEqual(["lucos_arachne", "lucos_time"], lists:sort(Deps)).
+
+	% When all failing checks have an active dependsOn suppression, no alert email is sent.
+	state_change_all_dep_suppressed_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
+		SystemChecks = #{
+			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>, <<"fail_count">> => 0, <<"unknown_count">> => 0}
+		},
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		state_change("host1.example.com", "lucos_time", SystemChecks, #{}, SuppressionMap, [Notifier]),
+		receive
+			{notified, "host1.example.com", "lucos_time", _FailingChecks, true, _} ->
+				ok  % Suppressed alert — correct
+		after 100 ->
+			?assert(false, "Expected suppressed notification")
+		end.
+
+	% When only some checks are dep-suppressed, the non-suppressed ones still alert.
+	state_change_partial_dep_suppressed_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
+		SystemChecks = #{
+			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>, <<"fail_count">> => 0, <<"unknown_count">> => 0},
+			<<"db">> => #{<<"ok">> => false, <<"fail_count">> => 0, <<"unknown_count">> => 0}
+		},
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		state_change("host1.example.com", "lucos_time", SystemChecks, #{}, SuppressionMap, [Notifier]),
+		receive
+			{notified, "host1.example.com", "lucos_time", FailingNow, false, _} ->
+				% Only db should alert, not eolas
+				?assert(maps:is_key(<<"db">>, FailingNow)),
+				?assertNot(maps:is_key(<<"eolas">>, FailingNow))
+		after 100 ->
+			?assert(false, "Expected alert on non-dep-suppressed checks")
+		end.
+
+	% unsuppress cascades pending_verification to systems with checks depending on the unsuppressed system.
+	unsuppress_cascades_pending_verification_test() ->
+		% lucos_time has a check with dependsOn: lucos_eolas
+		% lucos_eolas is being unsuppressed
+		TimeChecks = #{<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}},
+		SystemMap = #{
+			"lucos_eolas" => {"lucos_eolas", #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, #{}},
+			"schedule-tracker.l42.eu" => {"lucos_time", #{info => TimeChecks}, #{}, #{}}
+		},
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
+		State = {SystemMap, SuppressionMap, []},
+		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
+			{unsuppress, "lucos_eolas"}, from, State
+		),
+		% lucos_eolas itself should be in pending_verification
+		?assertMatch({pending_verification, _}, maps:get("lucos_eolas", NewSuppressionMap)),
+		% lucos_time (dependent) should also be in pending_verification
+		?assertMatch({pending_verification, _}, maps:get("lucos_time", NewSuppressionMap)).
 
 -endif.
