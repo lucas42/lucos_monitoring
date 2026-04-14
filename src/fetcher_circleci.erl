@@ -32,7 +32,7 @@ ciRepoLoop(StatePid, RepoId, Host) ->
 		ok = gen_server:cast(StatePid, {updateSystem, Host, RepoId, circleci, CIChecks, #{}})
 	catch
 		ExceptionClass:Term:StackTrace ->
-			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace])
+			logger:error("ExceptionClass: ~p Term: ~p StackTrace: ~p", [ExceptionClass, Term, StackTrace])
 	end,
 	timer:sleep(timer:seconds(60)),
 	ciRepoLoop(StatePid, RepoId, Host).
@@ -68,7 +68,7 @@ checkCIForSlug(Slug) ->
 			% Transport error — return unknown so existing check state is held
 			% until we can reach CircleCI again. This may be a transient network
 			% issue rather than a missing CI project.
-			io:format("CircleCI API request failed for ~p: ~p~n", [Slug, Error]),
+			logger:warning("CircleCI API request failed for ~p: ~p", [Slug, Error]),
 			#{<<"circleci">> => #{
 				<<"ok">> => unknown,
 				<<"techDetail">> => TechDetail,
@@ -80,7 +80,7 @@ checkCIForSlug(Slug) ->
 % An empty list means no active CircleCI project — treat as exempt (no check).
 % A non-empty list means we fetch workflows and evaluate their status.
 handlePipelineItems(Slug, [], _AuthHeader, _UAHeader, _TechDetail) ->
-	io:format("No recent pipelines for ~p — CircleCI project may not be active~n", [Slug]),
+	logger:info("No recent pipelines for ~p — CircleCI project may not be active", [Slug]),
 	#{};
 handlePipelineItems(Slug, [LatestPipeline | OtherPipelines], AuthHeader, UAHeader, TechDetail) ->
 	PipelineNumber = maps:get(<<"number">>, LatestPipeline),

@@ -22,7 +22,7 @@ tryRunChecks(StatePid, Id, Host) ->
 		_ -> ok
 	catch
 		ExceptionClass:Term:StackTrace ->
-			io:format("ExceptionClass: ~p Term: ~p StackTrace: ~p~n", [ExceptionClass, Term, StackTrace])
+			logger:error("ExceptionClass: ~p Term: ~p StackTrace: ~p", [ExceptionClass, Term, StackTrace])
 	end,
 	timer:sleep(timer:seconds(60)),
 	tryRunChecks(StatePid, Id, Host).
@@ -87,7 +87,7 @@ validateChecks(System, Entries) ->
 		case is_map(Value) of
 			true -> Value;
 			false ->
-				io:format("WARNING: ~s has non-map check '~s': ~p~n", [System, Key, Value]),
+				logger:warning("~s has non-map check '~s': ~p", [System, Key, Value]),
 				#{
 					<<"ok">> => false,
 					<<"techDetail">> => list_to_binary(io_lib:format("Invalid check format in /_info (expected a map, got ~p)", [Value]))
@@ -102,7 +102,7 @@ validateMetrics(System, Entries) ->
 		case is_map(Value) of
 			true -> true;
 			false ->
-				io:format("WARNING: ~s has non-map metric '~s': ~p (dropping)~n", [System, Key, Value]),
+				logger:warning("~s has non-map metric '~s': ~p (dropping)", [System, Key, Value]),
 				false
 		end
 	end, Entries).
@@ -133,7 +133,7 @@ parseError(Error) ->
 		timeout ->
 			{unknown, "HTTP Request timed out"};
 		_ ->
-			io:format("Unknown error handled: ~p~n",[Error]),
+			logger:warning("Unknown error handled: ~p", [Error]),
 			{false, "An unknown error occured: "++lists:flatten(io_lib:format("~p",[Error]))}
 	end.
 
@@ -152,7 +152,7 @@ parseConnectionError(Host, Port, IpVersion, ErrorType) ->
 		timeout ->
 			{unknown, "HTTP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
 		_ ->
-			io:format("Unknown connection error handled: ~p (ipv~p connection)~n",[ErrorType, IpVersion]),
+			logger:warning("Unknown connection error handled: ~p (ipv~p connection)", [ErrorType, IpVersion]),
 			{false, lists:flatten(io_lib:format("An unknown connection error occured: ~p (ipv~p connection)",[ErrorType, IpVersion]))}
 	end.
 

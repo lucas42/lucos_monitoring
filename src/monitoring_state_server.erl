@@ -14,7 +14,7 @@ init(Notifiers) ->
 handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 	case Request of
 		{updateSystem, Host, System, Source, SourceChecks, SystemMetrics} ->
-			io:format("Received update for system ~p (Host ~p, Source ~p)~n", [System, Host, Source]),
+			logger:info("Received update for system ~p (Host ~p, Source ~p)", [System, Host, Source]),
 			IsFirstSeen = not maps:is_key(Host, SystemMap),
 			{_, OldSourceChecksMap, OldNormalisedCache, OldMetrics} = maps:get(Host, SystemMap, {nil, #{}, #{}, #{}}),
 			NewSourceChecksMap = maps:put(Source, SourceChecks, OldSourceChecksMap),
@@ -53,7 +53,7 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 			end,
 			NewSuppressionMap = case IsFirstSeen of
 				true ->
-					io:format("Warm-up: skipping alert for ~p on first poll~n", [System]),
+					logger:notice("Warm-up: skipping alert for ~p on first poll", [System]),
 					SuppressionMap;
 				false ->
 					case maps:get(System, SuppressionMap, undefined) of
@@ -66,10 +66,10 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 									FailingNow = failingChecks(NormalisedChecks),
 									case maps:size(FailingNow) > 0 of
 										true ->
-											io:format("Service ~p still unhealthy after deploy — alerting~n", [System]),
+											logger:notice("Service ~p still unhealthy after deploy — alerting", [System]),
 											notify_all(Host, System, FailingNow, false, NewMetrics, Notifiers);
 										false ->
-											io:format("Service ~p healthy after deploy~n", [System])
+											logger:notice("Service ~p healthy after deploy", [System])
 									end,
 									maps:remove(System, SuppressionMap);
 								false ->
@@ -106,7 +106,7 @@ handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers}) ->
 				true ->
 					ExpiryTime = erlang:system_time(second) + 600,
 					NewSuppressionMap = maps:put(System, ExpiryTime, SuppressionMap),
-					io:format("Suppression window opened for ~p~n", [System]),
+					logger:notice("Suppression window opened for ~p", [System]),
 					{reply, ok, {SystemMap, NewSuppressionMap, Notifiers}};
 				false ->
 					{reply, {error, not_found}, {SystemMap, SuppressionMap, Notifiers}}
@@ -119,18 +119,18 @@ handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers}) ->
 				true ->
 					Sources = collect_active_sources(System, SystemMap),
 					NewSuppressionMap = maps:put(System, {pending_verification, Sources}, SuppressionMap),
-					io:format("Suppression window closed for ~p — awaiting verification poll~n", [System]),
+					logger:notice("Suppression window closed for ~p — awaiting verification poll", [System]),
 					% Cascade pending_verification to systems that have checks depending on this system.
 					% Single-hop only: we do not follow dependsOn chains transitively.
 					DependentSystems = find_dependent_systems(System, SystemMap),
 					FinalSuppressionMap = lists:foldl(fun(DepSystem, SM) ->
 						DepSources = collect_active_sources(DepSystem, SystemMap),
-						io:format("Cascading pending_verification to ~p (has checks depending on ~p)~n", [DepSystem, System]),
+						logger:notice("Cascading pending_verification to ~p (has checks depending on ~p)", [DepSystem, System]),
 						maps:put(DepSystem, {pending_verification, DepSources}, SM)
 					end, NewSuppressionMap, DependentSystems),
 					{reply, ok, {SystemMap, FinalSuppressionMap, Notifiers}};
 				false ->
-					io:format("Suppression window closed for ~p (was not suppressed)~n", [System]),
+					logger:notice("Suppression window closed for ~p (was not suppressed)", [System]),
 					{reply, ok, {SystemMap, SuppressionMap, Notifiers}}
 			end
 	end.
@@ -181,8 +181,7 @@ replaceUnknowns(OldChecks, NewChecks, Iterator, CountableKeys) ->
 						true ->
 							maps:put(<<"ok">>, false, IncrementedCheck);
 						false ->
-							DateTime = calendar:system_time_to_rfc3339(erlang:system_time(second)),
-							io:format("[~s] Not sending alert for ~p as there has only been ~p recurring failures so far.~n", [DateTime, Key, NewCount]),
+							logger:notice("Not sending alert for ~p as there has only been ~p recurring failures so far.", [Key, NewCount]),
 							maps:put(<<"ok">>, maps:get(<<"ok">>, OldCheck, unknown), IncrementedCheck)
 					end;
 				_ ->
@@ -254,7 +253,7 @@ notify_all(Host, System, FailingNow, Suppressed, Metrics, Notifiers) ->
 	lists:foreach(fun(NotifyFn) ->
 		try NotifyFn(Host, System, FailingNow, Suppressed, Metrics)
 		catch ExClass:ExReason ->
-			io:format("Notify failed for ~p on ~p: ~p ~p~n", [System, Host, ExClass, ExReason])
+			logger:error("Notify failed for ~p on ~p: ~p ~p", [System, Host, ExClass, ExReason])
 		end
 	end, Notifiers).
 
@@ -268,26 +267,26 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 	case maps:size(AllFailing) > 0 andalso maps:size(FailingNow) =:= 0 of
 		true ->
 			% All failing checks are dependency-suppressed — notify as suppressed (no email alert).
-			io:format("All failing checks on ~p suppressed via dependency: ~p~n", [System, maps:keys(AllFailing)]),
+			logger:notice("All failing checks on ~p suppressed via dependency: ~p", [System, maps:keys(AllFailing)]),
 			notify_all(Host, System, AllFailing, true, SystemMetrics, Notifiers),
 			SuppressionMap;
 		false ->
 			% FailingNow contains only non-dep-suppressed checks. Apply system-level suppression logic.
 			case maps:get(System, SuppressionMap, undefined) of
 				undefined ->
-					io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
+					logger:notice("Checks' state changed for ~p on ~p", [System, Host]),
 					notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
 					SuppressionMap;
 				ExpiryTime ->
 					Now = erlang:system_time(second),
 					case Now < ExpiryTime of
 						true ->
-							io:format("Alert suppressed for ~p during deploy window~n", [System]),
+							logger:notice("Alert suppressed for ~p during deploy window", [System]),
 							notify_all(Host, System, FailingNow, true, SystemMetrics, Notifiers),
 							SuppressionMap;
 						false ->
-							io:format("ERROR: Suppression window for ~p expired without being cleared - deploy may have taken longer than 10 minutes~n", [System]),
-							io:format("Checks' state changed for ~p on ~p~n", [System, Host]),
+							logger:error("Suppression window for ~p expired without being cleared - deploy may have taken longer than 10 minutes", [System]),
+							logger:notice("Checks' state changed for ~p on ~p", [System, Host]),
 							notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
 							maps:remove(System, SuppressionMap)
 					end
