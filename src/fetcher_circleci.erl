@@ -37,9 +37,11 @@ ciRepoLoop(StatePid, RepoId, Host) ->
 	timer:sleep(timer:seconds(60)),
 	ciRepoLoop(StatePid, RepoId, Host).
 
-% CircleCI pipeline check logic. Returns a checks map — empty #{} when the
-% project returns 404 (no CI configured), so that any stale state from a
-% previous transient error is cleared in the state server.
+% CircleCI pipeline check logic. Returns a checks map:
+%   - #{} (empty) when the project has no CI configured (404) — the state
+%     server will prune any stale circleci check from its normalised cache.
+%   - A circleci check with ok => unknown for transport/API errors — this
+%     keeps the existing check state until we hear back reliably.
 checkCIForSlug(Slug) ->
 	TechDetail = <<"Checks status of recent circleCI pipelines">>,
 	Token = os:getenv("CIRCLECI_API_TOKEN", ""),
@@ -53,8 +55,8 @@ checkCIForSlug(Slug) ->
 			PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
 			handlePipelineItems(Slug, maps:get(<<"items">>, PipelineResponse, []), AuthHeader, UAHeader, TechDetail);
 		{ok, {{_Version, 404, _ReasonPhrase}, _Headers, _Body}} ->
-			% No CI configured for this repo. Return empty map so the state
-			% server removes any circleci check left over from a transient error.
+			% No CI configured for this repo — return empty so the state server
+			% can prune any stale circleci check from its normalised cache.
 			#{};
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 			#{<<"circleci">> => #{
@@ -63,11 +65,14 @@ checkCIForSlug(Slug) ->
 				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
 			}};
 		{error, Error} ->
+			% Transport error — return unknown so existing check state is held
+			% until we can reach CircleCI again. This may be a transient network
+			% issue rather than a missing CI project.
 			io:format("CircleCI API request failed for ~p: ~p~n", [Slug, Error]),
 			#{<<"circleci">> => #{
 				<<"ok">> => unknown,
 				<<"techDetail">> => TechDetail,
-				<<"debug">> => <<"Error making request to CircleCI API">>
+				<<"debug">> => list_to_binary(io_lib:format("Transport error contacting CircleCI API: ~p", [Error]))
 			}}
 	end.
 

@@ -19,6 +19,20 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 			{_, OldSourceChecksMap, OldNormalisedCache, OldMetrics} = maps:get(Host, SystemMap, {nil, #{}, #{}, #{}}),
 			NewSourceChecksMap = maps:put(Source, SourceChecks, OldSourceChecksMap),
 			NewMergedChecks = mergeSourceChecks(NewSourceChecksMap),
+			% When a source explicitly reports no checks (e.g. circleci returns 404,
+			% meaning no CI is configured for this repo), remove the keys it previously
+			% contributed from the old normalised cache. This prevents mergeMissingInfoChecks
+			% from resurrecting stale checks (e.g. circleci) when another source
+			% (e.g. info) is temporarily unavailable.
+			% We only prune on empty source updates: if a source reports any checks
+			% (even unknown ones), we leave the old cache intact so that anti-flapiness
+			% logic (mergeMissingInfoChecks) can still hold info checks steady during
+			% a transient /_info blip.
+			OldSourceChecks = maps:get(Source, OldSourceChecksMap, #{}),
+			PrunedOldCache = case maps:size(SourceChecks) of
+				0 -> maps:without(maps:keys(OldSourceChecks), OldNormalisedCache);
+				_ -> OldNormalisedCache
+			end,
 			% Only count checks as "newly unknown" if they were included in the current
 			% source update — not checks carried forward from other sources. This prevents
 			% double-incrementing unknown_count when two sources (e.g. circleci + info)
@@ -29,7 +43,7 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 					_ -> Acc
 				end
 			end, sets:new([{version, 2}]), SourceChecks),
-			NormalisedChecks = normaliseChecks(OldNormalisedCache, NewMergedChecks, CountableKeys),
+			NormalisedChecks = normaliseChecks(PrunedOldCache, NewMergedChecks, CountableKeys),
 			% Only overwrite metrics when the source provides them; sources
 			% without metrics (e.g. circleci) pass #{} and should not wipe
 			% metrics previously stored by the info fetcher.
@@ -578,6 +592,77 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		Result = normaliseChecks(OldChecks, NewChecks, sets:new([{version, 2}])),
 		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result))),
 		?assertEqual(0, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result))).
+
+	% Bug fix: when circleci returns 404 (no CI for this repo), the circleci check must be
+	% removed from the normalised cache — even when info is already unavailable (fetch-info = unknown).
+	% The critical ordering: info must go unknown FIRST, then circleci gets a 404.
+	% Without the fix, mergeMissingInfoChecks would see fetch-info=unknown, do
+	% maps:merge(OldNormalisedCache_with_circleci, NewMergedChecks), and resurrect circleci.
+	% With the fix, the empty SourceChecks triggers removal of circleci from OldNormalisedCache
+	% before mergeMissingInfoChecks runs, so it cannot be resurrected.
+	circleci_404_wipes_check_even_when_info_unavailable_test() ->
+		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}, <<"tls-certificate">> => #{<<"ok">> => true}},
+		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
+		% Start with a system already known and healthy, with both sources reporting
+		ExistingNormalisedCache = #{
+			<<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
+			<<"tls-certificate">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
+			<<"circleci">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}
+		},
+		ExistingState = {
+			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks, circleci => CIChecks}, ExistingNormalisedCache, #{}}},
+			#{},
+			[]
+		},
+		% Info becomes temporarily unavailable FIRST (fetch-info = unknown)
+		{noreply, State2} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", info, #{<<"fetch-info">> => #{<<"ok">> => unknown}, <<"tls-certificate">> => #{<<"ok">> => true}}, #{}},
+			ExistingState
+		),
+		% THEN circleci returns 404 — no CI configured, sends #{}
+		{noreply, State3} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", circleci, #{}, #{}},
+			State2
+		),
+		{SystemMap3, _, _} = State3,
+		{"lucos_foo", _, NormalisedAfterCI404, _} = maps:get("host1.example.com", SystemMap3),
+		% circleci check must be absent — 404 means "no CI", not "CI unknown"
+		?assertNot(maps:is_key(<<"circleci">>, NormalisedAfterCI404),
+			"circleci check must be wiped by 404, not resurrected by mergeMissingInfoChecks").
+
+	% When /_info returns an unknown fetch-info (transient blip), other failing checks from
+	% that same source must be preserved in the normalised cache. If they disappear and then
+	% reappear when info recovers, a duplicate alert fires — we should only alert once.
+	info_blip_preserves_failing_checks_test() ->
+		InfoChecks = #{
+			<<"fetch-info">> => #{<<"ok">> => true},
+			<<"tls-certificate">> => #{<<"ok">> => false},
+			<<"item-count">> => #{<<"ok">> => false}
+		},
+		% Start with a system with two failing checks already in the normalised cache
+		ExistingNormalisedCache = #{
+			<<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
+			<<"tls-certificate">> => #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1},
+			<<"item-count">> => #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1}
+		},
+		ExistingState = {
+			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, ExistingNormalisedCache, #{}}},
+			#{},
+			[]
+		},
+		% /_info has a transient blip: only fetch-info comes back (unknown), tls-certificate
+		% and item-count are absent from the response
+		{noreply, State2} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", info, #{<<"fetch-info">> => #{<<"ok">> => unknown}}, #{}},
+			ExistingState
+		),
+		{SystemMap2, _, _} = State2,
+		{"lucos_foo", _, NormalisedAfterBlip, _} = maps:get("host1.example.com", SystemMap2),
+		% Both failing checks must still be present — they should NOT disappear during the blip
+		?assert(maps:is_key(<<"tls-certificate">>, NormalisedAfterBlip),
+			"tls-certificate must persist during transient /_info blip"),
+		?assert(maps:is_key(<<"item-count">>, NormalisedAfterBlip),
+			"item-count must persist during transient /_info blip").
 
 	% Bug fix: multiple source updates in the same monitoring cycle must not double-increment unknown_count.
 	% Scenario: circleci reports unknown, then info reports ok in the same cycle.
