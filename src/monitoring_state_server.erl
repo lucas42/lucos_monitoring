@@ -96,6 +96,8 @@ handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers}) ->
 				{System, NormalisedCache, Metrics}
 			end, SystemMap),
 			{reply, FlatSystemMap, {SystemMap, SuppressionMap, Notifiers}};
+		{fetch, suppression} ->
+			{reply, SuppressionMap, {SystemMap, SuppressionMap, Notifiers}};
 		{fetch, Host} ->
 			{System, _SourceChecksMap, NormalisedCache, Metrics} = maps:get(Host, SystemMap),
 			{reply, {System, NormalisedCache, Metrics}, {SystemMap, SuppressionMap, Notifiers}};

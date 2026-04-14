@@ -111,13 +111,6 @@ getReasonPhrase(StatusCode) ->
 	end.
 
 
-renderCheckStatus(Health, Link) ->
-	case Link of
-		"" -> atom_to_list(Health);
-		_ ->
-			"<a href=\""++Link++"\" target=\"_blank\">"++atom_to_list(Health)++"</a>"
-	end.
-
 formatStringFromInfo(Key, CheckInfo) ->
 	formatString(Key, maps:get(Key, CheckInfo, <<"">>)).
 
@@ -148,10 +141,30 @@ renderSystemChecks(SystemChecks) ->
 		fun (CheckId, CheckInfo, Html) ->
 			CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
 			Link = binary_to_list(maps:get(<<"link">>, CheckInfo, <<"">>)),
+			UnknownCount = maps:get(<<"unknown_count">>, CheckInfo, 0),
+			FailCount = maps:get(<<"fail_count">>, CheckInfo, 0),
+			FailThreshold = maps:get(<<"failThreshold">>, CheckInfo, 1),
+			IsBuffering = (UnknownCount > 0) orelse (FailCount > 0 andalso FailThreshold > 1),
+			CheckClass = case IsBuffering of
+				true -> "check buffering";
+				false -> getCssClass("check", CheckHealthy)
+			end,
+			StatusText = case IsBuffering of
+				true when UnknownCount > 0 ->
+					"unknown (" ++ integer_to_list(UnknownCount) ++ ")";
+				true ->
+					"failing (" ++ integer_to_list(FailCount) ++ "/" ++ integer_to_list(FailThreshold) ++ ")";
+				false ->
+					atom_to_list(CheckHealthy)
+			end,
+			StatusHtml = case Link of
+				"" -> StatusText;
+				_ -> "<a href=\""++Link++"\" target=\"_blank\">"++StatusText++"</a>"
+			end,
 			CheckHtml = "
-				<tr class=\""++getCssClass("check", CheckHealthy)++"\">
+				<tr class=\""++CheckClass++"\">
 					"++formatString(<<"checkid">>, CheckId)++"
-					<td class=\"status\">"++renderCheckStatus(CheckHealthy, Link)++"</td>
+					<td class=\"status\">"++StatusHtml++"</td>
 					"++formatStringFromInfo(<<"techDetail">>, CheckInfo)
 					++formatStringFromInfo(<<"debug">>, CheckInfo)
 				++"</tr>
@@ -239,7 +252,20 @@ countDupNames(SystemList, CompareSystemName) ->
 			SystemName == CompareSystemName
 		end, SystemList)).
 
-renderAll(SystemMap) ->
+getSuppressionStatus(unknown, _SuppressionMap) -> none;
+getSuppressionStatus(SystemName, SuppressionMap) when is_list(SystemName) ->
+	case maps:get(SystemName, SuppressionMap, undefined) of
+		undefined -> none;
+		{pending_verification, _} -> pending_verification;
+		ExpiryTime when is_integer(ExpiryTime) ->
+			Now = erlang:system_time(second),
+			case Now < ExpiryTime of
+				true -> active;
+				false -> none
+			end
+	end.
+
+renderAll(SystemMap, SuppressionMap) ->
 	SystemList = maps:to_list(SystemMap),
 	SortedSystems = lists:sort(
 		fun ({HostA, {NameA, ChecksA, _}}, {HostB, {NameB, ChecksB, _}}) ->
@@ -250,8 +276,14 @@ renderAll(SystemMap) ->
 	lists:foldl(
 		fun ({Host, {SystemName, SystemChecks, SystemMetrics}}, Output) ->
 			DupNameCount = countDupNames(SystemList, SystemName),
+			SuppressionStatus = getSuppressionStatus(SystemName, SuppressionMap),
+			SuppressionClass = case SuppressionStatus of
+				active -> " suppressed";
+				pending_verification -> " pending-verification";
+				none -> ""
+			end,
 			Output++"
-			<div class=\""++getCssClass("system", systemHealthy(SystemChecks))++"\">
+			<div class=\""++getCssClass("system", systemHealthy(SystemChecks))++SuppressionClass++"\">
 				"++renderSystemHeader(SystemName, Host, DupNameCount)++"
 				"++renderSystemChecks(SystemChecks)++"
 				"++renderSystemMetrics(SystemMetrics)++"
@@ -324,7 +356,8 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 	case Path of
 		"/" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
-			ChecksOutput = renderAll(Systems),
+			SuppressionMap = gen_server:call(StatePid, {fetch, suppression}),
+			ChecksOutput = renderAll(Systems, SuppressionMap),
 			{200, "text/html", "<html>
 				<head>
 					<title>Lucos Monitoring</title>
@@ -357,6 +390,8 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 			.system.healthy h2, tr.check.healthy td.status { background-color: #060; }
 			.system.erroring h2, tr.check.erroring td.status { background-color: #900; }
 			.system.health-unknown h2, tr.check.health-unknown td.status { background-color: #555; }
+			tr.check.buffering td.status { background-color: #880; }
+			.system.suppressed h2, .system.pending-verification h2 { background-color: #880; }
 			.system.healthy .debug { display: none; }
 			tbody .debug { white-space: pre-wrap; }
 			.metrics { margin-top: 2em; }
