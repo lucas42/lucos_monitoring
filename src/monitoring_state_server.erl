@@ -824,7 +824,7 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	% find_dependent_systems: self-reference is excluded
 	find_dependent_systems_excludes_self_test() ->
 		SystemMap = #{
-			"host1.example.com" => {"lucos_eolas", #{info => #{
+			"host1.example.com" => {"eolas.l42.eu", #{info => #{
 				<<"db">> => #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>}
 			}}, #{}, #{}}
 		},
