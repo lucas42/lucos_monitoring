@@ -605,4 +605,30 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		os:unsetenv("CLIENT_KEYS"),
 		?assertEqual(401, StatusCode).
 
+	getSuppressionStatus_not_suppressed_test() ->
+		% System not in suppression map — none
+		?assertEqual(none, getSuppressionStatus("lucos_foo", #{})).
+
+	getSuppressionStatus_pending_verification_test() ->
+		% pending_verification tuple — returns pending_verification
+		PendingSources = sets:from_list([info], [{version, 2}]),
+		SuppressionMap = #{"lucos_foo" => {pending_verification, PendingSources}},
+		?assertEqual(pending_verification, getSuppressionStatus("lucos_foo", SuppressionMap)).
+
+	getSuppressionStatus_active_test() ->
+		% Expiry time in the future — returns active
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{"lucos_foo" => FutureExpiry},
+		?assertEqual(active, getSuppressionStatus("lucos_foo", SuppressionMap)).
+
+	getSuppressionStatus_expired_test() ->
+		% Expiry time in the past — treated as none (window expired without being cleared)
+		PastExpiry = erlang:system_time(second) - 1,
+		SuppressionMap = #{"lucos_foo" => PastExpiry},
+		?assertEqual(none, getSuppressionStatus("lucos_foo", SuppressionMap)).
+
+	getSuppressionStatus_unknown_system_test() ->
+		% System name is the atom 'unknown' — always none regardless of map contents
+		?assertEqual(none, getSuppressionStatus(unknown, #{"unknown" => erlang:system_time(second) + 600})).
+
 -endif.
