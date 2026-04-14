@@ -19,6 +19,12 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 			{_, OldSourceChecksMap, OldNormalisedCache, OldMetrics} = maps:get(Host, SystemMap, {nil, #{}, #{}, #{}}),
 			NewSourceChecksMap = maps:put(Source, SourceChecks, OldSourceChecksMap),
 			NewMergedChecks = mergeSourceChecks(NewSourceChecksMap),
+			% Prune the old normalised cache to only include checks that still exist
+			% in at least one current source. This ensures that when a source stops
+			% reporting a check (e.g. circleci returns 404 for a repo with no CI),
+			% the stale check is not preserved by mergeMissingInfoChecks even when
+			% the info endpoint is temporarily unavailable.
+			PrunedOldCache = maps:with(maps:keys(NewMergedChecks), OldNormalisedCache),
 			% Only count checks as "newly unknown" if they were included in the current
 			% source update — not checks carried forward from other sources. This prevents
 			% double-incrementing unknown_count when two sources (e.g. circleci + info)
@@ -29,7 +35,7 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 					_ -> Acc
 				end
 			end, sets:new([{version, 2}]), SourceChecks),
-			NormalisedChecks = normaliseChecks(OldNormalisedCache, NewMergedChecks, CountableKeys),
+			NormalisedChecks = normaliseChecks(PrunedOldCache, NewMergedChecks, CountableKeys),
 			% Only overwrite metrics when the source provides them; sources
 			% without metrics (e.g. circleci) pass #{} and should not wipe
 			% metrics previously stored by the info fetcher.
@@ -578,6 +584,42 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		Result = normaliseChecks(OldChecks, NewChecks, sets:new([{version, 2}])),
 		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result))),
 		?assertEqual(0, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result))).
+
+	% Bug fix: when circleci returns 404 (no CI for this repo), the circleci check must be
+	% removed from the normalised cache — even when info is also unavailable (fetch-info = unknown).
+	% Previously, mergeMissingInfoChecks would resurrect the stale circleci check from
+	% OldNormalisedCache when fetch-info was unknown, because maps:merge kept old keys not
+	% in NewMergedChecks. The fix: prune OldNormalisedCache to NewMergedChecks keys before
+	% calling normaliseChecks, so stale checks can never be dragged back.
+	circleci_404_wipes_check_even_when_info_unavailable_test() ->
+		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}, <<"tls-certificate">> => #{<<"ok">> => true}},
+		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
+		% Start with a system already known and healthy, with both sources reporting
+		ExistingNormalisedCache = #{
+			<<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
+			<<"tls-certificate">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
+			<<"circleci">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}
+		},
+		ExistingState = {
+			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks, circleci => CIChecks}, ExistingNormalisedCache, #{}}},
+			#{},
+			[]
+		},
+		% circleci returns 404 — no CI configured, sends #{}
+		{noreply, State2} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", circleci, #{}, #{}},
+			ExistingState
+		),
+		% Now info becomes temporarily unavailable (fetch-info = unknown)
+		{noreply, State3} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", info, #{<<"fetch-info">> => #{<<"ok">> => unknown}, <<"tls-certificate">> => #{<<"ok">> => true}}, #{}},
+			State2
+		),
+		{SystemMap3, _, _} = State3,
+		{"lucos_foo", _, NormalisedAfterInfoDown, _} = maps:get("host1.example.com", SystemMap3),
+		% circleci check must be absent — 404 means "no CI", not "CI unknown"
+		?assertNot(maps:is_key(<<"circleci">>, NormalisedAfterInfoDown),
+			"circleci check must be wiped by 404, not resurrected by mergeMissingInfoChecks").
 
 	% Bug fix: multiple source updates in the same monitoring cycle must not double-increment unknown_count.
 	% Scenario: circleci reports unknown, then info reports ok in the same cycle.

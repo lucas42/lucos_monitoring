@@ -37,12 +37,11 @@ ciRepoLoop(StatePid, RepoId, Host) ->
 	timer:sleep(timer:seconds(60)),
 	ciRepoLoop(StatePid, RepoId, Host).
 
-% CircleCI pipeline check logic. Returns a checks map — empty #{} when the
-% project has no CI configured (404) or a transport error occurs, so that any
-% stale state from a previous transient error is cleared in the state server.
-% Transport errors are treated the same as 404 because repos without a CircleCI
-% project may produce httpc transport errors rather than a clean HTTP 404
-% (e.g. due to URL parsing quirks with certain repo name patterns).
+% CircleCI pipeline check logic. Returns a checks map:
+%   - #{} (empty) when the project has no CI configured (404) — the state
+%     server will prune any stale circleci check from its normalised cache.
+%   - A circleci check with ok => unknown for transport/API errors — this
+%     keeps the existing check state until we hear back reliably.
 checkCIForSlug(Slug) ->
 	TechDetail = <<"Checks status of recent circleCI pipelines">>,
 	Token = os:getenv("CIRCLECI_API_TOKEN", ""),
@@ -56,7 +55,8 @@ checkCIForSlug(Slug) ->
 			PipelineResponse = jiffy:decode(PipelineBody, [return_maps]),
 			handlePipelineItems(Slug, maps:get(<<"items">>, PipelineResponse, []), AuthHeader, UAHeader, TechDetail);
 		{ok, {{_Version, 404, _ReasonPhrase}, _Headers, _Body}} ->
-			% No CI configured for this repo.
+			% No CI configured for this repo — return empty so the state server
+			% can prune any stale circleci check from its normalised cache.
 			#{};
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
 			#{<<"circleci">> => #{
@@ -65,12 +65,15 @@ checkCIForSlug(Slug) ->
 				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
 			}};
 		{error, Error} ->
-			% Transport error — treat the same as 404 (no CI configured).
-			% Repos without a CircleCI project sometimes produce transport errors
-			% instead of a clean 404, so we cannot distinguish "no CI" from a
-			% transient network blip here. Returning #{} clears any stale state.
+			% Transport error — return unknown so existing check state is held
+			% until we can reach CircleCI again. This may be a transient network
+			% issue rather than a missing CI project.
 			io:format("CircleCI API request failed for ~p: ~p~n", [Slug, Error]),
-			#{}
+			#{<<"circleci">> => #{
+				<<"ok">> => unknown,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => list_to_binary(io_lib:format("Transport error contacting CircleCI API: ~p", [Error]))
+			}}
 	end.
 
 % Processes the list of pipeline items returned by the CircleCI API.
