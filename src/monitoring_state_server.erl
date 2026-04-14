@@ -769,21 +769,21 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 
 	% is_dependency_suppressed: dependsOn system is not in SuppressionMap → false
 	is_dependency_suppressed_system_not_suppressed_test() ->
-		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>},
+		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>},
 		?assertEqual(false, is_dependency_suppressed(Check, "lucos_time", #{})).
 
 	% is_dependency_suppressed: dependsOn system has an active suppression window → true
 	is_dependency_suppressed_active_suppression_test() ->
-		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>},
+		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>},
 		FutureExpiry = erlang:system_time(second) + 600,
-		SuppressionMap = #{"eolas.l42.eu" => FutureExpiry},
+		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
 		?assertEqual(true, is_dependency_suppressed(Check, "lucos_time", SuppressionMap)).
 
 	% is_dependency_suppressed: dependsOn system is in pending_verification (suppression lifted) → false
 	is_dependency_suppressed_pending_verification_test() ->
-		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>},
+		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>},
 		PendingSources = sets:from_list([info], [{version, 2}]),
-		SuppressionMap = #{"eolas.l42.eu" => {pending_verification, PendingSources}},
+		SuppressionMap = #{"lucos_eolas" => {pending_verification, PendingSources}},
 		?assertEqual(false, is_dependency_suppressed(Check, "lucos_time", SuppressionMap)).
 
 	% is_dependency_suppressed: self-reference guard — dependsOn points to the same system → false
@@ -795,28 +795,28 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 
 	% is_dependency_suppressed: suppression window has expired → false
 	is_dependency_suppressed_expired_test() ->
-		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>},
+		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>},
 		PastExpiry = erlang:system_time(second) - 1,
-		SuppressionMap = #{"eolas.l42.eu" => PastExpiry},
+		SuppressionMap = #{"lucos_eolas" => PastExpiry},
 		?assertEqual(false, is_dependency_suppressed(Check, "lucos_time", SuppressionMap)).
 
 	% find_dependent_systems: returns system IDs with checks declaring dependsOn TargetSystem
 	find_dependent_systems_basic_test() ->
 		SystemMap = #{
 			"host1.example.com" => {"lucos_time", #{info => #{
-				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>}
+				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
 			}}, #{}, #{}},
 			"host2.example.com" => {"lucos_arachne", #{info => #{
 				<<"triplestore">> => #{<<"ok">> => true}
 			}}, #{}, #{}}
 		},
-		?assertEqual(["lucos_time"], find_dependent_systems("eolas.l42.eu", SystemMap)).
+		?assertEqual(["lucos_time"], find_dependent_systems("lucos_eolas", SystemMap)).
 
 	% find_dependent_systems: no systems depend on target → empty list
 	find_dependent_systems_none_test() ->
 		SystemMap = #{
 			"host1.example.com" => {"lucos_time", #{info => #{
-				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>}
+				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
 			}}, #{}, #{}}
 		},
 		?assertEqual([], find_dependent_systems("some.other.system", SystemMap)).
@@ -824,31 +824,31 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	% find_dependent_systems: self-reference is excluded
 	find_dependent_systems_excludes_self_test() ->
 		SystemMap = #{
-			"host1.example.com" => {"eolas.l42.eu", #{info => #{
-				<<"db">> => #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>}
+			"host1.example.com" => {"lucos_eolas", #{info => #{
+				<<"db">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
 			}}, #{}, #{}}
 		},
-		?assertEqual([], find_dependent_systems("eolas.l42.eu", SystemMap)).
+		?assertEqual([], find_dependent_systems("lucos_eolas", SystemMap)).
 
 	% find_dependent_systems: multiple systems can depend on the same target
 	find_dependent_systems_multiple_test() ->
 		SystemMap = #{
 			"host1.example.com" => {"lucos_time", #{info => #{
-				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>}
+				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
 			}}, #{}, #{}},
 			"host2.example.com" => {"lucos_arachne", #{info => #{
-				<<"eolas-data">> => #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>}
+				<<"eolas-data">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
 			}}, #{}, #{}}
 		},
-		Deps = find_dependent_systems("eolas.l42.eu", SystemMap),
+		Deps = find_dependent_systems("lucos_eolas", SystemMap),
 		?assertEqual(["lucos_arachne", "lucos_time"], lists:sort(Deps)).
 
 	% When all failing checks have an active dependsOn suppression, no alert email is sent.
 	state_change_all_dep_suppressed_test() ->
 		FutureExpiry = erlang:system_time(second) + 600,
-		SuppressionMap = #{"eolas.l42.eu" => FutureExpiry},
+		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
 		SystemChecks = #{
-			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>, <<"fail_count">> => 0, <<"unknown_count">> => 0}
+			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>, <<"fail_count">> => 0, <<"unknown_count">> => 0}
 		},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
@@ -863,9 +863,9 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	% When only some checks are dep-suppressed, the non-suppressed ones still alert.
 	state_change_partial_dep_suppressed_test() ->
 		FutureExpiry = erlang:system_time(second) + 600,
-		SuppressionMap = #{"eolas.l42.eu" => FutureExpiry},
+		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
 		SystemChecks = #{
-			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>, <<"fail_count">> => 0, <<"unknown_count">> => 0},
+			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>, <<"fail_count">> => 0, <<"unknown_count">> => 0},
 			<<"db">> => #{<<"ok">> => false, <<"fail_count">> => 0, <<"unknown_count">> => 0}
 		},
 		Notifier = recording_notifier(self()),
@@ -882,21 +882,21 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 
 	% unsuppress cascades pending_verification to systems with checks depending on the unsuppressed system.
 	unsuppress_cascades_pending_verification_test() ->
-		% lucos_time has a check with dependsOn: eolas.l42.eu
-		% eolas.l42.eu is being unsuppressed
-		TimeChecks = #{<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"eolas.l42.eu">>}},
+		% lucos_time has a check with dependsOn: lucos_eolas
+		% lucos_eolas is being unsuppressed
+		TimeChecks = #{<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}},
 		SystemMap = #{
-			"eolas.l42.eu" => {"eolas.l42.eu", #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, #{}},
+			"lucos_eolas" => {"lucos_eolas", #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, #{}},
 			"schedule-tracker.l42.eu" => {"lucos_time", #{info => TimeChecks}, #{}, #{}}
 		},
 		FutureExpiry = erlang:system_time(second) + 600,
-		SuppressionMap = #{"eolas.l42.eu" => FutureExpiry},
+		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
 		State = {SystemMap, SuppressionMap, []},
 		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
-			{unsuppress, "eolas.l42.eu"}, from, State
+			{unsuppress, "lucos_eolas"}, from, State
 		),
-		% eolas.l42.eu itself should be in pending_verification
-		?assertMatch({pending_verification, _}, maps:get("eolas.l42.eu", NewSuppressionMap)),
+		% lucos_eolas itself should be in pending_verification
+		?assertMatch({pending_verification, _}, maps:get("lucos_eolas", NewSuppressionMap)),
 		% lucos_time (dependent) should also be in pending_verification
 		?assertMatch({pending_verification, _}, maps:get("lucos_time", NewSuppressionMap)).
 
