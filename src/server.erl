@@ -406,8 +406,8 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 			.system.health-unknown h2, tr.check.health-unknown td.status { background-color: #555; }
 			tr.check.buffering td.status { background-color: #da9000; }
 			.system.suppressed h2, .system.pending-verification h2 { background-color: #da9000; }
-			.system.suppressed h2:before { content: "🔇"; }
-			.system.pending-verification h2:before { content: "⏳"; }
+			.system.suppressed h2:before { content: \"🔇\"; }
+			.system.pending-verification h2:before { content: \"⏳\"; }
 			.system.healthy .debug { display: none; }
 			tbody .debug { white-space: pre-wrap; }
 			.metrics { margin-top: 2em; }
