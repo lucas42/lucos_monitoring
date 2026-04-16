@@ -20,6 +20,8 @@ RUN curl -s "https://configy.l42.eu/systems" -H "Accept: application/json" > con
 RUN curl -s "https://configy.l42.eu/components" -H "Accept: application/json" > config/ci-components-list.json
 
 FROM debian:trixie
+ARG VERSION
+ENV VERSION=$VERSION
 
 WORKDIR /web
 RUN apt-get update && apt-get install -y ca-certificates wget
