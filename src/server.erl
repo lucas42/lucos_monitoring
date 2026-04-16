@@ -404,8 +404,10 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 			.system.healthy h2, tr.check.healthy td.status { background-color: #060; }
 			.system.erroring h2, tr.check.erroring td.status { background-color: #900; }
 			.system.health-unknown h2, tr.check.health-unknown td.status { background-color: #555; }
-			tr.check.buffering td.status { background-color: #880; }
-			.system.suppressed h2, .system.pending-verification h2 { background-color: #880; }
+			tr.check.buffering td.status { background-color: #da9000; }
+			.system.suppressed h2, .system.pending-verification h2 { background-color: #da9000; }
+			.system.suppressed h2:before { content: "🔇"; }
+			.system.pending-verification h2:before { content: "⏳"; }
 			.system.healthy .debug { display: none; }
 			tbody .debug { white-space: pre-wrap; }
 			.metrics { margin-top: 2em; }
