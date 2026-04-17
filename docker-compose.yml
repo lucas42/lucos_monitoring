@@ -13,7 +13,7 @@ services:
       - LOGANNE_ENDPOINT
       - APP_ORIGIN
       - CLIENT_KEYS
-    image: lucas42/lucos_monitoring
+    image: lucas42/lucos_monitoring:${VERSION:-latest}
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "wget --tries=1 -qO- http://127.0.0.1:${PORT:-8080}/_info"]
