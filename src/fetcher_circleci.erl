@@ -85,23 +85,43 @@ handlePipelineItems(Slug, [], _AuthHeader, _UAHeader, _TechDetail) ->
 handlePipelineItems(Slug, [LatestPipeline | OtherPipelines], AuthHeader, UAHeader, TechDetail) ->
 	PipelineNumber = maps:get(<<"number">>, LatestPipeline),
 	LatestPipelineUrl = "https://app.circleci.com/pipelines/"++Slug++"/"++integer_to_list(PipelineNumber),
-	AllPipelines = [LatestPipeline | OtherPipelines],
-	AllWorkflows = collectAllWorkflows(AllPipelines, AuthHeader, UAHeader),
-	checkWorkflowStatuses(Slug, AllWorkflows, LatestPipelineUrl, TechDetail).
+	case fetchWorkflowsForPipeline(LatestPipeline, AuthHeader, UAHeader) of
+		{error, Reason} ->
+			% If the most recent pipeline's workflow fetch fails, return unknown rather
+			% than letting an older pipeline's workflows surface as the current state.
+			#{<<"circleci">> => #{
+				<<"ok">> => unknown,
+				<<"techDetail">> => TechDetail,
+				<<"debug">> => list_to_binary("Workflow fetch failed for most recent pipeline: " ++ Reason)
+			}};
+		{ok, LatestWorkflows} ->
+			OlderWorkflows = collectAllWorkflows(OtherPipelines, AuthHeader, UAHeader),
+			checkWorkflowStatuses(Slug, LatestWorkflows ++ OlderWorkflows, LatestPipelineUrl, TechDetail)
+	end.
+
+% Fetches workflows for a single pipeline. Returns {ok, Items} on success or
+% {error, Reason} on any HTTP or transport failure.
+fetchWorkflowsForPipeline(Pipeline, AuthHeader, UAHeader) ->
+	PipelineId = binary_to_list(maps:get(<<"id">>, Pipeline)),
+	WorkflowUrl = "https://circleci.com/api/v2/pipeline/"++PipelineId++"/workflow",
+	case httpc:request(get, {WorkflowUrl, [{"Accept","application/json"}, AuthHeader, UAHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
+		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, WorkflowBody}} ->
+			WorkflowResponse = jiffy:decode(WorkflowBody, [return_maps]),
+			{ok, maps:get(<<"items">>, WorkflowResponse, [])};
+		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
+			{error, "HTTP "++integer_to_list(StatusCode)++" "++ReasonPhrase};
+		{error, Error} ->
+			{error, lists:flatten(io_lib:format("~p", [Error]))}
+	end.
 
 % Fetches workflows for each pipeline in the list and concatenates them into a
 % single flat list. Errors fetching a pipeline's workflows are silently skipped
-% so that a transient API failure on one pipeline doesn't hide results from others.
+% so that a transient API failure on one older pipeline doesn't hide results from others.
 collectAllWorkflows([], _AuthHeader, _UAHeader) -> [];
 collectAllWorkflows([Pipeline | Rest], AuthHeader, UAHeader) ->
-	PipelineId = binary_to_list(maps:get(<<"id">>, Pipeline)),
-	WorkflowUrl = "https://circleci.com/api/v2/pipeline/"++PipelineId++"/workflow",
-	Workflows = case httpc:request(get, {WorkflowUrl, [{"Accept","application/json"}, AuthHeader, UAHeader]}, [{timeout, timer:seconds(5)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], []) of
-		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, WorkflowBody}} ->
-			WorkflowResponse = jiffy:decode(WorkflowBody, [return_maps]),
-			maps:get(<<"items">>, WorkflowResponse, []);
-		_ ->
-			[]
+	Workflows = case fetchWorkflowsForPipeline(Pipeline, AuthHeader, UAHeader) of
+		{ok, Items} -> Items;
+		{error, _} -> []
 	end,
 	Workflows ++ collectAllWorkflows(Rest, AuthHeader, UAHeader).
 
@@ -291,5 +311,6 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 		],
 		Result = checkWorkflowStatuses("github/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/github/lucas42/lucos_test/44", <<"Checks status of recent circleCI pipelines">>),
 		?assertMatch(#{<<"circleci">> := #{<<"ok">> := false}}, Result).
+
 
 -endif.
