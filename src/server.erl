@@ -147,11 +147,32 @@ formatString(Key, BinaryValue) ->
 	Value = re:replace(LinkedValue, "href=\"([^\"]*)&ZeroWidthSpace;([^\"]*)\"", "href=\"\\g1\\g2\"",[global, {return, list}]),
 	"<td class=\"formattedString "++binary_to_list(Key)++"\">"++Value++"</td>\r\n".
 
+checkSortPriority(CheckInfo) ->
+	CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
+	UnknownCount = maps:get(<<"unknown_count">>, CheckInfo, 0),
+	FailCount = maps:get(<<"fail_count">>, CheckInfo, 0),
+	FailThreshold = maps:get(<<"failThreshold">>, CheckInfo, 1),
+	IsBuffering = CheckHealthy =/= false andalso
+		((UnknownCount > 0) orelse (FailCount > 0 andalso FailThreshold > 1)),
+	case IsBuffering of
+		true -> 2;
+		false ->
+			case CheckHealthy of
+				false -> 0;
+				true  -> 3;
+				_     -> 1
+			end
+	end.
+
 renderSystemChecks(SystemChecks) ->
+	SortedChecks = lists:sort(
+		fun ({CheckIdA, CheckInfoA}, {CheckIdB, CheckInfoB}) ->
+			{checkSortPriority(CheckInfoA), CheckIdA} =< {checkSortPriority(CheckInfoB), CheckIdB}
+		end, maps:to_list(SystemChecks)),
 	"<div  class=\"system-checks\"><table>
 		<thead><td>Check</td><td>Status</td><td>Technical Detail</td><td class=\"debug\">Debug</td></thead>
-		" ++ maps:fold(
-		fun (CheckId, CheckInfo, Html) ->
+		" ++ lists:foldl(
+		fun ({CheckId, CheckInfo}, Html) ->
 			CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
 			Link = binary_to_list(maps:get(<<"link">>, CheckInfo, <<"">>)),
 			UnknownCount = maps:get(<<"unknown_count">>, CheckInfo, 0),
@@ -184,7 +205,7 @@ renderSystemChecks(SystemChecks) ->
 				++"</tr>
 			",
 			Html++CheckHtml
-		end, "", SystemChecks) ++ "
+		end, "", SortedChecks) ++ "
 	</table></div>".
 
 systemHealthy(SystemChecks) ->
@@ -200,18 +221,21 @@ systemHealthy(SystemChecks) ->
 
 
 renderSystemMetrics(SystemMetrics) ->
-	Html = maps:fold(
-		fun (MetricId, MetricInfo, Html) ->
+	SortedMetrics = lists:sort(
+		fun ({MetricIdA, _}, {MetricIdB, _}) -> MetricIdA =< MetricIdB end,
+		maps:to_list(SystemMetrics)),
+	Html = lists:foldl(
+		fun ({MetricId, MetricInfo}, Html) ->
 			Value = maps:get(<<"value">>, MetricInfo, -1),
 			TechDetail = binary_to_list(maps:get(<<"techDetail">>, MetricInfo, <<"">>)),
-			MetricHtml = io_lib:format("
+			MetricHtml = lists:flatten(io_lib:format("
 				<tr class=\"metric\" title=~p>
 					<td class=\"metricid\">~s</td>
 					<td class=\"value\">~p</td>
 				</tr>
-			", [TechDetail, binary_to_list(MetricId), Value]),
+			", [TechDetail, binary_to_list(MetricId), Value])),
 			Html++MetricHtml
-		end, "", SystemMetrics),
+		end, "", SortedMetrics),
 	case Html of
 		"" -> "";
 		_ ->
@@ -556,6 +580,55 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		?assertEqual(1, maps:get(<<"healthy">>, Summary)),
 		?assertEqual(1, maps:get(<<"erroring">>, Summary)),
 		?assertEqual(1, maps:get(<<"unknown">>, Summary)).
+
+	checkSortPriority_erroring_test() ->
+		?assertEqual(0, checkSortPriority(#{<<"ok">> => false})).
+
+	checkSortPriority_health_unknown_test() ->
+		?assertEqual(1, checkSortPriority(#{<<"ok">> => unknown})).
+
+	checkSortPriority_buffering_unknown_count_test() ->
+		% Healthy overall but has unknown_count > 0 → buffering
+		?assertEqual(2, checkSortPriority(#{<<"ok">> => true, <<"unknown_count">> => 1})).
+
+	checkSortPriority_buffering_fail_count_test() ->
+		% failThreshold > 1 and fail_count > 0 → buffering
+		?assertEqual(2, checkSortPriority(#{<<"ok">> => true, <<"fail_count">> => 1, <<"failThreshold">> => 3})).
+
+	checkSortPriority_healthy_test() ->
+		?assertEqual(3, checkSortPriority(#{<<"ok">> => true})).
+
+	renderSystemChecks_order_test() ->
+		SystemChecks = #{
+			<<"b-healthy">>      => #{<<"ok">> => true},
+			<<"a-erroring">>     => #{<<"ok">> => false},
+			<<"c-unknown">>      => #{<<"ok">> => unknown},
+			<<"d-buffering">>    => #{<<"ok">> => true, <<"unknown_count">> => 1},
+			<<"a-healthy">>      => #{<<"ok">> => true}
+		},
+		Html = renderSystemChecks(SystemChecks),
+		PosErroring  = string:str(Html, "a-erroring"),
+		PosUnknown   = string:str(Html, "c-unknown"),
+		PosBuffering = string:str(Html, "d-buffering"),
+		PosAHealthy  = string:str(Html, "a-healthy"),
+		PosBHealthy  = string:str(Html, "b-healthy"),
+		?assert(PosErroring  < PosUnknown,   "erroring must come before health-unknown"),
+		?assert(PosUnknown   < PosBuffering, "health-unknown must come before buffering"),
+		?assert(PosBuffering < PosAHealthy,  "buffering must come before healthy"),
+		?assert(PosAHealthy  < PosBHealthy,  "healthy checks must be sorted alphabetically").
+
+	renderSystemMetrics_order_test() ->
+		SystemMetrics = #{
+			<<"z-metric">> => #{<<"value">> => 1},
+			<<"a-metric">> => #{<<"value">> => 2},
+			<<"m-metric">> => #{<<"value">> => 3}
+		},
+		Html = renderSystemMetrics(SystemMetrics),
+		PosA = string:str(Html, "a-metric"),
+		PosM = string:str(Html, "m-metric"),
+		PosZ = string:str(Html, "z-metric"),
+		?assert(PosA < PosM, "a-metric must come before m-metric"),
+		?assert(PosM < PosZ, "m-metric must come before z-metric").
 
 	htmlEscape_no_special_chars_test() ->
 		?assertEqual("hello world", htmlEscape("hello world")).
