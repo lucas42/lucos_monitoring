@@ -228,12 +228,12 @@ renderSystemMetrics(SystemMetrics) ->
 		fun ({MetricId, MetricInfo}, Html) ->
 			Value = maps:get(<<"value">>, MetricInfo, -1),
 			TechDetail = binary_to_list(maps:get(<<"techDetail">>, MetricInfo, <<"">>)),
-			MetricHtml = io_lib:format("
+			MetricHtml = lists:flatten(io_lib:format("
 				<tr class=\"metric\" title=~p>
 					<td class=\"metricid\">~s</td>
 					<td class=\"value\">~p</td>
 				</tr>
-			", [TechDetail, binary_to_list(MetricId), Value]),
+			", [TechDetail, binary_to_list(MetricId), Value])),
 			Html++MetricHtml
 		end, "", SortedMetrics),
 	case Html of
