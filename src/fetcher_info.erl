@@ -30,9 +30,12 @@ tryRunChecks(StatePid, Id, Host) ->
 runChecks(StatePid, Id, Host) ->
 	{TLSCheck} = checkTlsExpiry(Host),
 	{InfoCheck, _System, Checks, Metrics} = fetchInfo(Host),
+	% Option B: require 2 consecutive failures before alerting on the fetcher's own synthetic
+	% checks. These are the checks most likely to see transient blips during deploys or restarts,
+	% so one extra poll of buffer meaningfully reduces false-positive alert volume.
 	AllChecks = maps:merge(#{
-		<<"fetch-info">> => InfoCheck,
-		<<"tls-certificate">> => TLSCheck
+		<<"fetch-info">> => maps:put(<<"failThreshold">>, 2, InfoCheck),
+		<<"tls-certificate">> => maps:put(<<"failThreshold">>, 2, TLSCheck)
 	}, Checks),
 	ok = gen_server:cast(StatePid, {updateSystem, Host, Id, info, AllChecks, Metrics}).
 
@@ -129,7 +132,9 @@ parseError(Error) ->
 			end,
 			{Status, Debug};
 		socket_closed_remotely ->
-			{false, "Socket closed remotely"};
+			% Transient: remote closed the connection (e.g. mid-stream during a container restart).
+			% Treated as unknown rather than false so flap-suppression can absorb brief blips.
+			{unknown, "Socket closed remotely"};
 		timeout ->
 			{unknown, "HTTP Request timed out"};
 		_ ->
@@ -144,9 +149,13 @@ parseConnectionError(Host, Port, IpVersion, ErrorType) ->
 		ehostunreach ->
 			{unknown, "No route to host "++Host++" over ipv"++integer_to_list(IpVersion)};
 		econnrefused ->
-			{false, "Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
+			% Transient: server briefly not listening (e.g. nginx reload, container restart).
+			% Treated as unknown rather than false so flap-suppression can absorb brief blips.
+			{unknown, "Failed to establish a TCP connection to host "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
 		closed ->
-			{false, "TCP connection was closed connecting to host "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
+			% Transient: connection dropped mid-stream during a restart.
+			% Treated as unknown rather than false so flap-suppression can absorb brief blips.
+			{unknown, "TCP connection was closed connecting to host "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
 		etimedout ->
 			{unknown, "TCP connection timed out whilst connecting to "++Host++" on port "++integer_to_list(Port)++" over ipv"++integer_to_list(IpVersion)};
 		timeout ->
@@ -267,10 +276,10 @@ fetchInfo(Host) ->
 		?assertNot(maps:is_key(<<"bad">>, Metrics)).
 
 	parseError_test() ->
-		% IPv4+IPv6: IPv4 HTTP timeout (unknown) + IPv6 connection refused (false) → false
-		?assertEqual({false, "HTTP connection timed out whilst connecting to example.l42.eu on port 443 over ipv4; Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],econnrefused},{inet,[inet],timeout}]})),
-		% IPv4 only: TCP connection closed
-		?assertEqual({false, "TCP connection was closed connecting to host example.l42.eu on port 1234 over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",1234}}, {inet,[inet],closed}]})),
+		% IPv4+IPv6: IPv4 HTTP timeout (unknown) + IPv6 connection refused (now unknown) → unknown
+		?assertEqual({unknown, "HTTP connection timed out whilst connecting to example.l42.eu on port 443 over ipv4; Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],econnrefused},{inet,[inet],timeout}]})),
+		% IPv4 only: TCP connection closed — reclassified as unknown (transient)
+		?assertEqual({unknown, "TCP connection was closed connecting to host example.l42.eu on port 1234 over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",1234}}, {inet,[inet],closed}]})),
 		% IPv6 only: DNS failure
 		?assertEqual({unknown, "DNS failure when trying to resolve ipv6 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",1234}}, {inet6,[inet6],nxdomain}]})),
 		% IPv6 only: unknown connection error type
@@ -279,8 +288,8 @@ fetchInfo(Host) ->
 		?assertEqual({false, "An unknown error occured: {not_a_real_error}"}, parseError({not_a_real_error})).
 
 	parseError_topLevel_test() ->
-		% The remote end closed the socket unexpectedly
-		?assertEqual({false, "Socket closed remotely"}, parseError(socket_closed_remotely)),
+		% The remote end closed the socket unexpectedly — reclassified as unknown (transient)
+		?assertEqual({unknown, "Socket closed remotely"}, parseError(socket_closed_remotely)),
 		% The overall HTTP request timed out at the httpc level (distinct from connection-level timeout)
 		?assertEqual({unknown, "HTTP Request timed out"}, parseError(timeout)).
 
@@ -289,8 +298,8 @@ fetchInfo(Host) ->
 		?assertEqual({unknown, "DNS failure when trying to resolve ipv4 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],nxdomain}]})),
 		% No route to host over IPv4
 		?assertEqual({unknown, "No route to host example.l42.eu over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],ehostunreach}]})),
-		% TCP connection refused over IPv4
-		?assertEqual({false, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],econnrefused}]})),
+		% TCP connection refused over IPv4 — reclassified as unknown (transient: server briefly not listening)
+		?assertEqual({unknown, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],econnrefused}]})),
 		% TCP connection timed out over IPv4
 		?assertEqual({unknown, "TCP connection timed out whilst connecting to example.l42.eu on port 443 over ipv4"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet,[inet],etimedout}]})),
 		% HTTP-level connection timeout over IPv4
@@ -303,21 +312,25 @@ fetchInfo(Host) ->
 	parseError_ipv6_test() ->
 		% No route to host over IPv6
 		?assertEqual({unknown, "No route to host example.l42.eu over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],ehostunreach}]})),
-		% TCP connection refused over IPv6
-		?assertEqual({false, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],econnrefused}]})),
+		% TCP connection refused over IPv6 — reclassified as unknown (transient: server briefly not listening)
+		?assertEqual({unknown, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],econnrefused}]})),
 		% TCP connection timed out over IPv6
 		?assertEqual({unknown, "TCP connection timed out whilst connecting to example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],etimedout}]})),
 		% HTTP-level connection timeout over IPv6
 		?assertEqual({unknown, "HTTP connection timed out whilst connecting to example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],timeout}]})),
-		% TCP connection was closed over IPv6
-		?assertEqual({false, "TCP connection was closed connecting to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],closed}]})).
+		% TCP connection was closed over IPv6 — reclassified as unknown (transient: mid-stream during restart)
+		?assertEqual({unknown, "TCP connection was closed connecting to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],closed}]})).
 
 	parseError_combined_test() ->
 		% Both IPv4 and IPv6 fail with DNS errors (both unknown → overall unknown)
 		?assertEqual({unknown, "DNS failure when trying to resolve ipv4 address for example.l42.eu; DNS failure when trying to resolve ipv6 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],nxdomain},{inet,[inet],nxdomain}]})),
-		% Both IPv4 and IPv6 connection refused (both false → overall false)
-		?assertEqual({false, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv4; Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],econnrefused},{inet,[inet],econnrefused}]})),
-		% IPv4 connection refused (false) + IPv6 DNS failure (unknown) → overall false
-		?assertEqual({false, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv4; DNS failure when trying to resolve ipv6 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],nxdomain},{inet,[inet],econnrefused}]})).
+		% Both IPv4 and IPv6 connection refused — both now unknown → overall unknown
+		?assertEqual({unknown, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv4; Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv6"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],econnrefused},{inet,[inet],econnrefused}]})),
+		% IPv4 connection refused (now unknown) + IPv6 DNS failure (unknown) → overall unknown
+		?assertEqual({unknown, "Failed to establish a TCP connection to host example.l42.eu on port 443 over ipv4; DNS failure when trying to resolve ipv6 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],nxdomain},{inet,[inet],econnrefused}]})),
+		% IPv4 definitive failure (unknown error type → false) + IPv6 DNS failure (unknown) → overall false
+		?assertEqual({false, "An unknown connection error occured: not_a_real_error (ipv4 connection); DNS failure when trying to resolve ipv6 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],nxdomain},{inet,[inet],not_a_real_error}]})),
+		% Both sides definitive failure (unknown error type → false on each) → overall false
+		?assertEqual({false, "An unknown connection error occured: not_a_real_error (ipv4 connection); An unknown connection error occured: not_a_real_error (ipv6 connection)"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],not_a_real_error},{inet,[inet],not_a_real_error}]})).
 
 -endif.
