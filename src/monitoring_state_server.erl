@@ -791,6 +791,12 @@ buildMetricOutput(MetricId, Metric) ->
 
 	% Bug fix: when circleci returns 404 (no CI for this repo), the circleci check must be
 	% removed from the normalised cache — even when info is already unavailable (fetch-info = unknown).
+	%
+	% The ordering — info blip first, THEN circleci 404 — is what makes this test non-trivial.
+	% When fetch-info is unknown, mergeMissingInfoChecks merges old checks on top of the incoming
+	% ones. Without the "prune-on-empty-source" logic, the 404's empty map would be treated as
+	% "no update this cycle", and the merge would silently resurrect the stale circleci check
+	% from the old normalised cache. This test regresses that specific scenario.
 	circleci_404_wipes_check_even_when_info_unavailable_test() ->
 		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}, <<"tls-certificate">> => #{<<"ok">> => true}},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
@@ -805,12 +811,15 @@ buildMetricOutput(MetricId, Metric) ->
 			#{},
 			[]
 		},
-		% Info becomes temporarily unavailable FIRST (fetch-info = unknown)
+		% Info becomes temporarily unavailable FIRST (fetch-info = unknown) — this activates
+		% mergeMissingInfoChecks, which would resurrect old checks if the pruning logic is absent.
 		{noreply, State2} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, #{<<"fetch-info">> => #{<<"ok">> => unknown}, <<"tls-certificate">> => #{<<"ok">> => true}}, #{}},
 			ExistingState
 		),
-		% THEN circleci returns 404 — no CI configured, sends #{}
+		% THEN circleci returns 404 — no CI configured, sends #{}.
+		% The pruning step must remove the old circleci check from the cache BEFORE the merge
+		% runs, so mergeMissingInfoChecks cannot put it back.
 		{noreply, State3} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, #{}, #{}},
 			State2
@@ -823,13 +832,20 @@ buildMetricOutput(MetricId, Metric) ->
 
 	% When /_info returns an unknown fetch-info (transient blip), other failing checks from
 	% that same source must be preserved in the normalised cache.
+	%
+	% Without mergeMissingInfoChecks, a single /_info blip would silently clear all failing
+	% checks from the normalised cache (because the blip's payload only contains fetch-info).
+	% That would produce a false recovery alert on the blip poll, followed by a re-alert on
+	% the next successful poll — doubling the alert noise for a single transient event.
 	info_blip_preserves_failing_checks_test() ->
 		InfoChecks = #{
 			<<"fetch-info">> => #{<<"ok">> => true},
 			<<"tls-certificate">> => #{<<"ok">> => false},
 			<<"item-count">> => #{<<"ok">> => false}
 		},
-		% Start with a system with two failing checks already in the normalised cache
+		% Start with a system with two failing checks already in the normalised cache.
+		% The blip update will only carry fetch-info — without the merge logic, tls-certificate
+		% and item-count would disappear from the cache.
 		ExistingNormalisedCache = #{
 			<<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
 			<<"tls-certificate">> => #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1},
@@ -852,6 +868,12 @@ buildMetricOutput(MetricId, Metric) ->
 			"item-count must persist during transient /_info blip").
 
 	% Bug fix: multiple source updates in the same monitoring cycle must not double-increment unknown_count.
+	%
+	% When circleci reports unknown, that check is merged into the shared view.  On the next
+	% poll, when info reports (even with no change), the circleci check is still present in the
+	% merged view as unknown.  Without the CountableKeys set, info's update would treat the
+	% carried-forward circleci check as a "new" unknown and increment its counter a second time —
+	% reaching count=2 in one cycle instead of two, and potentially triggering a premature alert.
 	multiple_sources_same_cycle_no_double_increment_test() ->
 		Notifiers = [],
 		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
@@ -1041,6 +1063,15 @@ buildMetricOutput(MetricId, Metric) ->
 	compute_check_status_failing_at_threshold_test() ->
 		Check = #{<<"ok">> => false, <<"fail_count">> => 1, <<"failThreshold">> => 1},
 		?assertEqual(failing, computeCheckStatus(Check)).
+
+	% computeCheckStatus: ok=unknown with unknown_count>0 → buffering.
+	% This is the case where replaceUnknowns has held the previous ok value as unknown
+	% (e.g. the check was never observed healthy) and the counter hasn't hit the threshold yet.
+	% Without this case, a check stuck in unknown with an incrementing counter would appear
+	% as plain "unknown" in the UI, hiding the fact that it is actively failing its poll.
+	compute_check_status_buffering_unknown_ok_test() ->
+		Check = #{<<"ok">> => unknown, <<"unknown_count">> => 1, <<"fail_count">> => 0},
+		?assertEqual(buffering, computeCheckStatus(Check)).
 
 	% computeCheckStatusText: healthy
 	compute_check_status_text_healthy_test() ->
