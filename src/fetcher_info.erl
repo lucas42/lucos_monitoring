@@ -1,33 +1,38 @@
 -module(fetcher_info).
--export([start/1, tryRunChecks/3]).
+-export([start/1, tryRunChecks/4]).
 -include_lib("eunit/include/eunit.hrl").
 
 start(StatePid) ->
 	{ok, _} = application:ensure_all_started([ssl, inets]),
 	{ok, SystemsBody} = file:read_file("./config/info-systems-list.json"),
 	{ok, HostsBody} = file:read_file("./config/info-hosts-list.json"),
-	Systems = parseInfoSystems(binary_to_list(SystemsBody)) ++
-	          parseInfoSystems(binary_to_list(HostsBody)),
-	lists:foreach(fun({Id, Host}) ->
-		spawn(?MODULE, tryRunChecks, [StatePid, Id, Host])
+	% info-systems-list.json entries are systems; info-hosts-list.json entries are hosts.
+	% DefaultType is used when the JSON entry has no "type" field.
+	Systems = parseInfoSystems(binary_to_list(SystemsBody), system) ++
+	          parseInfoSystems(binary_to_list(HostsBody), host),
+	lists:foreach(fun({Id, Type, Host}) ->
+		spawn(?MODULE, tryRunChecks, [StatePid, Id, Type, Host])
 	end, Systems).
 
-parseInfoSystems(Body) ->
+% Parses a JSON array of system/host entries. DefaultType is the atom to use
+% when an entry has no "type" field. Returns a list of {Id, Type, Host} triples.
+parseInfoSystems(Body, DefaultType) ->
 	Entries = jiffy:decode(Body, [return_maps]),
 	[{binary_to_list(maps:get(<<"id">>, Entry)),
+	  binary_to_atom(maps:get(<<"type">>, Entry, atom_to_binary(DefaultType)), utf8),
 	  binary_to_list(maps:get(<<"domain">>, Entry))} || Entry <- Entries].
 
-tryRunChecks(StatePid, Id, Host) ->
-	try runChecks(StatePid, Id, Host) of
+tryRunChecks(StatePid, Id, Type, Host) ->
+	try runChecks(StatePid, Id, Type, Host) of
 		_ -> ok
 	catch
 		ExceptionClass:Term:StackTrace ->
 			logger:error("ExceptionClass: ~p Term: ~p StackTrace: ~p", [ExceptionClass, Term, StackTrace])
 	end,
 	timer:sleep(timer:seconds(60)),
-	tryRunChecks(StatePid, Id, Host).
+	tryRunChecks(StatePid, Id, Type, Host).
 
-runChecks(StatePid, Id, Host) ->
+runChecks(StatePid, Id, Type, Host) ->
 	{TLSCheck} = checkTlsExpiry(Host),
 	{InfoCheck, _System, Checks, Metrics} = fetchInfo(Host),
 	% Option B: require 2 consecutive failures before alerting on the fetcher's own synthetic
@@ -37,7 +42,7 @@ runChecks(StatePid, Id, Host) ->
 		<<"fetch-info">> => maps:put(<<"failThreshold">>, 2, InfoCheck),
 		<<"tls-certificate">> => maps:put(<<"failThreshold">>, 2, TLSCheck)
 	}, Checks),
-	ok = gen_server:cast(StatePid, {updateSystem, Host, Id, info, AllChecks, Metrics}).
+	ok = gen_server:cast(StatePid, {updateSystem, Host, Id, Type, info, AllChecks, Metrics}).
 
 checkTlsExpiry(Host) ->
 	TechDetail = <<"Checks whether the TLS Certificate is valid and not about to expire">>,
@@ -206,11 +211,22 @@ fetchInfo(Host) ->
 -ifdef(TEST).
 	parseInfoSystems_test() ->
 		% Both id and domain are always present — id becomes the system identifier, domain the host.
+		% DefaultType is used when no "type" field is present in the entry.
 		Body = "[{\"id\":\"lucos_foo\",\"domain\":\"foo.l42.eu\"},{\"id\":\"lucos_bar\",\"domain\":\"bar.l42.eu\"}]",
-		?assertEqual([{"lucos_foo", "foo.l42.eu"}, {"lucos_bar", "bar.l42.eu"}], parseInfoSystems(Body)).
+		?assertEqual([{"lucos_foo", system, "foo.l42.eu"}, {"lucos_bar", system, "bar.l42.eu"}], parseInfoSystems(Body, system)).
+
+	parseInfoSystems_default_type_host_test() ->
+		% DefaultType host: entries from info-hosts-list.json use the host atom.
+		Body = "[{\"id\":\"lucos_host\",\"domain\":\"host.l42.eu\"}]",
+		?assertEqual([{"lucos_host", host, "host.l42.eu"}], parseInfoSystems(Body, host)).
+
+	parseInfoSystems_explicit_type_overrides_default_test() ->
+		% When an entry has an explicit "type" field, it overrides DefaultType.
+		Body = "[{\"id\":\"lucos_comp\",\"domain\":\"comp.l42.eu\",\"type\":\"component\"}]",
+		?assertEqual([{"lucos_comp", component, "comp.l42.eu"}], parseInfoSystems(Body, system)).
 
 	parseInfoSystems_empty_test() ->
-		?assertEqual([], parseInfoSystems("[]")).
+		?assertEqual([], parseInfoSystems("[]", system)).
 
 	parseInfo_test() ->
 		% Basic: system field only, no checks/metrics
