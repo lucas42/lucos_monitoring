@@ -95,7 +95,7 @@ The state server computes system `status` from the constituent checks and the su
 5. Any check is `buffering` → `buffering`
 6. Otherwise → `healthy`
 
-A system with no checks at all is `unknown` — the absence of a signal is not a positive signal.
+A system with no checks at all is `healthy` — such systems (e.g. `.github`, `vue-leaflet-antimeridian`) will always have zero checks and should not appear as noise at the top of the monitoring page. The absence of checks is not a signal of failure.
 
 When a system is `suppressed` or `pending_verification`, the status of individual checks is unaffected: a failing check inside a suppressed system still reports `<<"status">> => failing`. The system header reflects the suppression, the check rows reflect the underlying truth.
 

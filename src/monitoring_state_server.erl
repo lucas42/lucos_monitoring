@@ -400,28 +400,26 @@ computeSystemStatus(SystemId, NormalisedCache, SuppressionMap) ->
 
 % Aggregates check statuses into a system status (priority list steps 3–7 from ADR-0001).
 % Failing checks whose dependsOn system is actively suppressed are excluded from step 3.
-% A system with no checks is unknown (absence of a signal is not a positive signal).
+% A system with no checks (e.g. .github, vue-leaflet-antimeridian) is healthy — such
+% systems will always have zero checks and should not appear as noise at the top of the
+% monitoring page. The absence of checks is not a signal of failure.
 aggregateCheckStatuses(SystemId, NormalisedCache, SuppressionMap) ->
-	case maps:size(NormalisedCache) of
-		0 -> unknown;
-		_ ->
-			{HasFailing, HasUnknown, HasBuffering} = maps:fold(fun(_, Check, {F, U, B}) ->
-				Status = maps:get(<<"status">>, Check, unknown),
-				IsDepSuppressed = is_dependency_suppressed(Check, SystemId, SuppressionMap),
-				case {Status, IsDepSuppressed} of
-					{failing, true}  -> {F, U, B};   % dep-suppressed failing: exclude from system failing
-					{failing, false} -> {true, U, B};
-					{unknown, _}     -> {F, true, B};
-					{buffering, _}   -> {F, U, true};
-					_                -> {F, U, B}
-				end
-			end, {false, false, false}, NormalisedCache),
-			if
-				HasFailing   -> failing;
-				HasUnknown   -> unknown;
-				HasBuffering -> buffering;
-				true         -> healthy
-			end
+	{HasFailing, HasUnknown, HasBuffering} = maps:fold(fun(_, Check, {F, U, B}) ->
+		Status = maps:get(<<"status">>, Check, unknown),
+		IsDepSuppressed = is_dependency_suppressed(Check, SystemId, SuppressionMap),
+		case {Status, IsDepSuppressed} of
+			{failing, true}  -> {F, U, B};   % dep-suppressed failing: exclude from system failing
+			{failing, false} -> {true, U, B};
+			{unknown, _}     -> {F, true, B};
+			{buffering, _}   -> {F, U, true};
+			_                -> {F, U, B}
+		end
+	end, {false, false, false}, NormalisedCache),
+	if
+		HasFailing   -> failing;
+		HasUnknown   -> unknown;
+		HasBuffering -> buffering;
+		true         -> healthy
 	end.
 
 % Builds the system output map returned by {fetch, all}.
@@ -1095,9 +1093,12 @@ buildMetricOutput(MetricId, Metric) ->
 		Check = #{<<"unknown_count">> => 0, <<"fail_count">> => 1, <<"failThreshold">> => 3},
 		?assertEqual(<<"failing (1/3)">>, computeCheckStatusText(buffering, Check)).
 
-	% computeSystemStatus: no checks → unknown
+	% computeSystemStatus: no checks → healthy.
+	% Systems like .github or vue-leaflet-antimeridian have no checks and will always be in
+	% this state. Treating them as unknown would pull them to the top of the monitoring page
+	% as permanent noise. They should be healthy and sort to the bottom.
 	compute_system_status_no_checks_test() ->
-		?assertEqual(unknown, computeSystemStatus("lucos_foo", #{}, #{})).
+		?assertEqual(healthy, computeSystemStatus("lucos_foo", #{}, #{})).
 
 	% computeSystemStatus: all healthy checks → healthy
 	compute_system_status_healthy_test() ->
