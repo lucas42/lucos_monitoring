@@ -13,10 +13,10 @@ init(Notifiers) ->
 
 handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 	case Request of
-		{updateSystem, Host, System, Source, SourceChecks, SystemMetrics} ->
+		{updateSystem, Host, System, SystemType, Source, SourceChecks, SystemMetrics} ->
 			logger:info("Received update for system ~p (Host ~p, Source ~p)", [System, Host, Source]),
 			IsFirstSeen = not maps:is_key(Host, SystemMap),
-			{_, OldSourceChecksMap, OldNormalisedCache, OldMetrics} = maps:get(Host, SystemMap, {nil, #{}, #{}, #{}}),
+			{_, _, OldSourceChecksMap, OldNormalisedCache, OldMetrics} = maps:get(Host, SystemMap, {nil, system, #{}, #{}, #{}}),
 			NewSourceChecksMap = maps:put(Source, SourceChecks, OldSourceChecksMap),
 			NewMergedChecks = mergeSourceChecks(NewSourceChecksMap),
 			% When a source explicitly reports no checks (e.g. circleci returns 404,
@@ -84,23 +84,21 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers}) ->
 							end
 					end
 			end,
-			NewSystemMap = maps:put(Host, {System, NewSourceChecksMap, NormalisedChecks, NewMetrics}, SystemMap),
+			AnnotatedChecks = annotateCheckStatuses(NormalisedChecks),
+			NewSystemMap = maps:put(Host, {System, SystemType, NewSourceChecksMap, AnnotatedChecks, NewMetrics}, SystemMap),
 			{noreply, {NewSystemMap, NewSuppressionMap, Notifiers}}
 	end.
 
 handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers}) ->
 	case Request of
 		{fetch, all} ->
-			% Callers expect {System, FlatChecks, Metrics} — return the normalised cache directly
-			FlatSystemMap = maps:map(fun(_, {System, _SourceChecksMap, NormalisedCache, Metrics}) ->
-				{System, NormalisedCache, Metrics}
-			end, SystemMap),
-			{reply, FlatSystemMap, {SystemMap, SuppressionMap, Notifiers}};
-		{fetch, suppression} ->
-			{reply, SuppressionMap, {SystemMap, SuppressionMap, Notifiers}};
-		{fetch, Host} ->
-			{System, _SourceChecksMap, NormalisedCache, Metrics} = maps:get(Host, SystemMap),
-			{reply, {System, NormalisedCache, Metrics}, {SystemMap, SuppressionMap, Notifiers}};
+			% Return a list of system maps with pre-computed status atoms.
+			% Each system map includes <<"host">> (not in the ADR spec but needed by the
+			% view layer to build /_info URLs) alongside id, type, name, checks, metrics, status.
+			SystemList = maps:fold(fun(Host, {SystemId, SystemType, _SourceChecksMap, NormalisedCache, Metrics}, Acc) ->
+				[buildSystemOutput(Host, SystemId, SystemType, NormalisedCache, Metrics, SuppressionMap) | Acc]
+			end, [], SystemMap),
+			{reply, SystemList, {SystemMap, SuppressionMap, Notifiers}};
 		{suppress, System} ->
 			case systemExists(System, SystemMap) of
 				true ->
@@ -147,7 +145,7 @@ mergeSourceChecks(SourceChecksMap) ->
 
 systemExists(System, SystemMap) ->
 	maps:fold(fun
-		(_, {S, _, _, _}, _) when S =:= System -> true;
+		(_, {S, _, _, _, _}, _) when S =:= System -> true;
 		(_, _, Acc) -> Acc
 	end, false, SystemMap).
 
@@ -155,7 +153,7 @@ systemExists(System, SystemMap) ->
 % across all hosts. Used to build the PendingSources set on unsuppress.
 collect_active_sources(System, SystemMap) ->
 	maps:fold(fun
-		(_, {S, SourceChecksMap, _, _}, Acc) when S =:= System ->
+		(_, {S, _, SourceChecksMap, _, _}, Acc) when S =:= System ->
 			sets:union(Acc, sets:from_list(maps:keys(SourceChecksMap)));
 		(_, _, Acc) -> Acc
 	end, sets:new([{version, 2}]), SystemMap).
@@ -321,7 +319,7 @@ is_dependency_suppressed(Check, CurrentSystem, SuppressionMap) ->
 % Excludes TargetSystem itself (self-reference guard).
 find_dependent_systems(TargetSystem, SystemMap) ->
 	TargetBin = list_to_binary(TargetSystem),
-	lists:usort(maps:fold(fun(_Host, {System, SourceChecksMap, _, _}, Acc) ->
+	lists:usort(maps:fold(fun(_Host, {System, _SystemType, SourceChecksMap, _, _}, Acc) ->
 		case System =:= TargetSystem of
 			true -> Acc;  % Guard: skip self
 			false ->
@@ -335,6 +333,136 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 				end
 		end
 	end, [], SystemMap)).
+
+% Computes the status atom for a single normalised check.
+% Mapping (per ADR-0001):
+%   ok=false                                              → failing
+%   ok=true|unknown with unknown_count>0 or fail buffering → buffering
+%   ok=unknown, no counters                               → unknown
+%   ok=true, no counters                                  → healthy
+computeCheckStatus(Check) ->
+	Ok = maps:get(<<"ok">>, Check, unknown),
+	case Ok of
+		false -> failing;
+		_ ->
+			UnknownCount = maps:get(<<"unknown_count">>, Check, 0),
+			FailCount = maps:get(<<"fail_count">>, Check, 0),
+			FailThreshold = maps:get(<<"failThreshold">>, Check, 1),
+			IsBuffering = (UnknownCount > 0) orelse (FailCount > 0 andalso FailThreshold > 1),
+			case IsBuffering of
+				true -> buffering;
+				false ->
+					case Ok of
+						true -> healthy;
+						_ -> unknown
+					end
+			end
+	end.
+
+% Computes the human-readable status text string for a single check.
+computeCheckStatusText(Status, Check) ->
+	case Status of
+		buffering ->
+			UnknownCount = maps:get(<<"unknown_count">>, Check, 0),
+			case UnknownCount > 0 of
+				true ->
+					list_to_binary("unknown (" ++ integer_to_list(UnknownCount) ++ ")");
+				false ->
+					FailCount = maps:get(<<"fail_count">>, Check, 0),
+					FailThreshold = maps:get(<<"failThreshold">>, Check, 1),
+					list_to_binary("failing (" ++ integer_to_list(FailCount) ++ "/" ++ integer_to_list(FailThreshold) ++ ")")
+			end;
+		Other ->
+			atom_to_binary(Other, utf8)
+	end.
+
+% Adds <<"status">> and <<"statusText">> fields to every check in the normalised cache.
+% Called at write-time (after normaliseChecks) so {fetch, all} reads pre-computed values.
+annotateCheckStatuses(NormalisedCache) ->
+	maps:map(fun(_CheckId, Check) ->
+		Status = computeCheckStatus(Check),
+		StatusText = computeCheckStatusText(Status, Check),
+		maps:merge(Check, #{<<"status">> => Status, <<"statusText">> => StatusText})
+	end, NormalisedCache).
+
+% Computes the system-level status atom by walking the priority list from ADR-0001.
+% Per-check status must already be annotated (<<"status">> present in each check map).
+computeSystemStatus(SystemId, NormalisedCache, SuppressionMap) ->
+	Now = erlang:system_time(second),
+	case maps:get(SystemId, SuppressionMap, undefined) of
+		{pending_verification, _} ->
+			pending_verification;
+		ExpiryTime when is_integer(ExpiryTime), ExpiryTime > Now ->
+			suppressed;
+		_ ->
+			aggregateCheckStatuses(SystemId, NormalisedCache, SuppressionMap)
+	end.
+
+% Aggregates check statuses into a system status (priority list steps 3–7 from ADR-0001).
+% Failing checks whose dependsOn system is actively suppressed are excluded from step 3.
+% A system with no checks (e.g. .github, vue-leaflet-antimeridian) is healthy — such
+% systems will always have zero checks and should not appear as noise at the top of the
+% monitoring page. The absence of checks is not a signal of failure.
+aggregateCheckStatuses(SystemId, NormalisedCache, SuppressionMap) ->
+	{HasFailing, HasUnknown, HasBuffering} = maps:fold(fun(_, Check, {F, U, B}) ->
+		Status = maps:get(<<"status">>, Check, unknown),
+		IsDepSuppressed = is_dependency_suppressed(Check, SystemId, SuppressionMap),
+		case {Status, IsDepSuppressed} of
+			{failing, true}  -> {F, U, B};   % dep-suppressed failing: exclude from system failing
+			{failing, false} -> {true, U, B};
+			{unknown, _}     -> {F, true, B};
+			{buffering, _}   -> {F, U, true};
+			_                -> {F, U, B}
+		end
+	end, {false, false, false}, NormalisedCache),
+	if
+		HasFailing   -> failing;
+		HasUnknown   -> unknown;
+		HasBuffering -> buffering;
+		true         -> healthy
+	end.
+
+% Builds the system output map returned by {fetch, all}.
+% Includes <<"host">> for view-layer URL construction (not in ADR spec but required for rendering).
+buildSystemOutput(Host, SystemId, SystemType, NormalisedCache, Metrics, SuppressionMap) ->
+	Checks = [buildCheckOutput(CheckId, Check) || {CheckId, Check} <- maps:to_list(NormalisedCache)],
+	MetricsList = [buildMetricOutput(MetricId, Metric) || {MetricId, Metric} <- maps:to_list(Metrics)],
+	SystemStatus = computeSystemStatus(SystemId, NormalisedCache, SuppressionMap),
+	#{
+		<<"id">>      => list_to_binary(SystemId),
+		<<"type">>    => SystemType,
+		<<"name">>    => list_to_binary(SystemId),
+		<<"host">>    => list_to_binary(Host),
+		<<"checks">>  => Checks,
+		<<"metrics">> => MetricsList,
+		<<"status">>  => SystemStatus
+	}.
+
+% Builds the check output map. Includes optional string fields (techDetail, debug, link)
+% only when present and non-empty; omits internal counter fields.
+buildCheckOutput(CheckId, Check) ->
+	Status = maps:get(<<"status">>, Check, unknown),
+	StatusText = maps:get(<<"statusText">>, Check, <<"unknown">>),
+	Base = #{
+		<<"id">>         => CheckId,
+		<<"status">>     => Status,
+		<<"statusText">> => StatusText
+	},
+	lists:foldl(fun(Key, Acc) ->
+		case maps:get(Key, Check, <<>>) of
+			<<>> -> Acc;
+			Val when is_binary(Val) -> maps:put(Key, Val, Acc);
+			_ -> Acc
+		end
+	end, Base, [<<"techDetail">>, <<"debug">>, <<"link">>]).
+
+% Builds the metric output map.
+buildMetricOutput(MetricId, Metric) ->
+	#{
+		<<"id">>         => MetricId,
+		<<"techDetail">> => maps:get(<<"techDetail">>, Metric, <<"">>),
+		<<"value">>      => maps:get(<<"value">>, Metric, 0)
+	}.
 
 -ifdef(TEST).
 	-include_lib("eunit/include/eunit.hrl").
@@ -358,8 +486,8 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 
 	systemExists_test() ->
 		SystemMap = #{
-			"host1.example.com" => {"lucos_foo", #{}, #{}, #{}},
-			"host2.example.com" => {"lucos_bar", #{}, #{}, #{}}
+			"host1.example.com" => {"lucos_foo", system, #{}, #{}, #{}},
+			"host2.example.com" => {"lucos_bar", host, #{}, #{}, #{}}
 		},
 		?assertEqual(true, systemExists("lucos_foo", SystemMap)),
 		?assertEqual(true, systemExists("lucos_bar", SystemMap)),
@@ -387,12 +515,12 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 		InitialState = {#{}, #{}, []},
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		{noreply, {SystemMap, _, _}} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", info, Checks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, Checks, #{}},
 			InitialState
 		),
 		% Host should now be in the SystemMap
 		?assert(maps:is_key("host1.example.com", SystemMap)),
-		{"lucos_foo", SourceChecksMap, _, _} = maps:get("host1.example.com", SystemMap),
+		{"lucos_foo", _Type, SourceChecksMap, _, _} = maps:get("host1.example.com", SystemMap),
 		StoredChecks = mergeSourceChecks(SourceChecksMap),
 		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"fetch-info">>, StoredChecks))).
 
@@ -401,12 +529,12 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	warmup_second_update_not_suppressed_test() ->
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => Checks}, #{}, #{}}},
+			#{"host1.example.com" => {"lucos_foo", system, #{info => Checks}, #{}, #{}}},
 			#{},
 			[]
 		},
 		{noreply, {SystemMap, _, _}} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", info, Checks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, Checks, #{}},
 			ExistingState
 		),
 		% Host is still in the map after second update
@@ -418,16 +546,16 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => false}},
 		% Start with info checks already stored
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, #{}, #{}}},
+			#{"host1.example.com" => {"lucos_foo", system, #{info => InfoChecks}, #{}, #{}}},
 			#{},
 			[]
 		},
 		% circleci update arrives
 		{noreply, {SystemMap, _, _}} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", circleci, CIChecks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
 			ExistingState
 		),
-		{"lucos_foo", SourceChecksMap, _, _} = maps:get("host1.example.com", SystemMap),
+		{"lucos_foo", _Type, SourceChecksMap, _, _} = maps:get("host1.example.com", SystemMap),
 		Merged = mergeSourceChecks(SourceChecksMap),
 		% All three checks must be present
 		?assert(maps:is_key(<<"fetch-info">>, Merged)),
@@ -441,15 +569,15 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 		OldInfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}, <<"custom-check">> => #{<<"ok">> => true}},
 		NewInfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => OldInfoChecks}, #{}, #{}}},
+			#{"host1.example.com" => {"lucos_foo", system, #{info => OldInfoChecks}, #{}, #{}}},
 			#{},
 			[]
 		},
 		{noreply, {SystemMap, _, _}} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", info, NewInfoChecks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, NewInfoChecks, #{}},
 			ExistingState
 		),
-		{"lucos_foo", SourceChecksMap, _, _} = maps:get("host1.example.com", SystemMap),
+		{"lucos_foo", _Type, SourceChecksMap, _, _} = maps:get("host1.example.com", SystemMap),
 		Merged = mergeSourceChecks(SourceChecksMap),
 		?assertNot(maps:is_key(<<"custom-check">>, Merged)).
 
@@ -459,16 +587,16 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		Metrics = #{<<"agent-count">> => #{<<"value">> => 42, <<"techDetail">> => <<"count">>}},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, #{}, Metrics}},
+			#{"host1.example.com" => {"lucos_foo", system, #{info => InfoChecks}, #{}, Metrics}},
 			#{},
 			[]
 		},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
 		{noreply, {SystemMap, _, _}} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", circleci, CIChecks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
 			ExistingState
 		),
-		{"lucos_foo", _, _, StoredMetrics} = maps:get("host1.example.com", SystemMap),
+		{"lucos_foo", _, _, _, StoredMetrics} = maps:get("host1.example.com", SystemMap),
 		?assertEqual(Metrics, StoredMetrics).
 
 	% When a source provides non-empty metrics, they replace the existing ones.
@@ -476,15 +604,15 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 		OldMetrics = #{<<"agent-count">> => #{<<"value">> => 42, <<"techDetail">> => <<"count">>}},
 		NewMetrics = #{<<"agent-count">> => #{<<"value">> => 99, <<"techDetail">> => <<"count">>}},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, OldMetrics}},
+			#{"host1.example.com" => {"lucos_foo", system, #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, OldMetrics}},
 			#{},
 			[]
 		},
 		{noreply, {SystemMap, _, _}} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", info, #{<<"fetch-info">> => #{<<"ok">> => true}}, NewMetrics},
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, #{<<"fetch-info">> => #{<<"ok">> => true}}, NewMetrics},
 			ExistingState
 		),
-		{"lucos_foo", _, _, StoredMetrics} = maps:get("host1.example.com", SystemMap),
+		{"lucos_foo", _, _, _, StoredMetrics} = maps:get("host1.example.com", SystemMap),
 		?assertEqual(NewMetrics, StoredMetrics).
 
 	% Helper to build a recording notifier and retrieve what it captured.
@@ -505,7 +633,7 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	% Unsuppressing a healthy system enters pending_verification and does NOT fire an immediate alert.
 	unsuppress_healthy_system_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
-		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => HealthyChecks}, #{}, #{}}},
+		SystemMap = #{"host1.example.com" => {"lucos_foo", system, #{info => HealthyChecks}, #{}, #{}}},
 		Notifier = recording_notifier(self()),
 		State = {SystemMap, #{"lucos_foo" => erlang:system_time(second) + 600}, [Notifier]},
 		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
@@ -522,7 +650,7 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	% Unsuppressing an unhealthy system enters pending_verification; alert is deferred, not immediate.
 	unsuppress_unhealthy_system_test() ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
-		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => FailingChecks}, #{}, #{}}},
+		SystemMap = #{"host1.example.com" => {"lucos_foo", system, #{info => FailingChecks}, #{}, #{}}},
 		Notifier = recording_notifier(self()),
 		State = {SystemMap, #{"lucos_foo" => erlang:system_time(second) + 600}, [Notifier]},
 		drain_notifications(),
@@ -548,13 +676,13 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	% After unsuppress, a fresh poll reporting unhealthy fires an alert and clears pending state.
 	pending_verification_fires_alert_when_unhealthy_test() ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
-		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => FailingChecks}, #{}, #{}}},
+		SystemMap = #{"host1.example.com" => {"lucos_foo", system, #{info => FailingChecks}, #{}, #{}}},
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
 		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier]},
 		{noreply, {_, NewSuppressionMap, _}} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", info, FailingChecks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, FailingChecks, #{}},
 			State
 		),
 		% Suppression entry should be cleared
@@ -569,13 +697,13 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	% After unsuppress, a fresh poll reporting healthy clears pending state without alerting.
 	pending_verification_no_alert_when_healthy_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
-		SystemMap = #{"host1.example.com" => {"lucos_foo", #{info => HealthyChecks}, #{}, #{}}},
+		SystemMap = #{"host1.example.com" => {"lucos_foo", system, #{info => HealthyChecks}, #{}, #{}}},
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
 		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier]},
 		{noreply, {_, NewSuppressionMap, _}} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", info, HealthyChecks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, HealthyChecks, #{}},
 			State
 		),
 		% Suppression entry should be cleared
@@ -591,7 +719,7 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => false}},
 		SystemMap = #{
-			"host1.example.com" => {"lucos_foo", #{info => FailingChecks, circleci => CIChecks}, #{}, #{}}
+			"host1.example.com" => {"lucos_foo", system, #{info => FailingChecks, circleci => CIChecks}, #{}, #{}}
 		},
 		PendingSources = sets:from_list([info, circleci], [{version, 2}]),
 		Notifier = recording_notifier(self()),
@@ -599,7 +727,7 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier]},
 		% First source (info) reports — should still be pending
 		{noreply, State2} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", info, FailingChecks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, FailingChecks, #{}},
 			State
 		),
 		{_, SuppressionMap2, _} = State2,
@@ -611,7 +739,7 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 		end,
 		% Second source (circleci) reports — should evaluate and alert
 		{noreply, {_, SuppressionMap3, _}} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", circleci, CIChecks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
 			State2
 		),
 		?assertEqual(#{}, SuppressionMap3),
@@ -661,11 +789,12 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 
 	% Bug fix: when circleci returns 404 (no CI for this repo), the circleci check must be
 	% removed from the normalised cache — even when info is already unavailable (fetch-info = unknown).
-	% The critical ordering: info must go unknown FIRST, then circleci gets a 404.
-	% Without the fix, mergeMissingInfoChecks would see fetch-info=unknown, do
-	% maps:merge(OldNormalisedCache_with_circleci, NewMergedChecks), and resurrect circleci.
-	% With the fix, the empty SourceChecks triggers removal of circleci from OldNormalisedCache
-	% before mergeMissingInfoChecks runs, so it cannot be resurrected.
+	%
+	% The ordering — info blip first, THEN circleci 404 — is what makes this test non-trivial.
+	% When fetch-info is unknown, mergeMissingInfoChecks merges old checks on top of the incoming
+	% ones. Without the "prune-on-empty-source" logic, the 404's empty map would be treated as
+	% "no update this cycle", and the merge would silently resurrect the stale circleci check
+	% from the old normalised cache. This test regresses that specific scenario.
 	circleci_404_wipes_check_even_when_info_unavailable_test() ->
 		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}, <<"tls-certificate">> => #{<<"ok">> => true}},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
@@ -676,89 +805,97 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 			<<"circleci">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}
 		},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks, circleci => CIChecks}, ExistingNormalisedCache, #{}}},
+			#{"host1.example.com" => {"lucos_foo", system, #{info => InfoChecks, circleci => CIChecks}, ExistingNormalisedCache, #{}}},
 			#{},
 			[]
 		},
-		% Info becomes temporarily unavailable FIRST (fetch-info = unknown)
+		% Info becomes temporarily unavailable FIRST (fetch-info = unknown) — this activates
+		% mergeMissingInfoChecks, which would resurrect old checks if the pruning logic is absent.
 		{noreply, State2} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", info, #{<<"fetch-info">> => #{<<"ok">> => unknown}, <<"tls-certificate">> => #{<<"ok">> => true}}, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, #{<<"fetch-info">> => #{<<"ok">> => unknown}, <<"tls-certificate">> => #{<<"ok">> => true}}, #{}},
 			ExistingState
 		),
-		% THEN circleci returns 404 — no CI configured, sends #{}
+		% THEN circleci returns 404 — no CI configured, sends #{}.
+		% The pruning step must remove the old circleci check from the cache BEFORE the merge
+		% runs, so mergeMissingInfoChecks cannot put it back.
 		{noreply, State3} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", circleci, #{}, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, #{}, #{}},
 			State2
 		),
 		{SystemMap3, _, _} = State3,
-		{"lucos_foo", _, NormalisedAfterCI404, _} = maps:get("host1.example.com", SystemMap3),
+		{"lucos_foo", _, _, NormalisedAfterCI404, _} = maps:get("host1.example.com", SystemMap3),
 		% circleci check must be absent — 404 means "no CI", not "CI unknown"
 		?assertNot(maps:is_key(<<"circleci">>, NormalisedAfterCI404),
 			"circleci check must be wiped by 404, not resurrected by mergeMissingInfoChecks").
 
 	% When /_info returns an unknown fetch-info (transient blip), other failing checks from
-	% that same source must be preserved in the normalised cache. If they disappear and then
-	% reappear when info recovers, a duplicate alert fires — we should only alert once.
+	% that same source must be preserved in the normalised cache.
+	%
+	% Without mergeMissingInfoChecks, a single /_info blip would silently clear all failing
+	% checks from the normalised cache (because the blip's payload only contains fetch-info).
+	% That would produce a false recovery alert on the blip poll, followed by a re-alert on
+	% the next successful poll — doubling the alert noise for a single transient event.
 	info_blip_preserves_failing_checks_test() ->
 		InfoChecks = #{
 			<<"fetch-info">> => #{<<"ok">> => true},
 			<<"tls-certificate">> => #{<<"ok">> => false},
 			<<"item-count">> => #{<<"ok">> => false}
 		},
-		% Start with a system with two failing checks already in the normalised cache
+		% Start with a system with two failing checks already in the normalised cache.
+		% The blip update will only carry fetch-info — without the merge logic, tls-certificate
+		% and item-count would disappear from the cache.
 		ExistingNormalisedCache = #{
 			<<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
 			<<"tls-certificate">> => #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1},
 			<<"item-count">> => #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1}
 		},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks}, ExistingNormalisedCache, #{}}},
+			#{"host1.example.com" => {"lucos_foo", system, #{info => InfoChecks}, ExistingNormalisedCache, #{}}},
 			#{},
 			[]
 		},
-		% /_info has a transient blip: only fetch-info comes back (unknown), tls-certificate
-		% and item-count are absent from the response
 		{noreply, State2} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", info, #{<<"fetch-info">> => #{<<"ok">> => unknown}}, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, #{<<"fetch-info">> => #{<<"ok">> => unknown}}, #{}},
 			ExistingState
 		),
 		{SystemMap2, _, _} = State2,
-		{"lucos_foo", _, NormalisedAfterBlip, _} = maps:get("host1.example.com", SystemMap2),
-		% Both failing checks must still be present — they should NOT disappear during the blip
+		{"lucos_foo", _, _, NormalisedAfterBlip, _} = maps:get("host1.example.com", SystemMap2),
 		?assert(maps:is_key(<<"tls-certificate">>, NormalisedAfterBlip),
 			"tls-certificate must persist during transient /_info blip"),
 		?assert(maps:is_key(<<"item-count">>, NormalisedAfterBlip),
 			"item-count must persist during transient /_info blip").
 
 	% Bug fix: multiple source updates in the same monitoring cycle must not double-increment unknown_count.
-	% Scenario: circleci reports unknown, then info reports ok in the same cycle.
-	% The circleci check is carried forward in the merged view during info's update.
-	% With the fix, circleci's count should only increment when circleci itself reports — not when info reports.
+	%
+	% When circleci reports unknown, that check is merged into the shared view.  On the next
+	% poll, when info reports (even with no change), the circleci check is still present in the
+	% merged view as unknown.  Without the CountableKeys set, info's update would treat the
+	% carried-forward circleci check as a "new" unknown and increment its counter a second time —
+	% reaching count=2 in one cycle instead of two, and potentially triggering a premature alert.
 	multiple_sources_same_cycle_no_double_increment_test() ->
 		Notifiers = [],
-		% Start with a system already known (non-first-seen)
 		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", #{info => InfoChecks, circleci => CIChecks}, #{}, #{}}},
+			#{"host1.example.com" => {"lucos_foo", system, #{info => InfoChecks, circleci => CIChecks}, #{}, #{}}},
 			#{},
 			Notifiers
 		},
 		% circleci reports unknown
 		{noreply, State2} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", circleci, #{<<"circleci">> => #{<<"ok">> => unknown}}, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, #{<<"circleci">> => #{<<"ok">> => unknown}}, #{}},
 			ExistingState
 		),
 		{SystemMap2, _, _} = State2,
-		{"lucos_foo", _, NormalisedAfterCI, _} = maps:get("host1.example.com", SystemMap2),
+		{"lucos_foo", _, _, NormalisedAfterCI, _} = maps:get("host1.example.com", SystemMap2),
 		?assertEqual(1, maps:get(<<"unknown_count">>, maps:get(<<"circleci">>, NormalisedAfterCI, #{}), -1)),
 		% Now info reports (ok, no change) — circleci check is carried over in the merged view
 		{noreply, State3} = handle_cast(
-			{updateSystem, "host1.example.com", "lucos_foo", info, InfoChecks, #{}},
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, InfoChecks, #{}},
 			State2
 		),
 		{SystemMap3, _, _} = State3,
-		{"lucos_foo", _, NormalisedAfterInfo, _} = maps:get("host1.example.com", SystemMap3),
+		{"lucos_foo", _, _, NormalisedAfterInfo, _} = maps:get("host1.example.com", SystemMap3),
 		% circleci count must still be 1, NOT 2 — info's update must not re-increment it
 		?assertEqual(1, maps:get(<<"unknown_count">>, maps:get(<<"circleci">>, NormalisedAfterInfo, #{}), -1)).
 
@@ -802,10 +939,10 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	% find_dependent_systems: returns system IDs with checks declaring dependsOn TargetSystem
 	find_dependent_systems_basic_test() ->
 		SystemMap = #{
-			"host1.example.com" => {"lucos_time", #{info => #{
+			"host1.example.com" => {"lucos_time", system, #{info => #{
 				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
 			}}, #{}, #{}},
-			"host2.example.com" => {"lucos_arachne", #{info => #{
+			"host2.example.com" => {"lucos_arachne", system, #{info => #{
 				<<"triplestore">> => #{<<"ok">> => true}
 			}}, #{}, #{}}
 		},
@@ -814,7 +951,7 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	% find_dependent_systems: no systems depend on target → empty list
 	find_dependent_systems_none_test() ->
 		SystemMap = #{
-			"host1.example.com" => {"lucos_time", #{info => #{
+			"host1.example.com" => {"lucos_time", system, #{info => #{
 				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
 			}}, #{}, #{}}
 		},
@@ -823,7 +960,7 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	% find_dependent_systems: self-reference is excluded
 	find_dependent_systems_excludes_self_test() ->
 		SystemMap = #{
-			"host1.example.com" => {"lucos_eolas", #{info => #{
+			"host1.example.com" => {"lucos_eolas", system, #{info => #{
 				<<"db">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
 			}}, #{}, #{}}
 		},
@@ -832,10 +969,10 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 	% find_dependent_systems: multiple systems can depend on the same target
 	find_dependent_systems_multiple_test() ->
 		SystemMap = #{
-			"host1.example.com" => {"lucos_time", #{info => #{
+			"host1.example.com" => {"lucos_time", system, #{info => #{
 				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
 			}}, #{}, #{}},
-			"host2.example.com" => {"lucos_arachne", #{info => #{
+			"host2.example.com" => {"lucos_arachne", system, #{info => #{
 				<<"eolas-data">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
 			}}, #{}, #{}}
 		},
@@ -881,12 +1018,10 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 
 	% unsuppress cascades pending_verification to systems with checks depending on the unsuppressed system.
 	unsuppress_cascades_pending_verification_test() ->
-		% lucos_time has a check with dependsOn: lucos_eolas
-		% lucos_eolas is being unsuppressed
 		TimeChecks = #{<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}},
 		SystemMap = #{
-			"lucos_eolas" => {"lucos_eolas", #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, #{}},
-			"schedule-tracker.l42.eu" => {"lucos_time", #{info => TimeChecks}, #{}, #{}}
+			"lucos_eolas" => {"lucos_eolas", system, #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, #{}},
+			"schedule-tracker.l42.eu" => {"lucos_time", system, #{info => TimeChecks}, #{}, #{}}
 		},
 		FutureExpiry = erlang:system_time(second) + 600,
 		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
@@ -894,9 +1029,144 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
 			{unsuppress, "lucos_eolas"}, from, State
 		),
-		% lucos_eolas itself should be in pending_verification
 		?assertMatch({pending_verification, _}, maps:get("lucos_eolas", NewSuppressionMap)),
-		% lucos_time (dependent) should also be in pending_verification
 		?assertMatch({pending_verification, _}, maps:get("lucos_time", NewSuppressionMap)).
+
+	% computeCheckStatus: healthy check
+	compute_check_status_healthy_test() ->
+		Check = #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
+		?assertEqual(healthy, computeCheckStatus(Check)).
+
+	% computeCheckStatus: failing check (ok=false)
+	compute_check_status_failing_test() ->
+		Check = #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1},
+		?assertEqual(failing, computeCheckStatus(Check)).
+
+	% computeCheckStatus: unknown check (ok=unknown, no counters)
+	compute_check_status_unknown_test() ->
+		Check = #{<<"ok">> => unknown, <<"unknown_count">> => 0},
+		?assertEqual(unknown, computeCheckStatus(Check)).
+
+	% computeCheckStatus: buffering due to unknown_count > 0
+	compute_check_status_buffering_unknown_count_test() ->
+		Check = #{<<"ok">> => true, <<"unknown_count">> => 1, <<"fail_count">> => 0},
+		?assertEqual(buffering, computeCheckStatus(Check)).
+
+	% computeCheckStatus: buffering due to fail_count>0 with failThreshold>1
+	compute_check_status_buffering_fail_count_test() ->
+		Check = #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 1, <<"failThreshold">> => 3},
+		?assertEqual(buffering, computeCheckStatus(Check)).
+
+	% computeCheckStatus: fail_count=1 with failThreshold=1 is failing (already at threshold)
+	compute_check_status_failing_at_threshold_test() ->
+		Check = #{<<"ok">> => false, <<"fail_count">> => 1, <<"failThreshold">> => 1},
+		?assertEqual(failing, computeCheckStatus(Check)).
+
+	% computeCheckStatus: ok=unknown with unknown_count>0 → buffering.
+	% This is the case where replaceUnknowns has held the previous ok value as unknown
+	% (e.g. the check was never observed healthy) and the counter hasn't hit the threshold yet.
+	% Without this case, a check stuck in unknown with an incrementing counter would appear
+	% as plain "unknown" in the UI, hiding the fact that it is actively failing its poll.
+	compute_check_status_buffering_unknown_ok_test() ->
+		Check = #{<<"ok">> => unknown, <<"unknown_count">> => 1, <<"fail_count">> => 0},
+		?assertEqual(buffering, computeCheckStatus(Check)).
+
+	% computeCheckStatusText: healthy
+	compute_check_status_text_healthy_test() ->
+		?assertEqual(<<"healthy">>, computeCheckStatusText(healthy, #{})).
+
+	% computeCheckStatusText: failing
+	compute_check_status_text_failing_test() ->
+		?assertEqual(<<"failing">>, computeCheckStatusText(failing, #{})).
+
+	% computeCheckStatusText: unknown
+	compute_check_status_text_unknown_test() ->
+		?assertEqual(<<"unknown">>, computeCheckStatusText(unknown, #{})).
+
+	% computeCheckStatusText: buffering via unknown_count
+	compute_check_status_text_buffering_unknown_count_test() ->
+		Check = #{<<"unknown_count">> => 2},
+		?assertEqual(<<"unknown (2)">>, computeCheckStatusText(buffering, Check)).
+
+	% computeCheckStatusText: buffering via fail_count
+	compute_check_status_text_buffering_fail_count_test() ->
+		Check = #{<<"unknown_count">> => 0, <<"fail_count">> => 1, <<"failThreshold">> => 3},
+		?assertEqual(<<"failing (1/3)">>, computeCheckStatusText(buffering, Check)).
+
+	% computeSystemStatus: no checks → healthy.
+	% Systems like .github or vue-leaflet-antimeridian have no checks and will always be in
+	% this state. Treating them as unknown would pull them to the top of the monitoring page
+	% as permanent noise. They should be healthy and sort to the bottom.
+	compute_system_status_no_checks_test() ->
+		?assertEqual(healthy, computeSystemStatus("lucos_foo", #{}, #{})).
+
+	% computeSystemStatus: all healthy checks → healthy
+	compute_system_status_healthy_test() ->
+		Cache = #{<<"a">> => #{<<"ok">> => true, <<"status">> => healthy, <<"statusText">> => <<"healthy">>}},
+		?assertEqual(healthy, computeSystemStatus("lucos_foo", Cache, #{})).
+
+	% computeSystemStatus: any failing check → failing
+	compute_system_status_failing_test() ->
+		Cache = #{<<"a">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>}},
+		?assertEqual(failing, computeSystemStatus("lucos_foo", Cache, #{})).
+
+	% computeSystemStatus: any unknown check → unknown
+	compute_system_status_unknown_test() ->
+		Cache = #{<<"a">> => #{<<"ok">> => unknown, <<"status">> => unknown, <<"statusText">> => <<"unknown">>}},
+		?assertEqual(unknown, computeSystemStatus("lucos_foo", Cache, #{})).
+
+	% computeSystemStatus: any buffering check → buffering
+	compute_system_status_buffering_test() ->
+		Cache = #{<<"a">> => #{<<"ok">> => true, <<"unknown_count">> => 1, <<"status">> => buffering, <<"statusText">> => <<"unknown (1)">>}},
+		?assertEqual(buffering, computeSystemStatus("lucos_foo", Cache, #{})).
+
+	% computeSystemStatus: active suppression → suppressed (even if checks are failing)
+	compute_system_status_suppressed_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		Cache = #{<<"a">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>}},
+		?assertEqual(suppressed, computeSystemStatus("lucos_foo", Cache, #{"lucos_foo" => FutureExpiry})).
+
+	% computeSystemStatus: pending_verification → pending_verification
+	compute_system_status_pending_verification_test() ->
+		PendingSources = sets:from_list([info], [{version, 2}]),
+		Cache = #{<<"a">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>}},
+		?assertEqual(pending_verification, computeSystemStatus("lucos_foo", Cache, #{"lucos_foo" => {pending_verification, PendingSources}})).
+
+	% computeSystemStatus: failing check inside suppressed system — system is suppressed, check is still failing
+	suppressed_system_check_status_honest_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		Cache = #{<<"a">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>}},
+		SystemStatus = computeSystemStatus("lucos_foo", Cache, #{"lucos_foo" => FutureExpiry}),
+		CheckStatus = maps:get(<<"status">>, maps:get(<<"a">>, Cache)),
+		?assertEqual(suppressed, SystemStatus),
+		?assertEqual(failing, CheckStatus).
+
+	% computeSystemStatus: dep-suppressed failing check excludes from system failing determination
+	compute_system_status_dep_suppressed_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		Cache = #{<<"eolas">> => #{
+			<<"ok">> => false,
+			<<"dependsOn">> => <<"lucos_eolas">>,
+			<<"status">> => failing,
+			<<"statusText">> => <<"failing">>
+		}},
+		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
+		?assertEqual(healthy, computeSystemStatus("lucos_time", Cache, SuppressionMap)).
+
+	% failing takes priority over unknown (step 3 before step 4)
+	compute_system_status_priority_failing_over_unknown_test() ->
+		Cache = #{
+			<<"a">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>},
+			<<"b">> => #{<<"ok">> => unknown, <<"status">> => unknown, <<"statusText">> => <<"unknown">>}
+		},
+		?assertEqual(failing, computeSystemStatus("lucos_foo", Cache, #{})).
+
+	% unknown takes priority over buffering (step 4 before step 5)
+	compute_system_status_priority_unknown_over_buffering_test() ->
+		Cache = #{
+			<<"a">> => #{<<"ok">> => unknown, <<"status">> => unknown, <<"statusText">> => <<"unknown">>},
+			<<"b">> => #{<<"ok">> => true, <<"unknown_count">> => 1, <<"status">> => buffering, <<"statusText">> => <<"unknown (1)">>}
+		},
+		?assertEqual(unknown, computeSystemStatus("lucos_foo", Cache, #{})).
 
 -endif.

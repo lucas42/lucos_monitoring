@@ -147,51 +147,43 @@ formatString(Key, BinaryValue) ->
 	Value = re:replace(LinkedValue, "href=\"([^\"]*)&ZeroWidthSpace;([^\"]*)\"", "href=\"\\g1\\g2\"",[global, {return, list}]),
 	"<td class=\"formattedString "++binary_to_list(Key)++"\">"++Value++"</td>\r\n".
 
-checkSortPriority(CheckInfo) ->
-	CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
-	UnknownCount = maps:get(<<"unknown_count">>, CheckInfo, 0),
-	FailCount = maps:get(<<"fail_count">>, CheckInfo, 0),
-	FailThreshold = maps:get(<<"failThreshold">>, CheckInfo, 1),
-	IsBuffering = CheckHealthy =/= false andalso
-		((UnknownCount > 0) orelse (FailCount > 0 andalso FailThreshold > 1)),
-	case IsBuffering of
-		true -> 2;
-		false ->
-			case CheckHealthy of
-				false -> 0;
-				true  -> 3;
-				_     -> 1
-			end
-	end.
+% Maps a check status atom to a sort priority (lower = first in table).
+checkStatusSortPriority(failing)   -> 0;
+checkStatusSortPriority(unknown)   -> 1;
+checkStatusSortPriority(buffering) -> 2;
+checkStatusSortPriority(_)         -> 3. % healthy (and any future statuses)
+
+% Maps a system status atom to a sort priority (lower = first in page).
+systemStatusSortPriority(failing)              -> 0;
+systemStatusSortPriority(unknown)              -> 1;
+systemStatusSortPriority(buffering)            -> 2;
+systemStatusSortPriority(suppressed)           -> 3;
+systemStatusSortPriority(pending_verification) -> 3;
+systemStatusSortPriority(_)                    -> 4. % healthy
+
+% Maps a status atom to a CSS class string.
+% pending_verification uses a hyphen to match existing CSS convention.
+statusToCssClass(pending_verification) -> "pending-verification";
+statusToCssClass(Status) -> atom_to_list(Status).
 
 renderSystemChecks(SystemChecks) ->
 	SortedChecks = lists:sort(
-		fun ({CheckIdA, CheckInfoA}, {CheckIdB, CheckInfoB}) ->
-			{checkSortPriority(CheckInfoA), CheckIdA} =< {checkSortPriority(CheckInfoB), CheckIdB}
-		end, maps:to_list(SystemChecks)),
+		fun (CheckA, CheckB) ->
+			StatusA = maps:get(<<"status">>, CheckA, unknown),
+			StatusB = maps:get(<<"status">>, CheckB, unknown),
+			IdA = maps:get(<<"id">>, CheckA, <<>>),
+			IdB = maps:get(<<"id">>, CheckB, <<>>),
+			{checkStatusSortPriority(StatusA), IdA} =< {checkStatusSortPriority(StatusB), IdB}
+		end, SystemChecks),
 	"<div  class=\"system-checks\"><table>
 		<thead><td>Check</td><td>Status</td><td>Technical Detail</td><td class=\"debug\">Debug</td></thead>
 		" ++ lists:foldl(
-		fun ({CheckId, CheckInfo}, Html) ->
-			CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
-			Link = binary_to_list(maps:get(<<"link">>, CheckInfo, <<"">>)),
-			UnknownCount = maps:get(<<"unknown_count">>, CheckInfo, 0),
-			FailCount = maps:get(<<"fail_count">>, CheckInfo, 0),
-			FailThreshold = maps:get(<<"failThreshold">>, CheckInfo, 1),
-			IsBuffering = CheckHealthy =/= false andalso
-				((UnknownCount > 0) orelse (FailCount > 0 andalso FailThreshold > 1)),
-			CheckClass = case IsBuffering of
-				true -> "check buffering";
-				false -> getCssClass("check", CheckHealthy)
-			end,
-			StatusText = case IsBuffering of
-				true when UnknownCount > 0 ->
-					"unknown (" ++ integer_to_list(UnknownCount) ++ ")";
-				true ->
-					"failing (" ++ integer_to_list(FailCount) ++ "/" ++ integer_to_list(FailThreshold) ++ ")";
-				false ->
-					atom_to_list(CheckHealthy)
-			end,
+		fun (Check, Html) ->
+			CheckId = maps:get(<<"id">>, Check),
+			Status = maps:get(<<"status">>, Check, unknown),
+			StatusText = binary_to_list(maps:get(<<"statusText">>, Check, <<"unknown">>)),
+			Link = binary_to_list(maps:get(<<"link">>, Check, <<"">>)),
+			CheckClass = "check " ++ statusToCssClass(Status),
 			StatusHtml = case Link of
 				"" -> StatusText;
 				_ -> "<a href=\""++Link++"\" target=\"_blank\">"++StatusText++"</a>"
@@ -200,40 +192,31 @@ renderSystemChecks(SystemChecks) ->
 				<tr class=\""++CheckClass++"\">
 					"++formatString(<<"checkid">>, CheckId)++"
 					<td class=\"status\">"++StatusHtml++"</td>
-					"++formatStringFromInfo(<<"techDetail">>, CheckInfo)
-					++formatStringFromInfo(<<"debug">>, CheckInfo)
+					"++formatStringFromInfo(<<"techDetail">>, Check)
+					++formatStringFromInfo(<<"debug">>, Check)
 				++"</tr>
 			",
 			Html++CheckHtml
 		end, "", SortedChecks) ++ "
 	</table></div>".
 
-systemHealthy(SystemChecks) ->
-	maps:fold(fun (_CheckId, CheckInfo, AccHealthy) ->
-		CheckHealthy = maps:get(<<"ok">>, CheckInfo, false),
-		case {AccHealthy, CheckHealthy} of
-			{false, _} -> false;
-			{true, _} -> CheckHealthy;
-			{_, true} -> unknown;
-			{_, _} -> CheckHealthy
-		end
-	end, true, SystemChecks).
-
 
 renderSystemMetrics(SystemMetrics) ->
 	SortedMetrics = lists:sort(
-		fun ({MetricIdA, _}, {MetricIdB, _}) -> MetricIdA =< MetricIdB end,
-		maps:to_list(SystemMetrics)),
+		fun (MetricA, MetricB) ->
+			maps:get(<<"id">>, MetricA) =< maps:get(<<"id">>, MetricB)
+		end, SystemMetrics),
 	Html = lists:foldl(
-		fun ({MetricId, MetricInfo}, Html) ->
-			Value = maps:get(<<"value">>, MetricInfo, -1),
-			TechDetail = binary_to_list(maps:get(<<"techDetail">>, MetricInfo, <<"">>)),
+		fun (Metric, Html) ->
+			MetricId = binary_to_list(maps:get(<<"id">>, Metric)),
+			Value = maps:get(<<"value">>, Metric, -1),
+			TechDetail = binary_to_list(maps:get(<<"techDetail">>, Metric, <<"">>)),
 			MetricHtml = lists:flatten(io_lib:format("
 				<tr class=\"metric\" title=~p>
 					<td class=\"metricid\">~s</td>
 					<td class=\"value\">~p</td>
 				</tr>
-			", [TechDetail, binary_to_list(MetricId), Value])),
+			", [TechDetail, MetricId, Value])),
 			Html++MetricHtml
 		end, "", SortedMetrics),
 	case Html of
@@ -246,122 +229,93 @@ renderSystemMetrics(SystemMetrics) ->
 			</table>"
 	end.
 
-getCssClass(Type, Healthy) ->
-	case Healthy of
-		true -> Type ++ " healthy";
-		false -> Type ++ " erroring";
-		_ -> Type ++ " health-unknown"
-	end.
-
 renderSystemHeader(Name, Host, DupNameCount) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
-	case {Name, DupNameCount} of
-		{unknown, _} ->
-			"<h2 id=\"host-"++Host++"\">
-				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
-				"++Host++"
-			</h2>";
-		{_, 1} ->
-			ReadableName = re:replace(Name, "_", " ", [global, {return,list}]),
+	ReadableName = re:replace(binary_to_list(Name), "_", " ", [global, {return,list}]),
+	case DupNameCount of
+		1 ->
 			"<h2 id=\"host-"++Host++"\">
 				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
 				<span class=\"system-name\">"++ReadableName++"</span>
 			</h2>";
-		{_, _} ->
-			ReadableName = re:replace(Name, "_", " ", [global, {return,list}]),
+		_ ->
 			"<h2 id=\"host-"++Host++"\">
 				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
 				<span class=\"system-name\">"++ReadableName++"</span> ("++Host++")
 			</h2>"
 	end.
 
-% Used to sort systems by status
-sortedHealthStatus(SystemChecks) ->
-	case systemHealthy(SystemChecks) of
-		true -> 2;
-		false -> 0;
-		% Ensure "unknown" systems come above healthy ones
-		_ -> 1
-	end.
-
-countDupNames(SystemList, CompareSystemName) ->
-	length(lists:filter(
-		fun ({_, {SystemName, _, _}}) ->
-			SystemName == CompareSystemName
-		end, SystemList)).
-
-getSuppressionStatus(unknown, _SuppressionMap) -> none;
-getSuppressionStatus(SystemName, SuppressionMap) when is_list(SystemName) ->
-	case maps:get(SystemName, SuppressionMap, undefined) of
-		undefined -> none;
-		{pending_verification, _} -> pending_verification;
-		ExpiryTime when is_integer(ExpiryTime) ->
-			Now = erlang:system_time(second),
-			case Now < ExpiryTime of
-				true -> active;
-				false -> none
-			end
-	end.
-
-renderAll(SystemMap, SuppressionMap) ->
-	SystemList = maps:to_list(SystemMap),
+% Renders all systems. Systems is the list returned by {fetch, all} — each
+% element is a map with <<"host">>, <<"name">>, <<"status">>, <<"checks">>, <<"metrics">>.
+% Status-based CSS class and suppression states are derived from <<"status">> directly;
+% no separate suppression map fetch is needed.
+renderAll(Systems) ->
 	SortedSystems = lists:sort(
-		fun ({HostA, {NameA, ChecksA, _}}, {HostB, {NameB, ChecksB, _}}) ->
-			HealthyA = sortedHealthStatus(ChecksA),
-			HealthyB = sortedHealthStatus(ChecksB),
-			{HealthyA, NameA, HostA} < {HealthyB, NameB, HostB}
-		end, SystemList),
+		fun (SysA, SysB) ->
+			StatusA = maps:get(<<"status">>, SysA),
+			StatusB = maps:get(<<"status">>, SysB),
+			NameA = maps:get(<<"name">>, SysA, <<"">>),
+			NameB = maps:get(<<"name">>, SysB, <<"">>),
+			HostA = maps:get(<<"host">>, SysA, <<"">>),
+			HostB = maps:get(<<"host">>, SysB, <<"">>),
+			{systemStatusSortPriority(StatusA), NameA, HostA} =< {systemStatusSortPriority(StatusB), NameB, HostB}
+		end, Systems),
 	lists:foldl(
-		fun ({Host, {SystemName, SystemChecks, SystemMetrics}}, Output) ->
-			DupNameCount = countDupNames(SystemList, SystemName),
-			SuppressionStatus = getSuppressionStatus(SystemName, SuppressionMap),
-			SuppressionClass = case SuppressionStatus of
-				active -> " suppressed";
-				pending_verification -> " pending-verification";
-				none -> ""
-			end,
+		fun (System, Output) ->
+			Name = maps:get(<<"name">>, System),
+			Host = binary_to_list(maps:get(<<"host">>, System)),
+			Status = maps:get(<<"status">>, System),
+			SystemChecks = maps:get(<<"checks">>, System, []),
+			SystemMetrics = maps:get(<<"metrics">>, System, []),
+			DupNameCount = length(lists:filter(
+				fun(S) -> maps:get(<<"name">>, S, <<>>) =:= Name end,
+				Systems)),
+			CssClass = "system " ++ statusToCssClass(Status),
 			Output++"
-			<div class=\""++getCssClass("system", systemHealthy(SystemChecks))++SuppressionClass++"\">
-				"++renderSystemHeader(SystemName, Host, DupNameCount)++"
+			<div class=\""++CssClass++"\">
+				"++renderSystemHeader(Name, Host, DupNameCount)++"
 				"++renderSystemChecks(SystemChecks)++"
 				"++renderSystemMetrics(SystemMetrics)++"
 			</div>
 			"
 		end, "", SortedSystems).
 
-systemNameBinary(unknown) -> <<"unknown">>;
-systemNameBinary(Name) when is_list(Name) -> list_to_binary(Name).
-
-encodeStatus(SystemMap) ->
-	SystemList = maps:to_list(SystemMap),
+encodeStatus(Systems) ->
 	EncodedSystems = maps:from_list(lists:map(
-		fun ({Host, {SystemName, SystemChecks, SystemMetrics}}) ->
-			Healthy = systemHealthy(SystemChecks),
-			EncodedChecks = maps:map(
-				fun (_CheckId, CheckInfo) ->
-					maps:without([<<"unknown_count">>, <<"link">>], CheckInfo)
-				end, SystemChecks),
+		fun (System) ->
+			Host = maps:get(<<"host">>, System),
+			Name = maps:get(<<"name">>, System),
+			Status = maps:get(<<"status">>, System),
+			% Rebuild checks as a map keyed by check id, omitting the id field from the value
+			Checks = maps:from_list([
+				{maps:get(<<"id">>, C), maps:without([<<"id">>], C)}
+				|| C <- maps:get(<<"checks">>, System, [])]),
+			% Rebuild metrics as a map keyed by metric id, omitting the id field from the value
+			Metrics = maps:from_list([
+				{maps:get(<<"id">>, M), maps:without([<<"id">>], M)}
+				|| M <- maps:get(<<"metrics">>, System, [])]),
 			SystemJson = #{
-				<<"name">> => systemNameBinary(SystemName),
-				<<"healthy">> => Healthy,
-				<<"checks">> => EncodedChecks,
-				<<"metrics">> => SystemMetrics
+				<<"name">>    => Name,
+				<<"status">>  => Status,
+				<<"checks">>  => Checks,
+				<<"metrics">> => Metrics
 			},
-			{list_to_binary(Host), SystemJson}
-		end, SystemList)),
-	{TotalSystems, HealthyCount, ErroringCount, UnknownCount} = lists:foldl(
-		fun ({_Host, {_Name, SystemChecks, _Metrics}}, {Total, Healthy, Erroring, Unknown}) ->
-			case systemHealthy(SystemChecks) of
-				true  -> {Total + 1, Healthy + 1, Erroring, Unknown};
-				false -> {Total + 1, Healthy, Erroring + 1, Unknown};
-				_     -> {Total + 1, Healthy, Erroring, Unknown + 1}
+			{Host, SystemJson}
+		end, Systems)),
+	% Summary counts: healthy, failing, anything else (unknown/buffering/suppressed/pending) → unknown
+	{TotalSystems, HealthyCount, FailingCount, UnknownCount} = lists:foldl(
+		fun (System, {Total, Healthy, Failing, Unknown}) ->
+			case maps:get(<<"status">>, System) of
+				healthy -> {Total + 1, Healthy + 1, Failing, Unknown};
+				failing -> {Total + 1, Healthy, Failing + 1, Unknown};
+				_       -> {Total + 1, Healthy, Failing, Unknown + 1}
 			end
-		end, {0, 0, 0, 0}, SystemList),
+		end, {0, 0, 0, 0}, Systems),
 	Summary = #{
 		<<"total_systems">> => TotalSystems,
-		<<"healthy">> => HealthyCount,
-		<<"erroring">> => ErroringCount,
-		<<"unknown">> => UnknownCount
+		<<"healthy">>       => HealthyCount,
+		<<"failing">>       => FailingCount,
+		<<"unknown">>       => UnknownCount
 	},
 	jiffy:encode(#{
 		<<"systems">> => EncodedSystems,
@@ -374,7 +328,7 @@ encodeInfo(Systems) ->
 		checks => #{},
 		metrics => #{
 			<<"system-count">> => #{
-				<<"value">> => maps:size(Systems),
+				<<"value">> => length(Systems),
 				<<"techDetail">> => <<"The number of systems being monitored">>
 			}
 		},
@@ -394,8 +348,7 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 	case Path of
 		"/" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
-			SuppressionMap = gen_server:call(StatePid, {fetch, suppression}),
-			ChecksOutput = renderAll(Systems, SuppressionMap),
+			ChecksOutput = renderAll(Systems),
 			{200, "text/html", "<html>
 				<head>
 					<title>Lucos Monitoring</title>
@@ -426,9 +379,9 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 			tr:not(:last-child) > td { border-bottom-style: solid; }
 			tr.check td.status { background-color: #666; color: #fff; }
 			.system.healthy h2, tr.check.healthy td.status { background-color: #060; }
-			.system.erroring h2, tr.check.erroring td.status { background-color: #900; }
-			.system.health-unknown h2, tr.check.health-unknown td.status { background-color: #555; }
-			tr.check.buffering td.status { background-color: #da9000; }
+			.system.failing h2, tr.check.failing td.status { background-color: #900; }
+			.system.unknown h2, tr.check.unknown td.status { background-color: #555; }
+			.system.buffering h2, tr.check.buffering td.status { background-color: #da9000; }
 			.system.suppressed h2, .system.pending-verification h2 { background-color: #da9000; }
 			.system.suppressed h2:before { content: \""++binary_to_list(<<"🔇"/utf8>>)++"\"; }
 			.system.pending-verification h2:before { content: \""++binary_to_list(<<"⏳"/utf8>>)++"\"; }
@@ -493,136 +446,162 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 	-include_lib("eunit/include/eunit.hrl").
 
 	encodeStatus_empty_test() ->
-		Result = jiffy:decode(encodeStatus(#{}), [return_maps]),
+		Result = jiffy:decode(encodeStatus([]), [return_maps]),
 		?assertEqual(#{}, maps:get(<<"systems">>, Result)),
 		Summary = maps:get(<<"summary">>, Result),
 		?assertEqual(0, maps:get(<<"total_systems">>, Summary)),
 		?assertEqual(0, maps:get(<<"healthy">>, Summary)),
-		?assertEqual(0, maps:get(<<"erroring">>, Summary)),
+		?assertEqual(0, maps:get(<<"failing">>, Summary)),
 		?assertEqual(0, maps:get(<<"unknown">>, Summary)).
 
 	encodeStatus_healthy_system_test() ->
-		SystemMap = #{
-			"example.l42.eu" => {"lucos_example", #{
-				<<"fetch-info">> => #{<<"ok">> => true, <<"techDetail">> => <<"Fetches /_info">>}
-			}, #{}}
-		},
-		Result = jiffy:decode(encodeStatus(SystemMap), [return_maps]),
-		Systems = maps:get(<<"systems">>, Result),
-		System = maps:get(<<"example.l42.eu">>, Systems),
+		Systems = [#{
+			<<"host">>    => <<"example.l42.eu">>,
+			<<"name">>    => <<"lucos_example">>,
+			<<"status">>  => healthy,
+			<<"checks">>  => [#{<<"id">> => <<"fetch-info">>, <<"status">> => healthy, <<"statusText">> => <<"healthy">>, <<"techDetail">> => <<"Fetches /_info">>}],
+			<<"metrics">> => []
+		}],
+		Result = jiffy:decode(encodeStatus(Systems), [return_maps]),
+		SystemsMap = maps:get(<<"systems">>, Result),
+		System = maps:get(<<"example.l42.eu">>, SystemsMap),
 		?assertEqual(<<"lucos_example">>, maps:get(<<"name">>, System)),
-		?assertEqual(true, maps:get(<<"healthy">>, System)),
+		?assertEqual(<<"healthy">>, maps:get(<<"status">>, System)),
 		Summary = maps:get(<<"summary">>, Result),
 		?assertEqual(1, maps:get(<<"total_systems">>, Summary)),
 		?assertEqual(1, maps:get(<<"healthy">>, Summary)),
-		?assertEqual(0, maps:get(<<"erroring">>, Summary)),
+		?assertEqual(0, maps:get(<<"failing">>, Summary)),
 		?assertEqual(0, maps:get(<<"unknown">>, Summary)).
 
-	encodeStatus_erroring_system_test() ->
-		SystemMap = #{
-			"broken.l42.eu" => {"lucos_broken", #{
-				<<"fetch-info">> => #{<<"ok">> => false, <<"techDetail">> => <<"Fetches /_info">>, <<"debug">> => <<"Connection refused">>}
-			}, #{}}
-		},
-		Result = jiffy:decode(encodeStatus(SystemMap), [return_maps]),
-		Systems = maps:get(<<"systems">>, Result),
-		System = maps:get(<<"broken.l42.eu">>, Systems),
-		?assertEqual(false, maps:get(<<"healthy">>, System)),
+	encodeStatus_failing_system_test() ->
+		Systems = [#{
+			<<"host">>    => <<"broken.l42.eu">>,
+			<<"name">>    => <<"lucos_broken">>,
+			<<"status">>  => failing,
+			<<"checks">>  => [#{<<"id">> => <<"fetch-info">>, <<"status">> => failing, <<"statusText">> => <<"failing">>, <<"techDetail">> => <<"Fetches /_info">>, <<"debug">> => <<"Connection refused">>}],
+			<<"metrics">> => []
+		}],
+		Result = jiffy:decode(encodeStatus(Systems), [return_maps]),
+		SystemsMap = maps:get(<<"systems">>, Result),
+		System = maps:get(<<"broken.l42.eu">>, SystemsMap),
+		?assertEqual(<<"failing">>, maps:get(<<"status">>, System)),
 		Checks = maps:get(<<"checks">>, System),
 		FetchInfo = maps:get(<<"fetch-info">>, Checks),
-		?assertEqual(false, maps:get(<<"ok">>, FetchInfo)),
+		?assertEqual(<<"failing">>, maps:get(<<"status">>, FetchInfo)),
 		?assertEqual(<<"Connection refused">>, maps:get(<<"debug">>, FetchInfo)),
 		Summary = maps:get(<<"summary">>, Result),
 		?assertEqual(1, maps:get(<<"total_systems">>, Summary)),
 		?assertEqual(0, maps:get(<<"healthy">>, Summary)),
-		?assertEqual(1, maps:get(<<"erroring">>, Summary)),
+		?assertEqual(1, maps:get(<<"failing">>, Summary)),
 		?assertEqual(0, maps:get(<<"unknown">>, Summary)).
 
-	encodeStatus_unknown_system_name_test() ->
-		SystemMap = #{
-			"unreachable.l42.eu" => {unknown, #{
-				<<"fetch-info">> => #{<<"ok">> => unknown, <<"techDetail">> => <<"Fetches /_info">>}
-			}, #{}}
-		},
-		Result = jiffy:decode(encodeStatus(SystemMap), [return_maps]),
-		Systems = maps:get(<<"systems">>, Result),
-		System = maps:get(<<"unreachable.l42.eu">>, Systems),
-		?assertEqual(<<"unknown">>, maps:get(<<"name">>, System)),
+	encodeStatus_unknown_system_test() ->
+		Systems = [#{
+			<<"host">>    => <<"unreachable.l42.eu">>,
+			<<"name">>    => <<"lucos_unreachable">>,
+			<<"status">>  => unknown,
+			<<"checks">>  => [#{<<"id">> => <<"fetch-info">>, <<"status">> => unknown, <<"statusText">> => <<"unknown">>}],
+			<<"metrics">> => []
+		}],
+		Result = jiffy:decode(encodeStatus(Systems), [return_maps]),
+		SystemsMap = maps:get(<<"systems">>, Result),
+		System = maps:get(<<"unreachable.l42.eu">>, SystemsMap),
+		?assertEqual(<<"lucos_unreachable">>, maps:get(<<"name">>, System)),
+		?assertEqual(<<"unknown">>, maps:get(<<"status">>, System)),
 		Summary = maps:get(<<"summary">>, Result),
 		?assertEqual(1, maps:get(<<"total_systems">>, Summary)),
 		?assertEqual(0, maps:get(<<"healthy">>, Summary)),
-		?assertEqual(0, maps:get(<<"erroring">>, Summary)),
+		?assertEqual(0, maps:get(<<"failing">>, Summary)),
 		?assertEqual(1, maps:get(<<"unknown">>, Summary)).
-
-	encodeStatus_strips_internal_fields_test() ->
-		SystemMap = #{
-			"example.l42.eu" => {"lucos_example", #{
-				<<"fetch-info">> => #{<<"ok">> => true, <<"techDetail">> => <<"Fetches /_info">>, <<"unknown_count">> => 0, <<"link">> => <<"https://example.l42.eu/_info">>}
-			}, #{}}
-		},
-		Result = jiffy:decode(encodeStatus(SystemMap), [return_maps]),
-		Systems = maps:get(<<"systems">>, Result),
-		System = maps:get(<<"example.l42.eu">>, Systems),
-		Checks = maps:get(<<"checks">>, System),
-		FetchInfo = maps:get(<<"fetch-info">>, Checks),
-		?assertEqual(false, maps:is_key(<<"unknown_count">>, FetchInfo)),
-		?assertEqual(false, maps:is_key(<<"link">>, FetchInfo)).
 
 	encodeStatus_multiple_systems_summary_test() ->
-		SystemMap = #{
-			"healthy.l42.eu" => {"lucos_healthy", #{<<"fetch-info">> => #{<<"ok">> => true, <<"techDetail">> => <<"">>}}, #{}},
-			"erroring.l42.eu" => {"lucos_erroring", #{<<"fetch-info">> => #{<<"ok">> => false, <<"techDetail">> => <<"">>}}, #{}},
-			"unknown.l42.eu" => {unknown, #{<<"fetch-info">> => #{<<"ok">> => unknown, <<"techDetail">> => <<"">>}}, #{}}
-		},
-		Result = jiffy:decode(encodeStatus(SystemMap), [return_maps]),
+		Systems = [
+			#{<<"host">> => <<"healthy.l42.eu">>,   <<"name">> => <<"lucos_healthy">>,   <<"status">> => healthy,   <<"checks">> => [], <<"metrics">> => []},
+			#{<<"host">> => <<"failing.l42.eu">>,   <<"name">> => <<"lucos_failing">>,   <<"status">> => failing,   <<"checks">> => [], <<"metrics">> => []},
+			#{<<"host">> => <<"unknown.l42.eu">>,   <<"name">> => <<"lucos_unknown">>,   <<"status">> => unknown,   <<"checks">> => [], <<"metrics">> => []},
+			#{<<"host">> => <<"buffering.l42.eu">>, <<"name">> => <<"lucos_buffering">>, <<"status">> => buffering, <<"checks">> => [], <<"metrics">> => []}
+		],
+		Result = jiffy:decode(encodeStatus(Systems), [return_maps]),
 		Summary = maps:get(<<"summary">>, Result),
-		?assertEqual(3, maps:get(<<"total_systems">>, Summary)),
+		?assertEqual(4, maps:get(<<"total_systems">>, Summary)),
 		?assertEqual(1, maps:get(<<"healthy">>, Summary)),
-		?assertEqual(1, maps:get(<<"erroring">>, Summary)),
-		?assertEqual(1, maps:get(<<"unknown">>, Summary)).
+		?assertEqual(1, maps:get(<<"failing">>, Summary)),
+		% buffering counts towards unknown in summary (not definitively healthy or failing)
+		?assertEqual(2, maps:get(<<"unknown">>, Summary)).
 
-	checkSortPriority_erroring_test() ->
-		?assertEqual(0, checkSortPriority(#{<<"ok">> => false})).
+	checkStatusSortPriority_failing_test() ->
+		?assertEqual(0, checkStatusSortPriority(failing)).
 
-	checkSortPriority_health_unknown_test() ->
-		?assertEqual(1, checkSortPriority(#{<<"ok">> => unknown})).
+	checkStatusSortPriority_unknown_test() ->
+		?assertEqual(1, checkStatusSortPriority(unknown)).
 
-	checkSortPriority_buffering_unknown_count_test() ->
-		% Healthy overall but has unknown_count > 0 → buffering
-		?assertEqual(2, checkSortPriority(#{<<"ok">> => true, <<"unknown_count">> => 1})).
+	checkStatusSortPriority_buffering_test() ->
+		?assertEqual(2, checkStatusSortPriority(buffering)).
 
-	checkSortPriority_buffering_fail_count_test() ->
-		% failThreshold > 1 and fail_count > 0 → buffering
-		?assertEqual(2, checkSortPriority(#{<<"ok">> => true, <<"fail_count">> => 1, <<"failThreshold">> => 3})).
+	checkStatusSortPriority_healthy_test() ->
+		?assertEqual(3, checkStatusSortPriority(healthy)).
 
-	checkSortPriority_healthy_test() ->
-		?assertEqual(3, checkSortPriority(#{<<"ok">> => true})).
+	systemStatusSortPriority_failing_test() ->
+		?assertEqual(0, systemStatusSortPriority(failing)).
+
+	systemStatusSortPriority_unknown_test() ->
+		?assertEqual(1, systemStatusSortPriority(unknown)).
+
+	systemStatusSortPriority_buffering_test() ->
+		?assertEqual(2, systemStatusSortPriority(buffering)).
+
+	systemStatusSortPriority_suppressed_test() ->
+		?assertEqual(3, systemStatusSortPriority(suppressed)).
+
+	systemStatusSortPriority_pending_verification_test() ->
+		?assertEqual(3, systemStatusSortPriority(pending_verification)).
+
+	systemStatusSortPriority_healthy_test() ->
+		?assertEqual(4, systemStatusSortPriority(healthy)).
+
+	statusToCssClass_healthy_test() ->
+		?assertEqual("healthy", statusToCssClass(healthy)).
+
+	statusToCssClass_failing_test() ->
+		?assertEqual("failing", statusToCssClass(failing)).
+
+	statusToCssClass_unknown_test() ->
+		?assertEqual("unknown", statusToCssClass(unknown)).
+
+	statusToCssClass_buffering_test() ->
+		?assertEqual("buffering", statusToCssClass(buffering)).
+
+	statusToCssClass_pending_verification_test() ->
+		?assertEqual("pending-verification", statusToCssClass(pending_verification)).
+
+	statusToCssClass_suppressed_test() ->
+		?assertEqual("suppressed", statusToCssClass(suppressed)).
 
 	renderSystemChecks_order_test() ->
-		SystemChecks = #{
-			<<"b-healthy">>      => #{<<"ok">> => true},
-			<<"a-erroring">>     => #{<<"ok">> => false},
-			<<"c-unknown">>      => #{<<"ok">> => unknown},
-			<<"d-buffering">>    => #{<<"ok">> => true, <<"unknown_count">> => 1},
-			<<"a-healthy">>      => #{<<"ok">> => true}
-		},
+		SystemChecks = [
+			#{<<"id">> => <<"b-healthy">>,   <<"status">> => healthy,   <<"statusText">> => <<"healthy">>},
+			#{<<"id">> => <<"a-failing">>,   <<"status">> => failing,   <<"statusText">> => <<"failing">>},
+			#{<<"id">> => <<"c-unknown">>,   <<"status">> => unknown,   <<"statusText">> => <<"unknown">>},
+			#{<<"id">> => <<"d-buffering">>, <<"status">> => buffering, <<"statusText">> => <<"unknown (1)">>},
+			#{<<"id">> => <<"a-healthy">>,   <<"status">> => healthy,   <<"statusText">> => <<"healthy">>}
+		],
 		Html = renderSystemChecks(SystemChecks),
-		PosErroring  = string:str(Html, "a-erroring"),
+		PosFailing   = string:str(Html, "a-failing"),
 		PosUnknown   = string:str(Html, "c-unknown"),
 		PosBuffering = string:str(Html, "d-buffering"),
 		PosAHealthy  = string:str(Html, "a-healthy"),
 		PosBHealthy  = string:str(Html, "b-healthy"),
-		?assert(PosErroring  < PosUnknown,   "erroring must come before health-unknown"),
-		?assert(PosUnknown   < PosBuffering, "health-unknown must come before buffering"),
+		?assert(PosFailing   < PosUnknown,   "failing must come before unknown"),
+		?assert(PosUnknown   < PosBuffering, "unknown must come before buffering"),
 		?assert(PosBuffering < PosAHealthy,  "buffering must come before healthy"),
 		?assert(PosAHealthy  < PosBHealthy,  "healthy checks must be sorted alphabetically").
 
 	renderSystemMetrics_order_test() ->
-		SystemMetrics = #{
-			<<"z-metric">> => #{<<"value">> => 1},
-			<<"a-metric">> => #{<<"value">> => 2},
-			<<"m-metric">> => #{<<"value">> => 3}
-		},
+		SystemMetrics = [
+			#{<<"id">> => <<"z-metric">>, <<"value">> => 1, <<"techDetail">> => <<"">>},
+			#{<<"id">> => <<"a-metric">>, <<"value">> => 2, <<"techDetail">> => <<"">>},
+			#{<<"id">> => <<"m-metric">>, <<"value">> => 3, <<"techDetail">> => <<"">>}
+		],
 		Html = renderSystemMetrics(SystemMetrics),
 		PosA = string:str(Html, "a-metric"),
 		PosM = string:str(Html, "m-metric"),
@@ -693,31 +672,5 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		gen_server:stop(StatePid),
 		os:unsetenv("CLIENT_KEYS"),
 		?assertEqual(401, StatusCode).
-
-	getSuppressionStatus_not_suppressed_test() ->
-		% System not in suppression map — none
-		?assertEqual(none, getSuppressionStatus("lucos_foo", #{})).
-
-	getSuppressionStatus_pending_verification_test() ->
-		% pending_verification tuple — returns pending_verification
-		PendingSources = sets:from_list([info], [{version, 2}]),
-		SuppressionMap = #{"lucos_foo" => {pending_verification, PendingSources}},
-		?assertEqual(pending_verification, getSuppressionStatus("lucos_foo", SuppressionMap)).
-
-	getSuppressionStatus_active_test() ->
-		% Expiry time in the future — returns active
-		FutureExpiry = erlang:system_time(second) + 600,
-		SuppressionMap = #{"lucos_foo" => FutureExpiry},
-		?assertEqual(active, getSuppressionStatus("lucos_foo", SuppressionMap)).
-
-	getSuppressionStatus_expired_test() ->
-		% Expiry time in the past — treated as none (window expired without being cleared)
-		PastExpiry = erlang:system_time(second) - 1,
-		SuppressionMap = #{"lucos_foo" => PastExpiry},
-		?assertEqual(none, getSuppressionStatus("lucos_foo", SuppressionMap)).
-
-	getSuppressionStatus_unknown_system_test() ->
-		% System name is the atom 'unknown' — always none regardless of map contents
-		?assertEqual(none, getSuppressionStatus(unknown, #{"unknown" => erlang:system_time(second) + 600})).
 
 -endif.

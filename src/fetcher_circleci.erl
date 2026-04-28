@@ -1,5 +1,5 @@
 -module(fetcher_circleci).
--export([start/1, parseConfigyRepos/1]).
+-export([start/1, parseConfigyRepos/2]).
 -include_lib("eunit/include/eunit.hrl").
 
 % Reads the CI repo lists (written at build time from configy) and spawns a
@@ -8,15 +8,20 @@ start(StatePid) ->
 	{ok, _} = application:ensure_all_started([ssl, inets]),
 	{ok, SystemsBody} = file:read_file("./config/ci-systems-list.json"),
 	{ok, ComponentsBody} = file:read_file("./config/ci-components-list.json"),
-	Repos = parseConfigyRepos(binary_to_list(SystemsBody)) ++
-	        parseConfigyRepos(binary_to_list(ComponentsBody)),
-	lists:foreach(fun({RepoId, Host}) ->
-		spawn(fun() -> ciRepoLoop(StatePid, RepoId, Host) end)
+	% ci-systems-list.json entries are systems; ci-components-list.json entries are components.
+	% DefaultType is the atom used when an entry has no explicit "type" field.
+	Repos = parseConfigyRepos(binary_to_list(SystemsBody), system) ++
+	        parseConfigyRepos(binary_to_list(ComponentsBody), component),
+	lists:foreach(fun({RepoId, Type, Host}) ->
+		spawn(fun() -> ciRepoLoop(StatePid, RepoId, Type, Host) end)
 	end, Repos).
 
-parseConfigyRepos(Body) ->
+% Parses a JSON array of repo entries. DefaultType is the atom used when an
+% entry has no "type" field. Returns a list of {RepoId, Type, Host} triples.
+parseConfigyRepos(Body, DefaultType) ->
 	Repos = jiffy:decode(Body, [return_maps]),
 	[{binary_to_list(maps:get(<<"id">>, Repo)),
+	  binary_to_atom(maps:get(<<"type">>, Repo, atom_to_binary(DefaultType)), utf8),
 	  repoHost(Repo)} || Repo <- Repos].
 
 repoHost(Repo) ->
@@ -25,17 +30,17 @@ repoHost(Repo) ->
 		Domain -> binary_to_list(Domain)
 	end.
 
-ciRepoLoop(StatePid, RepoId, Host) ->
+ciRepoLoop(StatePid, RepoId, Type, Host) ->
 	try
 		Slug = "github/lucas42/" ++ RepoId,
 		CIChecks = checkCIForSlug(Slug),
-		ok = gen_server:cast(StatePid, {updateSystem, Host, RepoId, circleci, CIChecks, #{}})
+		ok = gen_server:cast(StatePid, {updateSystem, Host, RepoId, Type, circleci, CIChecks, #{}})
 	catch
 		ExceptionClass:Term:StackTrace ->
 			logger:error("ExceptionClass: ~p Term: ~p StackTrace: ~p", [ExceptionClass, Term, StackTrace])
 	end,
 	timer:sleep(timer:seconds(60)),
-	ciRepoLoop(StatePid, RepoId, Host).
+	ciRepoLoop(StatePid, RepoId, Type, Host).
 
 % CircleCI pipeline check logic. Returns a checks map:
 %   - #{} (empty) when the project has no CI configured (404) — the state
@@ -187,11 +192,22 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 	parseConfigyRepos_test() ->
 		% System with a domain: host is the domain.
 		% Component with no domain: host falls back to the repo id.
+		% DefaultType is used when no "type" field is present.
 		Body = "[{\"id\":\"lucos_foo\",\"domain\":\"foo.l42.eu\"},{\"id\":\"lucos_bar\",\"domain\":null}]",
-		?assertEqual([{"lucos_foo", "foo.l42.eu"}, {"lucos_bar", "lucos_bar"}], parseConfigyRepos(Body)).
+		?assertEqual([{"lucos_foo", system, "foo.l42.eu"}, {"lucos_bar", system, "lucos_bar"}], parseConfigyRepos(Body, system)).
+
+	parseConfigyRepos_default_type_component_test() ->
+		% DefaultType component: entries from ci-components-list.json use the component atom.
+		Body = "[{\"id\":\"lucos_comp\",\"domain\":null}]",
+		?assertEqual([{"lucos_comp", component, "lucos_comp"}], parseConfigyRepos(Body, component)).
+
+	parseConfigyRepos_explicit_type_overrides_default_test() ->
+		% When an entry has an explicit "type" field, it overrides DefaultType.
+		Body = "[{\"id\":\"lucos_host\",\"domain\":\"host.l42.eu\",\"type\":\"host\"}]",
+		?assertEqual([{"lucos_host", host, "host.l42.eu"}], parseConfigyRepos(Body, system)).
 
 	parseConfigyRepos_empty_test() ->
-		?assertEqual([], parseConfigyRepos("[]")).
+		?assertEqual([], parseConfigyRepos("[]", system)).
 
 	handlePipelineItems_no_pipelines_test() ->
 		% 0 pipelines → exempt (no check). Repos with no active CircleCI project
