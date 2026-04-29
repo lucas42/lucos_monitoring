@@ -103,7 +103,20 @@ handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers}) ->
 			case systemExists(System, SystemMap) of
 				true ->
 					ExpiryTime = erlang:system_time(second) + 600,
-					NewSuppressionMap = maps:put(System, ExpiryTime, SuppressionMap),
+					% Snapshot per-Host failing-check keys at suppress-time. During the
+					% suppression window, state_change/6 partitions the current FailingNow
+					% set against this snapshot: checks that were already failing are
+					% continuing problems (alert), checks that became failing during the
+					% window are likely deploy churn (suppress).
+					% Per-Host because SystemMap is keyed by Host and a System could in
+					% principle span multiple hosts (today it's 1:1; the data model supports more).
+					PreExisting = maps:fold(fun
+						(Host, {S, _, _, NormalisedCache, _}, Acc) when S =:= System ->
+							FailingKeys = sets:from_list(maps:keys(failingChecks(NormalisedCache)), [{version, 2}]),
+							maps:put(Host, FailingKeys, Acc);
+						(_, _, Acc) -> Acc
+					end, #{}, SystemMap),
+					NewSuppressionMap = maps:put(System, {ExpiryTime, PreExisting}, SuppressionMap),
 					logger:notice("Suppression window opened for ~p", [System]),
 					{reply, ok, {SystemMap, NewSuppressionMap, Notifiers}};
 				false ->
@@ -275,12 +288,31 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 					logger:notice("Checks' state changed for ~p on ~p", [System, Host]),
 					notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
 					SuppressionMap;
-				ExpiryTime ->
+				{ExpiryTime, PreExisting} ->
 					Now = erlang:system_time(second),
 					case Now < ExpiryTime of
 						true ->
-							logger:notice("Alert suppressed for ~p during deploy window", [System]),
-							notify_all(Host, System, FailingNow, true, SystemMetrics, Notifiers),
+							% Partition FailingNow against the pre-existing snapshot for this Host:
+							%   - PreExistingFailing: failing-already-at-suppress-time → continuing problem,
+							%     alert as Suppressed=false
+							%   - NewlyFailing: became unhealthy during the window → likely deploy churn,
+							%     alert as Suppressed=true (the existing suppression rationale)
+							% This restores the visual distinction between continuing failures and
+							% post-deploy flap in the Loganne event stream.
+							HostPreExisting = maps:get(Host, PreExisting, sets:new([{version, 2}])),
+							{PreExistingFailing, NewlyFailing} = partitionByPreExisting(FailingNow, HostPreExisting),
+							case maps:size(PreExistingFailing) > 0 of
+								true ->
+									logger:notice("Pre-existing failures continuing during deploy window for ~p: ~p", [System, maps:keys(PreExistingFailing)]),
+									notify_all(Host, System, PreExistingFailing, false, SystemMetrics, Notifiers);
+								false -> ok
+							end,
+							case maps:size(NewlyFailing) > 0 of
+								true ->
+									logger:notice("Alert suppressed for ~p during deploy window", [System]),
+									notify_all(Host, System, NewlyFailing, true, SystemMetrics, Notifiers);
+								false -> ok
+							end,
 							SuppressionMap;
 						false ->
 							logger:error("Suppression window for ~p expired without being cleared - deploy may have taken longer than 10 minutes", [System]),
@@ -290,6 +322,16 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 					end
 			end
 	end.
+
+% Partitions a map of failing checks into (PreExistingFailing, NewlyFailing) using
+% a set of pre-existing-failing check keys captured at suppress-time.
+partitionByPreExisting(FailingNow, HostPreExisting) ->
+	maps:fold(fun(Key, Check, {PreAcc, NewAcc}) ->
+		case sets:is_element(Key, HostPreExisting) of
+			true  -> {maps:put(Key, Check, PreAcc), NewAcc};
+			false -> {PreAcc, maps:put(Key, Check, NewAcc)}
+		end
+	end, {#{}, #{}}, FailingNow).
 
 % Returns true if this check's dependsOn system is currently under an active suppression window.
 % Guards against self-references (CurrentSystem == dependsOn) and treats pending_verification
@@ -306,7 +348,7 @@ is_dependency_suppressed(Check, CurrentSystem, SuppressionMap) ->
 					case maps:get(DependsOnStr, SuppressionMap, undefined) of
 						undefined -> false;
 						{pending_verification, _} -> false;  % Suppression has been lifted
-						ExpiryTime ->
+						{ExpiryTime, _PreExisting} ->
 							Now = erlang:system_time(second),
 							Now < ExpiryTime
 					end
@@ -387,13 +429,27 @@ annotateCheckStatuses(NormalisedCache) ->
 
 % Computes the system-level status atom by walking the priority list from ADR-0001.
 % Per-check status must already be annotated (<<"status">> present in each check map).
-computeSystemStatus(SystemId, NormalisedCache, SuppressionMap) ->
+%
+% During an active suppression window, the system collapses to `suppressed` UNLESS
+% any pre-existing-failing check (snapshotted at suppress-time for this Host) is
+% still in the current failing set — in which case the system has a continuing
+% problem that must remain visible on the dashboard, and we fall through to
+% aggregateCheckStatuses to compute the honest status. This matches the
+% Loganne-side narrowing in state_change/6: the two surfaces stay consistent.
+computeSystemStatus(Host, SystemId, NormalisedCache, SuppressionMap) ->
 	Now = erlang:system_time(second),
 	case maps:get(SystemId, SuppressionMap, undefined) of
 		{pending_verification, _} ->
 			pending_verification;
-		ExpiryTime when is_integer(ExpiryTime), ExpiryTime > Now ->
-			suppressed;
+		{ExpiryTime, PreExisting} when ExpiryTime > Now ->
+			HostPreExisting = maps:get(Host, PreExisting, sets:new([{version, 2}])),
+			CurrentFailingKeys = sets:from_list(maps:keys(maps:filter(fun(_, Check) ->
+				maps:get(<<"status">>, Check, unknown) =:= failing
+			end, NormalisedCache)), [{version, 2}]),
+			case sets:size(sets:intersection(HostPreExisting, CurrentFailingKeys)) > 0 of
+				true -> aggregateCheckStatuses(SystemId, NormalisedCache, SuppressionMap);
+				false -> suppressed
+			end;
 		_ ->
 			aggregateCheckStatuses(SystemId, NormalisedCache, SuppressionMap)
 	end.
@@ -427,7 +483,7 @@ aggregateCheckStatuses(SystemId, NormalisedCache, SuppressionMap) ->
 buildSystemOutput(Host, SystemId, SystemType, NormalisedCache, Metrics, SuppressionMap) ->
 	Checks = [buildCheckOutput(CheckId, Check) || {CheckId, Check} <- maps:to_list(NormalisedCache)],
 	MetricsList = [buildMetricOutput(MetricId, Metric) || {MetricId, Metric} <- maps:to_list(Metrics)],
-	SystemStatus = computeSystemStatus(SystemId, NormalisedCache, SuppressionMap),
+	SystemStatus = computeSystemStatus(Host, SystemId, NormalisedCache, SuppressionMap),
 	#{
 		<<"id">>      => list_to_binary(SystemId),
 		<<"type">>    => SystemType,
@@ -635,7 +691,7 @@ buildMetricOutput(MetricId, Metric) ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		SystemMap = #{"host1.example.com" => {"lucos_foo", system, #{info => HealthyChecks}, #{}, #{}}},
 		Notifier = recording_notifier(self()),
-		State = {SystemMap, #{"lucos_foo" => erlang:system_time(second) + 600}, [Notifier]},
+		State = {SystemMap, #{"lucos_foo" => {erlang:system_time(second) + 600, #{}}}, [Notifier]},
 		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
 			{unsuppress, "lucos_foo"}, from, State
 		),
@@ -652,7 +708,7 @@ buildMetricOutput(MetricId, Metric) ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		SystemMap = #{"host1.example.com" => {"lucos_foo", system, #{info => FailingChecks}, #{}, #{}}},
 		Notifier = recording_notifier(self()),
-		State = {SystemMap, #{"lucos_foo" => erlang:system_time(second) + 600}, [Notifier]},
+		State = {SystemMap, #{"lucos_foo" => {erlang:system_time(second) + 600, #{}}}, [Notifier]},
 		drain_notifications(),
 		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
 			{unsuppress, "lucos_foo"}, from, State
@@ -912,7 +968,7 @@ buildMetricOutput(MetricId, Metric) ->
 	is_dependency_suppressed_active_suppression_test() ->
 		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>},
 		FutureExpiry = erlang:system_time(second) + 600,
-		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
+		SuppressionMap = #{"lucos_eolas" => {FutureExpiry, #{}}},
 		?assertEqual(true, is_dependency_suppressed(Check, "lucos_time", SuppressionMap)).
 
 	% is_dependency_suppressed: dependsOn system is in pending_verification (suppression lifted) → false
@@ -926,14 +982,14 @@ buildMetricOutput(MetricId, Metric) ->
 	is_dependency_suppressed_self_reference_test() ->
 		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_foo">>},
 		FutureExpiry = erlang:system_time(second) + 600,
-		SuppressionMap = #{"lucos_foo" => FutureExpiry},
+		SuppressionMap = #{"lucos_foo" => {FutureExpiry, #{}}},
 		?assertEqual(false, is_dependency_suppressed(Check, "lucos_foo", SuppressionMap)).
 
 	% is_dependency_suppressed: suppression window has expired → false
 	is_dependency_suppressed_expired_test() ->
 		Check = #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>},
 		PastExpiry = erlang:system_time(second) - 1,
-		SuppressionMap = #{"lucos_eolas" => PastExpiry},
+		SuppressionMap = #{"lucos_eolas" => {PastExpiry, #{}}},
 		?assertEqual(false, is_dependency_suppressed(Check, "lucos_time", SuppressionMap)).
 
 	% find_dependent_systems: returns system IDs with checks declaring dependsOn TargetSystem
@@ -982,7 +1038,7 @@ buildMetricOutput(MetricId, Metric) ->
 	% When all failing checks have an active dependsOn suppression, no alert email is sent.
 	state_change_all_dep_suppressed_test() ->
 		FutureExpiry = erlang:system_time(second) + 600,
-		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
+		SuppressionMap = #{"lucos_eolas" => {FutureExpiry, #{}}},
 		SystemChecks = #{
 			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>, <<"fail_count">> => 0, <<"unknown_count">> => 0}
 		},
@@ -999,7 +1055,7 @@ buildMetricOutput(MetricId, Metric) ->
 	% When only some checks are dep-suppressed, the non-suppressed ones still alert.
 	state_change_partial_dep_suppressed_test() ->
 		FutureExpiry = erlang:system_time(second) + 600,
-		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
+		SuppressionMap = #{"lucos_eolas" => {FutureExpiry, #{}}},
 		SystemChecks = #{
 			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>, <<"fail_count">> => 0, <<"unknown_count">> => 0},
 			<<"db">> => #{<<"ok">> => false, <<"fail_count">> => 0, <<"unknown_count">> => 0}
@@ -1024,7 +1080,7 @@ buildMetricOutput(MetricId, Metric) ->
 			"schedule-tracker.l42.eu" => {"lucos_time", system, #{info => TimeChecks}, #{}, #{}}
 		},
 		FutureExpiry = erlang:system_time(second) + 600,
-		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
+		SuppressionMap = #{"lucos_eolas" => {FutureExpiry, #{}}},
 		State = {SystemMap, SuppressionMap, []},
 		{reply, ok, {_, NewSuppressionMap, _}} = handle_call(
 			{unsuppress, "lucos_eolas"}, from, State
@@ -1098,45 +1154,73 @@ buildMetricOutput(MetricId, Metric) ->
 	% this state. Treating them as unknown would pull them to the top of the monitoring page
 	% as permanent noise. They should be healthy and sort to the bottom.
 	compute_system_status_no_checks_test() ->
-		?assertEqual(healthy, computeSystemStatus("lucos_foo", #{}, #{})).
+		?assertEqual(healthy, computeSystemStatus("host1", "lucos_foo", #{}, #{})).
 
 	% computeSystemStatus: all healthy checks → healthy
 	compute_system_status_healthy_test() ->
 		Cache = #{<<"a">> => #{<<"ok">> => true, <<"status">> => healthy, <<"statusText">> => <<"healthy">>}},
-		?assertEqual(healthy, computeSystemStatus("lucos_foo", Cache, #{})).
+		?assertEqual(healthy, computeSystemStatus("host1", "lucos_foo", Cache, #{})).
 
 	% computeSystemStatus: any failing check → failing
 	compute_system_status_failing_test() ->
 		Cache = #{<<"a">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>}},
-		?assertEqual(failing, computeSystemStatus("lucos_foo", Cache, #{})).
+		?assertEqual(failing, computeSystemStatus("host1", "lucos_foo", Cache, #{})).
 
 	% computeSystemStatus: any unknown check → unknown
 	compute_system_status_unknown_test() ->
 		Cache = #{<<"a">> => #{<<"ok">> => unknown, <<"status">> => unknown, <<"statusText">> => <<"unknown">>}},
-		?assertEqual(unknown, computeSystemStatus("lucos_foo", Cache, #{})).
+		?assertEqual(unknown, computeSystemStatus("host1", "lucos_foo", Cache, #{})).
 
 	% computeSystemStatus: any buffering check → buffering
 	compute_system_status_buffering_test() ->
 		Cache = #{<<"a">> => #{<<"ok">> => true, <<"unknown_count">> => 1, <<"status">> => buffering, <<"statusText">> => <<"unknown (1)">>}},
-		?assertEqual(buffering, computeSystemStatus("lucos_foo", Cache, #{})).
+		?assertEqual(buffering, computeSystemStatus("host1", "lucos_foo", Cache, #{})).
 
-	% computeSystemStatus: active suppression → suppressed (even if checks are failing)
+	% computeSystemStatus: active suppression with no pre-existing failures → suppressed
+	% (the failing check appeared during the deploy window, so it's appropriately hidden).
 	compute_system_status_suppressed_test() ->
 		FutureExpiry = erlang:system_time(second) + 600,
 		Cache = #{<<"a">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>}},
-		?assertEqual(suppressed, computeSystemStatus("lucos_foo", Cache, #{"lucos_foo" => FutureExpiry})).
+		?assertEqual(suppressed, computeSystemStatus("host1", "lucos_foo", Cache, #{"lucos_foo" => {FutureExpiry, #{}}})).
+
+	% computeSystemStatus: active suppression with a pre-existing failure still failing →
+	% falls through to aggregateCheckStatuses so the system remains visibly failing on
+	% the dashboard during the deploy window.
+	compute_system_status_active_window_pre_existing_failure_visible_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		Cache = #{<<"a">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>}},
+		PreExisting = #{"host1" => sets:from_list([<<"a">>], [{version, 2}])},
+		?assertEqual(failing, computeSystemStatus("host1", "lucos_foo", Cache, #{"lucos_foo" => {FutureExpiry, PreExisting}})).
+
+	% computeSystemStatus: active suppression where the only currently-failing check is NOT in
+	% the pre-existing snapshot → still suppressed (this is exactly the "deploy churn" case
+	% the suppression is designed for).
+	compute_system_status_active_window_new_failure_only_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		Cache = #{<<"new-check">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>}},
+		PreExisting = #{"host1" => sets:from_list([<<"some-other-check">>], [{version, 2}])},
+		?assertEqual(suppressed, computeSystemStatus("host1", "lucos_foo", Cache, #{"lucos_foo" => {FutureExpiry, PreExisting}})).
+
+	% computeSystemStatus: active suppression where pre-existing-failing has since recovered →
+	% suppressed (no continuing problem to surface).
+	compute_system_status_active_window_pre_existing_recovered_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		Cache = #{<<"a">> => #{<<"ok">> => true, <<"status">> => healthy, <<"statusText">> => <<"healthy">>}},
+		PreExisting = #{"host1" => sets:from_list([<<"a">>], [{version, 2}])},
+		?assertEqual(suppressed, computeSystemStatus("host1", "lucos_foo", Cache, #{"lucos_foo" => {FutureExpiry, PreExisting}})).
 
 	% computeSystemStatus: pending_verification → pending_verification
 	compute_system_status_pending_verification_test() ->
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Cache = #{<<"a">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>}},
-		?assertEqual(pending_verification, computeSystemStatus("lucos_foo", Cache, #{"lucos_foo" => {pending_verification, PendingSources}})).
+		?assertEqual(pending_verification, computeSystemStatus("host1", "lucos_foo", Cache, #{"lucos_foo" => {pending_verification, PendingSources}})).
 
-	% computeSystemStatus: failing check inside suppressed system — system is suppressed, check is still failing
+	% computeSystemStatus: failing check inside suppressed system (no pre-existing) — system
+	% is suppressed, check is still failing.
 	suppressed_system_check_status_honest_test() ->
 		FutureExpiry = erlang:system_time(second) + 600,
 		Cache = #{<<"a">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>}},
-		SystemStatus = computeSystemStatus("lucos_foo", Cache, #{"lucos_foo" => FutureExpiry}),
+		SystemStatus = computeSystemStatus("host1", "lucos_foo", Cache, #{"lucos_foo" => {FutureExpiry, #{}}}),
 		CheckStatus = maps:get(<<"status">>, maps:get(<<"a">>, Cache)),
 		?assertEqual(suppressed, SystemStatus),
 		?assertEqual(failing, CheckStatus).
@@ -1150,8 +1234,8 @@ buildMetricOutput(MetricId, Metric) ->
 			<<"status">> => failing,
 			<<"statusText">> => <<"failing">>
 		}},
-		SuppressionMap = #{"lucos_eolas" => FutureExpiry},
-		?assertEqual(healthy, computeSystemStatus("lucos_time", Cache, SuppressionMap)).
+		SuppressionMap = #{"lucos_eolas" => {FutureExpiry, #{}}},
+		?assertEqual(healthy, computeSystemStatus("host1", "lucos_time", Cache, SuppressionMap)).
 
 	% failing takes priority over unknown (step 3 before step 4)
 	compute_system_status_priority_failing_over_unknown_test() ->
@@ -1159,7 +1243,7 @@ buildMetricOutput(MetricId, Metric) ->
 			<<"a">> => #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>},
 			<<"b">> => #{<<"ok">> => unknown, <<"status">> => unknown, <<"statusText">> => <<"unknown">>}
 		},
-		?assertEqual(failing, computeSystemStatus("lucos_foo", Cache, #{})).
+		?assertEqual(failing, computeSystemStatus("host1", "lucos_foo", Cache, #{})).
 
 	% unknown takes priority over buffering (step 4 before step 5)
 	compute_system_status_priority_unknown_over_buffering_test() ->
@@ -1167,6 +1251,92 @@ buildMetricOutput(MetricId, Metric) ->
 			<<"a">> => #{<<"ok">> => unknown, <<"status">> => unknown, <<"statusText">> => <<"unknown">>},
 			<<"b">> => #{<<"ok">> => true, <<"unknown_count">> => 1, <<"status">> => buffering, <<"statusText">> => <<"unknown (1)">>}
 		},
-		?assertEqual(unknown, computeSystemStatus("lucos_foo", Cache, #{})).
+		?assertEqual(unknown, computeSystemStatus("host1", "lucos_foo", Cache, #{})).
+
+	% suppress: snapshot pre-existing failing checks at suppress-time. A subsequent
+	% state_change with the same checks should split the alert into a Suppressed=false
+	% notification (continuing problem) — NOT collapse to a single Suppressed=true.
+	suppress_snapshots_pre_existing_failures_test() ->
+		FailingChecks = #{<<"host-tracking-failures">> => #{<<"ok">> => false, <<"fail_count">> => 1, <<"unknown_count">> => 0}},
+		AnnotatedFailing = annotateCheckStatuses(FailingChecks),
+		SystemMap = #{"host1" => {"lucos_foo", system, #{info => FailingChecks}, AnnotatedFailing, #{}}},
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State = {SystemMap, #{}, [Notifier]},
+		{reply, ok, {_SM, NewSuppressionMap, _}} = handle_call({suppress, "lucos_foo"}, from, State),
+		% Snapshot must contain the host-tracking-failures key under "host1"
+		{ExpiryTime, PreExisting} = maps:get("lucos_foo", NewSuppressionMap),
+		?assert(is_integer(ExpiryTime)),
+		?assertMatch(#{"host1" := _}, PreExisting),
+		HostKeys = maps:get("host1", PreExisting),
+		?assert(sets:is_element(<<"host-tracking-failures">>, HostKeys)).
+
+	% state_change: pre-existing failure during active window → Suppressed=false (continuing problem).
+	state_change_pre_existing_alerts_unsuppressed_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		PreExisting = #{"host1" => sets:from_list([<<"host-tracking-failures">>], [{version, 2}])},
+		SuppressionMap = #{"lucos_backups" => {FutureExpiry, PreExisting}},
+		SystemChecks = #{<<"host-tracking-failures">> => #{<<"ok">> => false, <<"fail_count">> => 1, <<"unknown_count">> => 0}},
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		state_change("host1", "lucos_backups", SystemChecks, #{}, SuppressionMap, [Notifier]),
+		receive
+			{notified, "host1", "lucos_backups", FailingNow, false, _} ->
+				?assert(maps:is_key(<<"host-tracking-failures">>, FailingNow))
+		after 100 ->
+			?assert(false, "Expected unsuppressed alert for pre-existing failure")
+		end.
+
+	% state_change: only-newly-failing during active window → Suppressed=true (deploy churn).
+	state_change_newly_failing_during_window_suppressed_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		PreExisting = #{"host1" => sets:new([{version, 2}])},
+		SuppressionMap = #{"lucos_foo" => {FutureExpiry, PreExisting}},
+		SystemChecks = #{<<"new-failure">> => #{<<"ok">> => false, <<"fail_count">> => 1, <<"unknown_count">> => 0}},
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		state_change("host1", "lucos_foo", SystemChecks, #{}, SuppressionMap, [Notifier]),
+		receive
+			{notified, "host1", "lucos_foo", FailingNow, true, _} ->
+				?assert(maps:is_key(<<"new-failure">>, FailingNow))
+		after 100 ->
+			?assert(false, "Expected suppressed alert for newly-failing check")
+		end.
+
+	% state_change: mix of pre-existing and new failures during active window → two separate
+	% notify_all calls, one per partition, with the right Suppressed flag for each.
+	state_change_partitions_pre_existing_and_newly_failing_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		PreExisting = #{"host1" => sets:from_list([<<"old-failure">>], [{version, 2}])},
+		SuppressionMap = #{"lucos_foo" => {FutureExpiry, PreExisting}},
+		SystemChecks = #{
+			<<"old-failure">> => #{<<"ok">> => false, <<"fail_count">> => 1, <<"unknown_count">> => 0},
+			<<"new-failure">> => #{<<"ok">> => false, <<"fail_count">> => 1, <<"unknown_count">> => 0}
+		},
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		state_change("host1", "lucos_foo", SystemChecks, #{}, SuppressionMap, [Notifier]),
+		% Collect both notifications — order is not guaranteed.
+		Notifications = collect_notifications(2, []),
+		Unsuppressed = [Keys || {_, _, _, Keys, false, _} <- Notifications],
+		Suppressed   = [Keys || {_, _, _, Keys, true,  _} <- Notifications],
+		?assertEqual(1, length(Unsuppressed)),
+		?assertEqual(1, length(Suppressed)),
+		[UnsupKeys] = Unsuppressed,
+		[SupKeys]   = Suppressed,
+		?assert(maps:is_key(<<"old-failure">>, UnsupKeys)),
+		?assertNot(maps:is_key(<<"new-failure">>, UnsupKeys)),
+		?assert(maps:is_key(<<"new-failure">>, SupKeys)),
+		?assertNot(maps:is_key(<<"old-failure">>, SupKeys)).
+
+	% Helper: collect N notifications from the test process mailbox, in order received.
+	collect_notifications(0, Acc) ->
+		lists:reverse(Acc);
+	collect_notifications(N, Acc) ->
+		receive
+			{notified, _, _, _, _, _} = Msg -> collect_notifications(N - 1, [Msg | Acc])
+		after 100 ->
+			lists:reverse(Acc)
+		end.
 
 -endif.
