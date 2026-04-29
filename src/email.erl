@@ -65,8 +65,52 @@ getMetricSummary(SystemMetrics) ->
 		0 ->
 			"";
 		_ ->
-			io_lib:format("** System Metrics **~n~p~n",[SystemMetrics])
+			"** System Metrics **\r\n" ++
+			maps:fold(fun (MetricId, Metric, Acc) ->
+				Id = binary_to_list(MetricId),
+				Value = maps:get(<<"value">>, Metric, 0),
+				ValueStr = lists:flatten(io_lib:format("~p", [Value])),
+				TechDetail = binary_to_list(maps:get(<<"techDetail">>, Metric, <<"">>)),
+				TechDetailStr = case TechDetail of
+					"" -> "";
+					_ -> " (" ++ TechDetail ++ ")"
+				end,
+				Acc ++ Id ++ ": " ++ ValueStr ++ TechDetailStr ++ "\r\n"
+			end, "", SystemMetrics)
 	end.
+
+-ifdef(TEST).
+	-include_lib("eunit/include/eunit.hrl").
+
+	getMetricSummary_empty_test() ->
+		?assertEqual("", getMetricSummary(#{})).
+
+	getMetricSummary_single_metric_test() ->
+		Metrics = #{<<"request-count">> => #{<<"value">> => 99, <<"techDetail">> => <<"Total HTTP requests">>}},
+		Result = getMetricSummary(Metrics),
+		?assert(string:str(Result, "** System Metrics **") > 0),
+		?assert(string:str(Result, "request-count") > 0),
+		?assert(string:str(Result, "99") > 0),
+		?assert(string:str(Result, "Total HTTP requests") > 0).
+
+	% Regression: non-ASCII bytes (em-dash U+2014, UTF-8 bytes 226,128,148) must NOT
+	% appear as Erlang integer-list form or binary term form in the email body.
+	getMetricSummary_nonascii_techdetail_test() ->
+		Metrics = #{<<"last-update">> => #{<<"value">> => 1234567890, <<"techDetail">> => <<"Seconds \xe2\x80\x94 last call">>}},
+		Result = lists:flatten(getMetricSummary(Metrics)),
+		?assertEqual(0, string:str(Result, "226,128,148"), "techDetail must not appear as integer-list form"),
+		?assertEqual(0, string:str(Result, "<<226"), "techDetail must not appear as binary term form"),
+		?assert(string:str(Result, "last-update") > 0, "metric ID must appear in email").
+
+	getMetricSummary_no_techdetail_test() ->
+		Metrics = #{<<"cpu-usage">> => #{<<"value">> => 42}},
+		Result = getMetricSummary(Metrics),
+		?assert(string:str(Result, "cpu-usage") > 0),
+		?assert(string:str(Result, "42") > 0),
+		% No parenthetical techDetail section when techDetail is absent
+		?assertEqual(0, string:str(Result, "()")).
+
+-endif.
 
 sendEmail(Subject, Body) ->
 	SendAddress =  os:getenv("SEND_ADDRESS"),

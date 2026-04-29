@@ -210,13 +210,13 @@ renderSystemMetrics(SystemMetrics) ->
 		fun (Metric, Html) ->
 			MetricId = binary_to_list(maps:get(<<"id">>, Metric)),
 			Value = maps:get(<<"value">>, Metric, -1),
-			TechDetail = binary_to_list(maps:get(<<"techDetail">>, Metric, <<"">>)),
-			MetricHtml = lists:flatten(io_lib:format("
-				<tr class=\"metric\" title=~p>
-					<td class=\"metricid\">~s</td>
-					<td class=\"value\">~p</td>
-				</tr>
-			", [TechDetail, MetricId, Value])),
+			MetricHtml = lists:flatten(
+				"<tr class=\"metric\">"
+				++ "<td class=\"metricid\">" ++ MetricId ++ "</td>"
+				++ "<td class=\"value\">" ++ lists:flatten(io_lib:format("~p", [Value])) ++ "</td>"
+				++ formatStringFromInfo(<<"techDetail">>, Metric)
+				++ "</tr>"
+			),
 			Html++MetricHtml
 		end, "", SortedMetrics),
 	case Html of
@@ -224,7 +224,7 @@ renderSystemMetrics(SystemMetrics) ->
 		_ ->
 			"
 			<table class=\"metrics\">
-				<thead><td>Metric</td><td>Value</td></thead>
+				<thead><td>Metric</td><td>Value</td><td>Technical Detail</td></thead>
 				"++Html++"
 			</table>"
 	end.
@@ -608,6 +608,17 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		PosZ = string:str(Html, "z-metric"),
 		?assert(PosA < PosM, "a-metric must come before m-metric"),
 		?assert(PosM < PosZ, "m-metric must come before z-metric").
+
+	% Regression test: non-ASCII bytes in techDetail (e.g. em-dash U+2014, UTF-8 bytes 226,128,148)
+	% must NOT appear as Erlang integer-list form ([226,128,148,...]) or binary form (<<226,...>>).
+	renderSystemMetrics_nonascii_techdetail_test() ->
+		SystemMetrics = [
+			#{<<"id">> => <<"test-metric">>, <<"value">> => 42, <<"techDetail">> => <<"Count \xe2\x80\x94 current total">>}
+		],
+		Html = renderSystemMetrics(SystemMetrics),
+		?assertEqual(0, string:str(Html, "226,128,148"), "techDetail must not appear as integer-list form"),
+		?assertEqual(0, string:str(Html, "<<226"), "techDetail must not appear as binary term form"),
+		?assert(string:str(Html, "test-metric") > 0, "metric ID must appear in HTML").
 
 	htmlEscape_no_special_chars_test() ->
 		?assertEqual("hello world", htmlEscape("hello world")).
