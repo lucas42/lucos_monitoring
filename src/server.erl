@@ -322,16 +322,35 @@ encodeStatus(Systems) ->
 		<<"summary">> => Summary
 	}).
 
-encodeInfo(Systems) ->
+encodeInfo(Systems, PollStats) ->
+	PollMetrics = case maps:get(count, PollStats, 0) > 0 of
+		true ->
+			#{
+				<<"poll-max-duration-ms">> => #{
+					<<"value">> => maps:get(max_duration_ms, PollStats, 0),
+					<<"techDetail">> => <<"Maximum check duration (ms) across all systems in the most recent poll cycle">>
+				},
+				<<"poll-mean-duration-ms">> => #{
+					<<"value">> => maps:get(mean_duration_ms, PollStats, 0),
+					<<"techDetail">> => <<"Mean check duration (ms) across all systems in the most recent poll cycle">>
+				},
+				<<"poll-failed-checks">> => #{
+					<<"value">> => maps:get(failed_count, PollStats, 0),
+					<<"techDetail">> => <<"Number of systems whose most recent poll had a fetch-info failure">>
+				}
+			};
+		false ->
+			#{}
+	end,
 	jiffy:encode(#{
 		system => <<"lucos_monitoring">>,
 		checks => #{},
-		metrics => #{
+		metrics => maps:merge(#{
 			<<"system-count">> => #{
 				<<"value">> => length(Systems),
 				<<"techDetail">> => <<"The number of systems being monitored">>
 			}
-		},
+		}, PollMetrics),
 		ci => #{
 			circle => <<"gh/lucas42/lucos_monitoring">>
 		},
@@ -403,7 +422,8 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 			{200, "application/json", encodeStatus(Systems)};
 		"/_info" ->
 			Systems = gen_server:call(StatePid, {fetch, all}),
-			{200, "application/json", encodeInfo(Systems)};
+			PollStats = gen_server:call(StatePid, {fetch, poll_stats}),
+			{200, "application/json", encodeInfo(Systems, PollStats)};
 		"/icon" ->
 			{ok, IconFile} = file:read_file("icon.png"),
 			{200, "image/png", IconFile};
@@ -444,6 +464,37 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 
 -ifdef(TEST).
 	-include_lib("eunit/include/eunit.hrl").
+
+	% encodeInfo: no poll stats (count=0) → only system-count metric
+	encodeInfo_no_poll_stats_test() ->
+		EmptyStats = #{count => 0, max_duration_ms => 0, mean_duration_ms => 0, failed_count => 0},
+		Result = jiffy:decode(encodeInfo([], EmptyStats), [return_maps]),
+		Metrics = maps:get(<<"metrics">>, Result),
+		?assert(maps:is_key(<<"system-count">>, Metrics)),
+		?assertNot(maps:is_key(<<"poll-max-duration-ms">>, Metrics)),
+		?assertNot(maps:is_key(<<"poll-mean-duration-ms">>, Metrics)),
+		?assertNot(maps:is_key(<<"poll-failed-checks">>, Metrics)).
+
+	% encodeInfo: with poll stats → all four metrics present
+	encodeInfo_with_poll_stats_test() ->
+		PollStats = #{count => 10, max_duration_ms => 900, mean_duration_ms => 350, failed_count => 2},
+		Result = jiffy:decode(encodeInfo([], PollStats), [return_maps]),
+		Metrics = maps:get(<<"metrics">>, Result),
+		?assert(maps:is_key(<<"system-count">>, Metrics)),
+		?assert(maps:is_key(<<"poll-max-duration-ms">>, Metrics)),
+		?assert(maps:is_key(<<"poll-mean-duration-ms">>, Metrics)),
+		?assert(maps:is_key(<<"poll-failed-checks">>, Metrics)),
+		?assertEqual(900, maps:get(<<"value">>, maps:get(<<"poll-max-duration-ms">>, Metrics))),
+		?assertEqual(350, maps:get(<<"value">>, maps:get(<<"poll-mean-duration-ms">>, Metrics))),
+		?assertEqual(2, maps:get(<<"value">>, maps:get(<<"poll-failed-checks">>, Metrics))).
+
+	% encodeInfo: system-count reflects number of systems
+	encodeInfo_system_count_test() ->
+		PollStats = #{count => 0},
+		Systems = [#{<<"host">> => <<"a">>, <<"name">> => <<"s">>, <<"status">> => healthy, <<"checks">> => [], <<"metrics">> => []},
+		           #{<<"host">> => <<"b">>, <<"name">> => <<"t">>, <<"status">> => healthy, <<"checks">> => [], <<"metrics">> => []}],
+		Result = jiffy:decode(encodeInfo(Systems, PollStats), [return_maps]),
+		?assertEqual(2, maps:get(<<"value">>, maps:get(<<"system-count">>, maps:get(<<"metrics">>, Result)))).
 
 	encodeStatus_empty_test() ->
 		Result = jiffy:decode(encodeStatus([]), [return_maps]),

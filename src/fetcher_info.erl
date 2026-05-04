@@ -33,6 +33,7 @@ tryRunChecks(StatePid, Id, Type, Host) ->
 	tryRunChecks(StatePid, Id, Type, Host).
 
 runChecks(StatePid, Id, Type, Host) ->
+	StartTime = erlang:monotonic_time(millisecond),
 	{TLSCheck} = checkTlsExpiry(Host),
 	{InfoCheck, _System, Checks, Metrics} = fetchInfo(Host),
 	% Option B: require 2 consecutive failures before alerting on the fetcher's own synthetic
@@ -42,7 +43,14 @@ runChecks(StatePid, Id, Type, Host) ->
 		<<"fetch-info">> => maps:put(<<"failThreshold">>, 2, InfoCheck),
 		<<"tls-certificate">> => maps:put(<<"failThreshold">>, 2, TLSCheck)
 	}, Checks),
-	ok = gen_server:cast(StatePid, {updateSystem, Host, Id, Type, info, AllChecks, Metrics}).
+	ok = gen_server:cast(StatePid, {updateSystem, Host, Id, Type, info, AllChecks, Metrics}),
+	DurationMs = erlang:monotonic_time(millisecond) - StartTime,
+	InfoOk = maps:get(<<"ok">>, InfoCheck, unknown),
+	TLSOk = maps:get(<<"ok">>, TLSCheck, unknown),
+	% IsOk=true only when fetch-info succeeded; unknown/false counts as not-ok for burst detection.
+	IsOk = (InfoOk =:= true),
+	logger:info("Checked ~p: duration_ms=~p fetch_info=~p tls=~p", [Id, DurationMs, InfoOk, TLSOk]),
+	ok = gen_server:cast(StatePid, {poll_timing, Id, DurationMs, IsOk}).
 
 checkTlsExpiry(Host) ->
 	TechDetail = <<"Checks whether the TLS Certificate is valid and not about to expire">>,
