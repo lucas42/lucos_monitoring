@@ -1,0 +1,27 @@
+.system h2 { background-color: #666; color: #fff; padding: 0.1em 1em; border-radius: 0.2em; }
+h2 .system-name { text-transform:capitalize; }
+h2 .rawInfoURL { float: right; text-decoration: none; }
+.empty { font-style: italic; }
+table { border-collapse: collapse; }
+td { border: none thin #ccc; padding: 0.2em 1em; }
+thead td { font-weight: bold; border-bottom-style: solid; }
+tr > td:not(:first-child) { border-left-style: solid; }
+tr:not(:last-child) > td { border-bottom-style: solid; }
+tr.check td.status { background-color: #666; color: #fff; }
+.system.healthy h2, tr.check.healthy td.status { background-color: #060; }
+.system.failing h2, tr.check.failing td.status { background-color: #900; }
+.system.unknown h2, tr.check.unknown td.status { background-color: #555; }
+.system.buffering h2, tr.check.buffering td.status { background-color: #da9000; }
+.system.suppressed h2, .system.pending-verification h2 { background-color: #da9000; }
+.system.suppressed h2:before { content: "🔇"; }
+.system.pending-verification h2:before { content: "⏳"; }
+.system.healthy .debug { display: none; }
+tbody .debug { white-space: pre-wrap; }
+.metrics { margin-top: 2em; }
+tr.metric[title] { cursor: help; }
+.status a { display: block; color:inherit; text-decoration: none; width: 100%; }
+.status a:hover { text-decoration: underline; }
+.formattedString a { word-break: break-word; }
+#checks { max-width: 720px; display: block; margin: 0 auto;}
+.system-checks { display: block; width: 100%; }
+.system-checks > table { width: 100%; }
