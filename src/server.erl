@@ -215,7 +215,7 @@ controller(Method, RequestUri, Body, Headers, StatePid) ->
 			{200, "text/html", view:render_page(Systems)};
 		"/style.css" ->
 			{ok, CssFile} = file:read_file("style.css"),
-			{200, "text/css", CssFile};
+			{200, "text/css", binary_to_list(CssFile)};
 		"/robots.txt" ->
 			{200, "text/plain", "User-agent: *\nDisallow:\n"};
 		"/api/status" ->
