@@ -35,15 +35,27 @@ tryRunChecks(StatePid, Id, Type, Host) ->
 
 runChecks(StatePid, Id, Type, Host) ->
 	StartTime = erlang:monotonic_time(millisecond),
-	{TLSCheck} = checkTlsExpiry(Host),
-	{InfoCheck, _System, Checks, Metrics} = fetchInfo(Host),
+	HasIPv6 = hasIPv6(Host),
+	{TLSCheck, TLSIPv6Check} = checkTlsExpiry(Host, HasIPv6),
+	{InfoCheck, _System, Checks, Metrics, InfoIPv6Check} = fetchInfo(Host, HasIPv6),
 	% Option B: require 2 consecutive failures before alerting on the fetcher's own synthetic
 	% checks. These are the checks most likely to see transient blips during deploys or restarts,
 	% so one extra poll of buffer meaningfully reduces false-positive alert volume.
-	AllChecks = maps:merge(#{
+	SyntheticChecks = #{
 		<<"fetch-info">> => maps:put(<<"failThreshold">>, 2, InfoCheck),
 		<<"tls-certificate">> => maps:put(<<"failThreshold">>, 2, TLSCheck)
-	}, Checks),
+	},
+	% For dual-stack hosts, add per-family IPv6 visibility checks.
+	% These are separate signals — a host is healthy if reachable on any family,
+	% but IPv6 failures must remain visible on the dashboard.
+	IPv6SyntheticChecks = case HasIPv6 of
+		true -> #{
+			<<"fetch-info-ipv6">> => maps:put(<<"failThreshold">>, 2, InfoIPv6Check),
+			<<"tls-certificate-ipv6">> => maps:put(<<"failThreshold">>, 2, TLSIPv6Check)
+		};
+		false -> #{}
+	end,
+	AllChecks = maps:merge(maps:merge(SyntheticChecks, IPv6SyntheticChecks), Checks),
 	ok = gen_server:cast(StatePid, {updateSystem, Host, Id, Type, info, AllChecks, Metrics}),
 	DurationMs = erlang:monotonic_time(millisecond) - StartTime,
 	InfoOk = maps:get(<<"ok">>, InfoCheck, unknown),
@@ -53,43 +65,75 @@ runChecks(StatePid, Id, Type, Host) ->
 	logger:info("Checked ~p: duration_ms=~p fetch_info=~p tls=~p", [Id, DurationMs, InfoOk, TLSOk]),
 	ok = gen_server:cast(StatePid, {poll_timing, Id, DurationMs, IsOk}).
 
-checkTlsExpiry(Host) ->
+% Returns true if the host has at least one AAAA record, false otherwise.
+hasIPv6(Host) ->
+	case inet:getaddrs(Host, inet6) of
+		{ok, [_ | _]} -> true;
+		_ -> false
+	end.
+
+% Orchestrates TLS expiry checking with IPv4 fallback for dual-stack hosts.
+% Returns {MainCheck, IPv6Check} where IPv6Check is undefined for v4-only hosts.
+% MainCheck passes if TLS is reachable on any address family.
+% IPv6Check reflects the IPv6-only result (visible on dashboard independently).
+checkTlsExpiry(Host, false) ->
+	{checkTlsExpiryByFamily(Host, inet), undefined};
+checkTlsExpiry(Host, true) ->
+	IPv6Check = checkTlsExpiryByFamily(Host, inet6),
+	case maps:get(<<"ok">>, IPv6Check) of
+		true ->
+			% IPv6 succeeded — use for both main and IPv6 checks
+			{IPv6Check, IPv6Check};
+		_ ->
+			% IPv6 failed — fall back to IPv4 for main, preserve IPv6 result
+			{checkTlsExpiryByFamily(Host, inet), IPv6Check}
+	end.
+
+% Checks TLS certificate expiry by connecting via a specific address family.
+% Resolves the hostname to an IP in the specified family first, then connects
+% directly to that IP with server_name_indication set to the original hostname.
+checkTlsExpiryByFamily(Host, IpFamily) ->
 	TechDetail = <<"Checks whether the TLS Certificate is valid and not about to expire">>,
-	SslOpts = [
-		{verify, verify_peer},
-		{cacerts, public_key:cacerts_get()},
-		{server_name_indication, Host}
-	],
 	Unavailable = #{
 		<<"ok">> => unknown,
 		<<"techDetail">> => TechDetail,
 		<<"debug">> => <<"Can't get expiry time for TLS Cert">>
 	},
-	case ssl:connect(Host, 443, SslOpts, timer:seconds(1)) of
-		{ok, Socket} ->
-			PeercertResult = ssl:peercert(Socket),
-			ssl:close(Socket),
-			case PeercertResult of
-				{ok, DerCert} ->
-					OtpCert = public_key:pkix_decode_cert(DerCert, otp),
-					TBSCert = OtpCert#'OTPCertificate'.tbsCertificate,
-					Validity = TBSCert#'OTPTBSCertificate'.validity,
-					NotAfter = Validity#'Validity'.notAfter,
-					Expiry = tlsNotAfterToUnix(NotAfter),
-					Diff = Expiry - erlang:system_time(second),
-					if
-						% start failing when there's fewer than 20 days until expiry
-						Diff < 1728000 ->
-							Debug = list_to_binary("TLS Certificate due to expire in "++integer_to_list(Diff)++" seconds"),
-							{#{<<"ok">> => false, <<"techDetail">> => TechDetail, <<"debug">> => Debug}};
-						true ->
-							{#{<<"ok">> => true, <<"techDetail">> => TechDetail}}
+	case inet:getaddr(Host, IpFamily) of
+		{error, _} ->
+			Unavailable;
+		{ok, Addr} ->
+			SslOpts = [
+				{verify, verify_peer},
+				{cacerts, public_key:cacerts_get()},
+				{server_name_indication, Host}
+			],
+			case ssl:connect(Addr, 443, SslOpts, timer:seconds(1)) of
+				{ok, Socket} ->
+					PeercertResult = ssl:peercert(Socket),
+					ssl:close(Socket),
+					case PeercertResult of
+						{ok, DerCert} ->
+							OtpCert = public_key:pkix_decode_cert(DerCert, otp),
+							TBSCert = OtpCert#'OTPCertificate'.tbsCertificate,
+							Validity = TBSCert#'OTPTBSCertificate'.validity,
+							NotAfter = Validity#'Validity'.notAfter,
+							Expiry = tlsNotAfterToUnix(NotAfter),
+							Diff = Expiry - erlang:system_time(second),
+							if
+								% start failing when there's fewer than 20 days until expiry
+								Diff < 1728000 ->
+									Debug = list_to_binary("TLS Certificate due to expire in "++integer_to_list(Diff)++" seconds"),
+									#{<<"ok">> => false, <<"techDetail">> => TechDetail, <<"debug">> => Debug};
+								true ->
+									#{<<"ok">> => true, <<"techDetail">> => TechDetail}
+							end;
+						{error, _} ->
+							Unavailable
 					end;
 				{error, _} ->
-					{Unavailable}
-			end;
-		{error, _} ->
-			{Unavailable}
+					Unavailable
+			end
 	end.
 
 % Converts an ASN.1 certificate validity time to a Unix timestamp (seconds since epoch).
@@ -204,10 +248,31 @@ parseConnectionError(Host, Port, IpVersion, ErrorType) ->
 			{false, lists:flatten(io_lib:format("An unknown connection error occured: ~p (ipv~p connection)",[ErrorType, IpVersion]))}
 	end.
 
-fetchInfo(Host) ->
+% Orchestrates /_info fetching with IPv4 fallback for dual-stack hosts.
+% Returns {MainCheck, System, Checks, Metrics, IPv6Check} where IPv6Check is
+% undefined for v4-only hosts.
+% MainCheck passes if /_info is reachable on any address family.
+% IPv6Check reflects the IPv6-only result (visible on dashboard independently).
+fetchInfo(Host, false) ->
+	{Check, System, Checks, Metrics} = fetchInfoByFamily(Host, inet),
+	{Check, System, Checks, Metrics, undefined};
+fetchInfo(Host, true) ->
+	{IPv6Check, System6, Checks6, Metrics6} = fetchInfoByFamily(Host, inet6),
+	case maps:get(<<"ok">>, IPv6Check) of
+		true ->
+			% IPv6 succeeded — use for both main and IPv6 checks
+			{IPv6Check, System6, Checks6, Metrics6, IPv6Check};
+		_ ->
+			% IPv6 failed — fall back to IPv4 for main check, preserve IPv6 result
+			{MainCheck, System, Checks, Metrics} = fetchInfoByFamily(Host, inet),
+			{MainCheck, System, Checks, Metrics, IPv6Check}
+	end.
+
+% Fetches /_info using a specific address family (inet or inet6).
+fetchInfoByFamily(Host, IpFamily) ->
 	InfoURL = "https://" ++ Host ++ "/_info",
 	TechDetail = list_to_binary("Makes HTTP request to "++InfoURL++""),
-	case httpc:request(get, {InfoURL, [{"User-Agent", os:getenv("SYSTEM", "")}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], [{socket_opts, [{ipfamily, inet6fb4}]}]) of
+	case httpc:request(get, {InfoURL, [{"User-Agent", os:getenv("SYSTEM", "")}]}, [{timeout, timer:seconds(1)},{ssl,[{verify, verify_peer},{cacerts, public_key:cacerts_get()}]}], [{socket_opts, [{ipfamily, IpFamily}]}]) of
 		{ok, {{_Version, 200, _ReasonPhrase}, _Headers, Body}} ->
 			try
 				{System, Checks, Metrics} = parseInfo(Body),
