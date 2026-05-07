@@ -1,6 +1,7 @@
 -module(fetcher_info).
 -export([start/1, tryRunChecks/4]).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("public_key/include/public_key.hrl").
 
 start(StatePid) ->
 	{ok, _} = application:ensure_all_started([ssl, inets]),
@@ -54,36 +55,61 @@ runChecks(StatePid, Id, Type, Host) ->
 
 checkTlsExpiry(Host) ->
 	TechDetail = <<"Checks whether the TLS Certificate is valid and not about to expire">>,
-	Command = "echo | timeout 1s openssl s_client -connect "++Host++":443 -servername "++Host++" 2>/dev/null | openssl x509 -noout -enddate | sed 's/.*=//' | date +'%s' -f -",
-	Output = os:cmd(Command),
-	case string:to_integer(Output) of
-		{error, _Reason} ->
-			Check = #{
-				<<"ok">> => unknown,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => <<"Can't get expiry time for TLS Cert">>
-			},
-			{Check};
-		{Expiry, _Rest} ->
-			Diff = Expiry - erlang:system_time(second),
-			if
-				% start failing when there's fewer than 20 days until expiry
-				Diff < 1728000 ->
-					Debug = list_to_binary("TLS Certificate due to expire in "++integer_to_list(Diff)++" seconds"),
-					Check = #{
-						<<"ok">> => false,
-						<<"techDetail">> => TechDetail,
-						<<"debug">> => Debug
-					},
-					{Check};
-				true ->
-					Check = #{
-						<<"ok">> => true,
-						<<"techDetail">> => TechDetail
-					},
-					{Check}
-			end
+	SslOpts = [
+		{verify, verify_peer},
+		{cacerts, public_key:cacerts_get()},
+		{server_name_indication, Host}
+	],
+	Unavailable = #{
+		<<"ok">> => unknown,
+		<<"techDetail">> => TechDetail,
+		<<"debug">> => <<"Can't get expiry time for TLS Cert">>
+	},
+	case ssl:connect(Host, 443, SslOpts, timer:seconds(1)) of
+		{ok, Socket} ->
+			PeercertResult = ssl:peercert(Socket),
+			ssl:close(Socket),
+			case PeercertResult of
+				{ok, DerCert} ->
+					OtpCert = public_key:pkix_decode_cert(DerCert, otp),
+					TBSCert = OtpCert#'OTPCertificate'.tbsCertificate,
+					Validity = TBSCert#'OTPTBSCertificate'.validity,
+					NotAfter = Validity#'Validity'.notAfter,
+					Expiry = tlsNotAfterToUnix(NotAfter),
+					Diff = Expiry - erlang:system_time(second),
+					if
+						% start failing when there's fewer than 20 days until expiry
+						Diff < 1728000 ->
+							Debug = list_to_binary("TLS Certificate due to expire in "++integer_to_list(Diff)++" seconds"),
+							{#{<<"ok">> => false, <<"techDetail">> => TechDetail, <<"debug">> => Debug}};
+						true ->
+							{#{<<"ok">> => true, <<"techDetail">> => TechDetail}}
+					end;
+				{error, _} ->
+					{Unavailable}
+			end;
+		{error, _} ->
+			{Unavailable}
 	end.
+
+% Converts an ASN.1 certificate validity time to a Unix timestamp (seconds since epoch).
+% utcTime format: "YYMMDDHHMMSSZ" — years 50-99 map to 1950-1999, 00-49 to 2000-2049.
+% generalTime format: "YYYYMMDDHHMMSSZ".
+tlsNotAfterToUnix({utcTime, [Y1,Y2,M1,M2,D1,D2,H1,H2,Mi1,Mi2,S1,S2|_]}) ->
+	YY = list_to_integer([Y1,Y2]),
+	Year = if YY >= 50 -> 1900 + YY; true -> 2000 + YY end,
+	Datetime = {{Year, list_to_integer([M1,M2]), list_to_integer([D1,D2])},
+	            {list_to_integer([H1,H2]), list_to_integer([Mi1,Mi2]), list_to_integer([S1,S2])}},
+	datetimeToUnixSeconds(Datetime);
+tlsNotAfterToUnix({generalTime, [Y1,Y2,Y3,Y4,M1,M2,D1,D2,H1,H2,Mi1,Mi2,S1,S2|_]}) ->
+	Year = list_to_integer([Y1,Y2,Y3,Y4]),
+	Datetime = {{Year, list_to_integer([M1,M2]), list_to_integer([D1,D2])},
+	            {list_to_integer([H1,H2]), list_to_integer([Mi1,Mi2]), list_to_integer([S1,S2])}},
+	datetimeToUnixSeconds(Datetime).
+
+datetimeToUnixSeconds(DateTime) ->
+	UnixEpoch = calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}}),
+	calendar:datetime_to_gregorian_seconds(DateTime) - UnixEpoch.
 
 parseInfo(Body) ->
 	Info = jiffy:decode(Body, [return_maps]),
@@ -356,5 +382,23 @@ fetchInfo(Host) ->
 		?assertEqual({false, "An unknown connection error occured: not_a_real_error (ipv4 connection); DNS failure when trying to resolve ipv6 address for example.l42.eu"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],nxdomain},{inet,[inet],not_a_real_error}]})),
 		% Both sides definitive failure (unknown error type → false on each) → overall false
 		?assertEqual({false, "An unknown connection error occured: not_a_real_error (ipv4 connection); An unknown connection error occured: not_a_real_error (ipv6 connection)"}, parseError({failed_connect,[{to_address,{"example.l42.eu",443}}, {inet6,[inet6],not_a_real_error},{inet,[inet],not_a_real_error}]})).
+
+	tlsNotAfterToUnix_test() ->
+		% utcTime: YY >= 50 maps to 1900s. "700101000000Z" = 1970-01-01 00:00:00 UTC = Unix epoch = 0
+		?assertEqual(0, tlsNotAfterToUnix({utcTime, "700101000000Z"})),
+		% utcTime: YY < 50 maps to 2000s. "000101000000Z" = 2000-01-01 00:00:00 UTC = 946684800
+		?assertEqual(946684800, tlsNotAfterToUnix({utcTime, "000101000000Z"})),
+		% generalTime: "19700101000000Z" = 1970-01-01 00:00:00 UTC = 0
+		?assertEqual(0, tlsNotAfterToUnix({generalTime, "19700101000000Z"})),
+		% generalTime: "20000101000000Z" = 2000-01-01 00:00:00 UTC = 946684800
+		?assertEqual(946684800, tlsNotAfterToUnix({generalTime, "20000101000000Z"})).
+
+	datetimeToUnixSeconds_test() ->
+		% Unix epoch maps to 0
+		?assertEqual(0, datetimeToUnixSeconds({{1970, 1, 1}, {0, 0, 0}})),
+		% 2000-01-01 00:00:00 UTC = 946684800
+		?assertEqual(946684800, datetimeToUnixSeconds({{2000, 1, 1}, {0, 0, 0}})),
+		% One second before epoch is negative
+		?assertEqual(-1, datetimeToUnixSeconds({{1969, 12, 31}, {23, 59, 59}})).
 
 -endif.
