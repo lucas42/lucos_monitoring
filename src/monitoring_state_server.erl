@@ -1,17 +1,20 @@
 -module(monitoring_state_server).
 -behaviour(gen_server).
--export([start_link/0, start_link/1, init/1, handle_cast/2, handle_call/3]).
+-export([start_link/0, start_link/1, start_link/2, init/1, handle_cast/2, handle_call/3]).
 
 start_link() ->
 	start_link([fun loganne:notify/5, fun email:notify/5]).
 
 start_link(Notifiers) ->
-	gen_server:start_link(?MODULE, Notifiers, []).
+	start_link(Notifiers, fun(_) -> ok end).
 
-init(Notifiers) ->
-	{ok, {#{}, #{}, Notifiers, #{}}}.
+start_link(Notifiers, Publish) ->
+	gen_server:start_link(?MODULE, {Notifiers, Publish}, []).
 
-handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings}) ->
+init({Notifiers, Publish}) ->
+	{ok, {#{}, #{}, Notifiers, #{}, Publish}}.
+
+handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish}) ->
 	case Request of
 		{updateSystem, Host, System, SystemType, Source, SourceChecks, SystemMetrics} ->
 			logger:info("Received update for system ~p (Host ~p, Source ~p)", [System, Host, Source]),
@@ -86,7 +89,9 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings}) ->
 			end,
 			AnnotatedChecks = annotateCheckStatuses(NormalisedChecks),
 			NewSystemMap = maps:put(Host, {System, SystemType, NewSourceChecksMap, AnnotatedChecks, NewMetrics}, SystemMap),
-			{noreply, {NewSystemMap, NewSuppressionMap, Notifiers, PollTimings}};
+			SystemList = build_system_list(NewSystemMap, NewSuppressionMap),
+			Publish(SystemList),
+			{noreply, {NewSystemMap, NewSuppressionMap, Notifiers, PollTimings, Publish}};
 		{poll_timing, SystemId, DurationMs, IsOk} ->
 			BurstThreshold = 3,
 			BurstWindowMs = 30000,
@@ -114,22 +119,20 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings}) ->
 				false ->
 					ok
 			end,
-			{noreply, {SystemMap, SuppressionMap, Notifiers, NewPollTimings}}
+			{noreply, {SystemMap, SuppressionMap, Notifiers, NewPollTimings, Publish}}
 	end.
 
-handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers, PollTimings}) ->
+handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish}) ->
 	case Request of
 		{fetch, all} ->
 			% Return a list of system maps with pre-computed status atoms.
 			% Each system map includes <<"host">> (not in the ADR spec but needed by the
 			% view layer to build /_info URLs) alongside id, type, name, checks, metrics, status.
-			SystemList = maps:fold(fun(Host, {SystemId, SystemType, _SourceChecksMap, NormalisedCache, Metrics}, Acc) ->
-				[buildSystemOutput(Host, SystemId, SystemType, NormalisedCache, Metrics, SuppressionMap) | Acc]
-			end, [], SystemMap),
-			{reply, SystemList, {SystemMap, SuppressionMap, Notifiers, PollTimings}};
+			SystemList = build_system_list(SystemMap, SuppressionMap),
+			{reply, SystemList, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish}};
 		{fetch, poll_stats} ->
 			Stats = computePollStats(maps:values(PollTimings)),
-			{reply, Stats, {SystemMap, SuppressionMap, Notifiers, PollTimings}};
+			{reply, Stats, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish}};
 		{suppress, System} ->
 			case systemExists(System, SystemMap) of
 				true ->
@@ -149,9 +152,11 @@ handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers, PollTimings})
 					end, #{}, SystemMap),
 					NewSuppressionMap = maps:put(System, {ExpiryTime, PreExisting}, SuppressionMap),
 					logger:notice("Suppression window opened for ~p", [System]),
-					{reply, ok, {SystemMap, NewSuppressionMap, Notifiers, PollTimings}};
+					SystemList = build_system_list(SystemMap, NewSuppressionMap),
+					Publish(SystemList),
+					{reply, ok, {SystemMap, NewSuppressionMap, Notifiers, PollTimings, Publish}};
 				false ->
-					{reply, {error, not_found}, {SystemMap, SuppressionMap, Notifiers, PollTimings}}
+					{reply, {error, not_found}, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish}}
 			end;
 		{unsuppress, System} ->
 			% Instead of alerting immediately on stale pre-unsuppress health data,
@@ -170,10 +175,12 @@ handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers, PollTimings})
 						logger:notice("Cascading pending_verification to ~p (has checks depending on ~p)", [DepSystem, System]),
 						maps:put(DepSystem, {pending_verification, DepSources}, SM)
 					end, NewSuppressionMap, DependentSystems),
-					{reply, ok, {SystemMap, FinalSuppressionMap, Notifiers, PollTimings}};
+					SystemList = build_system_list(SystemMap, FinalSuppressionMap),
+					Publish(SystemList),
+					{reply, ok, {SystemMap, FinalSuppressionMap, Notifiers, PollTimings, Publish}};
 				false ->
 					logger:notice("Suppression window closed for ~p (was not suppressed)", [System]),
-					{reply, ok, {SystemMap, SuppressionMap, Notifiers, PollTimings}}
+					{reply, ok, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish}}
 			end
 	end.
 
@@ -509,6 +516,13 @@ aggregateCheckStatuses(SystemId, NormalisedCache, SuppressionMap) ->
 		true         -> healthy
 	end.
 
+% Builds the full system list as returned by {fetch, all}.
+% Used by both {fetch, all} handler and the publish hook at each mutation site.
+build_system_list(SystemMap, SuppressionMap) ->
+	maps:fold(fun(Host, {SystemId, SystemType, _SourceChecksMap, NormalisedCache, Metrics}, Acc) ->
+		[buildSystemOutput(Host, SystemId, SystemType, NormalisedCache, Metrics, SuppressionMap) | Acc]
+	end, [], SystemMap).
+
 % Builds the system output map returned by {fetch, all}.
 % Includes <<"host">> for view-layer URL construction (not in ADR spec but required for rendering).
 buildSystemOutput(Host, SystemId, SystemType, NormalisedCache, Metrics, SuppressionMap) ->
@@ -617,9 +631,9 @@ computePollStats(Timings) ->
 
 	% First update for a host stores its state but doesn't alert (warm-up grace period).
 	warmup_first_update_stores_state_test() ->
-		InitialState = {#{}, #{}, [], #{}},
+		InitialState = {#{}, #{}, [], #{}, fun(_) -> ok end},
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => false}},
-		{noreply, {SystemMap, _, _, _}} = handle_cast(
+		{noreply, {SystemMap, _, _, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, Checks, #{}},
 			InitialState
 		),
@@ -637,9 +651,9 @@ computePollStats(Timings) ->
 			#{"host1.example.com" => {"lucos_foo", system, #{info => Checks}, #{}, #{}}},
 			#{},
 			[],
-			#{}
+			#{}, fun(_) -> ok end
 		},
-		{noreply, {SystemMap, _, _, _}} = handle_cast(
+		{noreply, {SystemMap, _, _, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, Checks, #{}},
 			ExistingState
 		),
@@ -655,10 +669,10 @@ computePollStats(Timings) ->
 			#{"host1.example.com" => {"lucos_foo", system, #{info => InfoChecks}, #{}, #{}}},
 			#{},
 			[],
-			#{}
+			#{}, fun(_) -> ok end
 		},
 		% circleci update arrives
-		{noreply, {SystemMap, _, _, _}} = handle_cast(
+		{noreply, {SystemMap, _, _, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
 			ExistingState
 		),
@@ -679,9 +693,9 @@ computePollStats(Timings) ->
 			#{"host1.example.com" => {"lucos_foo", system, #{info => OldInfoChecks}, #{}, #{}}},
 			#{},
 			[],
-			#{}
+			#{}, fun(_) -> ok end
 		},
-		{noreply, {SystemMap, _, _, _}} = handle_cast(
+		{noreply, {SystemMap, _, _, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, NewInfoChecks, #{}},
 			ExistingState
 		),
@@ -698,10 +712,10 @@ computePollStats(Timings) ->
 			#{"host1.example.com" => {"lucos_foo", system, #{info => InfoChecks}, #{}, Metrics}},
 			#{},
 			[],
-			#{}
+			#{}, fun(_) -> ok end
 		},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
-		{noreply, {SystemMap, _, _, _}} = handle_cast(
+		{noreply, {SystemMap, _, _, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
 			ExistingState
 		),
@@ -716,9 +730,9 @@ computePollStats(Timings) ->
 			#{"host1.example.com" => {"lucos_foo", system, #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, OldMetrics}},
 			#{},
 			[],
-			#{}
+			#{}, fun(_) -> ok end
 		},
-		{noreply, {SystemMap, _, _, _}} = handle_cast(
+		{noreply, {SystemMap, _, _, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, #{<<"fetch-info">> => #{<<"ok">> => true}}, NewMetrics},
 			ExistingState
 		),
@@ -745,8 +759,8 @@ computePollStats(Timings) ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		SystemMap = #{"host1.example.com" => {"lucos_foo", system, #{info => HealthyChecks}, #{}, #{}}},
 		Notifier = recording_notifier(self()),
-		State = {SystemMap, #{"lucos_foo" => {erlang:system_time(second) + 600, #{}}}, [Notifier], #{}},
-		{reply, ok, {_, NewSuppressionMap, _, _}} = handle_call(
+		State = {SystemMap, #{"lucos_foo" => {erlang:system_time(second) + 600, #{}}}, [Notifier], #{}, fun(_) -> ok end},
+		{reply, ok, {_, NewSuppressionMap, _, _, _}} = handle_call(
 			{unsuppress, "lucos_foo"}, from, State
 		),
 		% System should be in pending_verification, not removed from the map
@@ -762,9 +776,9 @@ computePollStats(Timings) ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		SystemMap = #{"host1.example.com" => {"lucos_foo", system, #{info => FailingChecks}, #{}, #{}}},
 		Notifier = recording_notifier(self()),
-		State = {SystemMap, #{"lucos_foo" => {erlang:system_time(second) + 600, #{}}}, [Notifier], #{}},
+		State = {SystemMap, #{"lucos_foo" => {erlang:system_time(second) + 600, #{}}}, [Notifier], #{}, fun(_) -> ok end},
 		drain_notifications(),
-		{reply, ok, {_, NewSuppressionMap, _, _}} = handle_call(
+		{reply, ok, {_, NewSuppressionMap, _, _, _}} = handle_call(
 			{unsuppress, "lucos_foo"}, from, State
 		),
 		% System should be in pending_verification (not cleared)
@@ -777,8 +791,8 @@ computePollStats(Timings) ->
 
 	% Unsuppressing a system that isn't in the map is a no-op (idempotent).
 	unsuppress_unknown_system_is_noop_test() ->
-		State = {#{}, #{}, [], #{}},
-		{reply, ok, {_, NewSuppressionMap, _, _}} = handle_call(
+		State = {#{}, #{}, [], #{}, fun(_) -> ok end},
+		{reply, ok, {_, NewSuppressionMap, _, _, _}} = handle_call(
 			{unsuppress, "lucos_unknown"}, from, State
 		),
 		?assertEqual(#{}, NewSuppressionMap).
@@ -790,8 +804,8 @@ computePollStats(Timings) ->
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
-		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier], #{}},
-		{noreply, {_, NewSuppressionMap, _, _}} = handle_cast(
+		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier], #{}, fun(_) -> ok end},
+		{noreply, {_, NewSuppressionMap, _, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, FailingChecks, #{}},
 			State
 		),
@@ -811,8 +825,8 @@ computePollStats(Timings) ->
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
-		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier], #{}},
-		{noreply, {_, NewSuppressionMap, _, _}} = handle_cast(
+		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier], #{}, fun(_) -> ok end},
+		{noreply, {_, NewSuppressionMap, _, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, HealthyChecks, #{}},
 			State
 		),
@@ -834,13 +848,13 @@ computePollStats(Timings) ->
 		PendingSources = sets:from_list([info, circleci], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
-		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier], #{}},
+		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier], #{}, fun(_) -> ok end},
 		% First source (info) reports — should still be pending
 		{noreply, State2} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, FailingChecks, #{}},
 			State
 		),
-		{_, SuppressionMap2, _, _} = State2,
+		{_, SuppressionMap2, _, _, _} = State2,
 		?assertMatch({pending_verification, _}, maps:get("lucos_foo", SuppressionMap2)),
 		receive
 			{notified, _, _, _, _, _} -> ?assert(false, "No alert expected after first source only")
@@ -848,7 +862,7 @@ computePollStats(Timings) ->
 			ok
 		end,
 		% Second source (circleci) reports — should evaluate and alert
-		{noreply, {_, SuppressionMap3, _, _}} = handle_cast(
+		{noreply, {_, SuppressionMap3, _, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
 			State2
 		),
@@ -918,7 +932,7 @@ computePollStats(Timings) ->
 			#{"host1.example.com" => {"lucos_foo", system, #{info => InfoChecks, circleci => CIChecks}, ExistingNormalisedCache, #{}}},
 			#{},
 			[],
-			#{}
+			#{}, fun(_) -> ok end
 		},
 		% Info becomes temporarily unavailable FIRST (fetch-info = unknown) — this activates
 		% mergeMissingInfoChecks, which would resurrect old checks if the pruning logic is absent.
@@ -933,7 +947,7 @@ computePollStats(Timings) ->
 			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, #{}, #{}},
 			State2
 		),
-		{SystemMap3, _, _, _} = State3,
+		{SystemMap3, _, _, _, _} = State3,
 		{"lucos_foo", _, _, NormalisedAfterCI404, _} = maps:get("host1.example.com", SystemMap3),
 		% circleci check must be absent — 404 means "no CI", not "CI unknown"
 		?assertNot(maps:is_key(<<"circleci">>, NormalisedAfterCI404),
@@ -964,13 +978,13 @@ computePollStats(Timings) ->
 			#{"host1.example.com" => {"lucos_foo", system, #{info => InfoChecks}, ExistingNormalisedCache, #{}}},
 			#{},
 			[],
-			#{}
+			#{}, fun(_) -> ok end
 		},
 		{noreply, State2} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, #{<<"fetch-info">> => #{<<"ok">> => unknown}}, #{}},
 			ExistingState
 		),
-		{SystemMap2, _, _, _} = State2,
+		{SystemMap2, _, _, _, _} = State2,
 		{"lucos_foo", _, _, NormalisedAfterBlip, _} = maps:get("host1.example.com", SystemMap2),
 		?assert(maps:is_key(<<"tls-certificate">>, NormalisedAfterBlip),
 			"tls-certificate must persist during transient /_info blip"),
@@ -992,14 +1006,14 @@ computePollStats(Timings) ->
 			#{"host1.example.com" => {"lucos_foo", system, #{info => InfoChecks, circleci => CIChecks}, #{}, #{}}},
 			#{},
 			Notifiers,
-			#{}
+			#{}, fun(_) -> ok end
 		},
 		% circleci reports unknown
 		{noreply, State2} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, #{<<"circleci">> => #{<<"ok">> => unknown}}, #{}},
 			ExistingState
 		),
-		{SystemMap2, _, _, _} = State2,
+		{SystemMap2, _, _, _, _} = State2,
 		{"lucos_foo", _, _, NormalisedAfterCI, _} = maps:get("host1.example.com", SystemMap2),
 		?assertEqual(1, maps:get(<<"unknown_count">>, maps:get(<<"circleci">>, NormalisedAfterCI, #{}), -1)),
 		% Now info reports (ok, no change) — circleci check is carried over in the merged view
@@ -1007,7 +1021,7 @@ computePollStats(Timings) ->
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, InfoChecks, #{}},
 			State2
 		),
-		{SystemMap3, _, _, _} = State3,
+		{SystemMap3, _, _, _, _} = State3,
 		{"lucos_foo", _, _, NormalisedAfterInfo, _} = maps:get("host1.example.com", SystemMap3),
 		% circleci count must still be 1, NOT 2 — info's update must not re-increment it
 		?assertEqual(1, maps:get(<<"unknown_count">>, maps:get(<<"circleci">>, NormalisedAfterInfo, #{}), -1)).
@@ -1138,8 +1152,8 @@ computePollStats(Timings) ->
 		},
 		FutureExpiry = erlang:system_time(second) + 600,
 		SuppressionMap = #{"lucos_eolas" => {FutureExpiry, #{}}},
-		State = {SystemMap, SuppressionMap, [], #{}},
-		{reply, ok, {_, NewSuppressionMap, _, _}} = handle_call(
+		State = {SystemMap, SuppressionMap, [], #{}, fun(_) -> ok end},
+		{reply, ok, {_, NewSuppressionMap, _, _, _}} = handle_call(
 			{unsuppress, "lucos_eolas"}, from, State
 		),
 		?assertMatch({pending_verification, _}, maps:get("lucos_eolas", NewSuppressionMap)),
@@ -1319,8 +1333,8 @@ computePollStats(Timings) ->
 		SystemMap = #{"host1" => {"lucos_foo", system, #{info => FailingChecks}, AnnotatedFailing, #{}}},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
-		State = {SystemMap, #{}, [Notifier], #{}},
-		{reply, ok, {_SM, NewSuppressionMap, _, _}} = handle_call({suppress, "lucos_foo"}, from, State),
+		State = {SystemMap, #{}, [Notifier], #{}, fun(_) -> ok end},
+		{reply, ok, {_SM, NewSuppressionMap, _, _, _}} = handle_call({suppress, "lucos_foo"}, from, State),
 		% Snapshot must contain the host-tracking-failures key under "host1"
 		{ExpiryTime, PreExisting} = maps:get("lucos_foo", NewSuppressionMap),
 		?assert(is_integer(ExpiryTime)),
@@ -1398,8 +1412,8 @@ computePollStats(Timings) ->
 
 	% poll_timing cast stores duration and ok status for a system.
 	poll_timing_stores_entry_test() ->
-		State = {#{}, #{}, [], #{}},
-		{noreply, {_, _, _, PollTimings}} = handle_cast(
+		State = {#{}, #{}, [], #{}, fun(_) -> ok end},
+		{noreply, {_, _, _, PollTimings, _}} = handle_cast(
 			{poll_timing, "lucos_foo", 450, true},
 			State
 		),
@@ -1410,8 +1424,8 @@ computePollStats(Timings) ->
 
 	% poll_timing: failed entry is stored with ok=false.
 	poll_timing_stores_failed_entry_test() ->
-		State = {#{}, #{}, [], #{}},
-		{noreply, {_, _, _, PollTimings}} = handle_cast(
+		State = {#{}, #{}, [], #{}, fun(_) -> ok end},
+		{noreply, {_, _, _, PollTimings, _}} = handle_cast(
 			{poll_timing, "lucos_bar", 1200, false},
 			State
 		),
@@ -1421,22 +1435,22 @@ computePollStats(Timings) ->
 	% poll_timing: burst warning fires when failure count first crosses BurstThreshold (3).
 	% Three consecutive failed poll_timing casts should trigger the threshold crossing.
 	poll_timing_burst_detection_fires_at_threshold_test() ->
-		State = {#{}, #{}, [], #{}},
+		State = {#{}, #{}, [], #{}, fun(_) -> ok end},
 		{noreply, State1} = handle_cast({poll_timing, "svc_a", 1000, false}, State),
 		{noreply, State2} = handle_cast({poll_timing, "svc_b", 950, false}, State1),
 		% At count=2, no burst yet. At count=3 (after svc_c), burst fires.
 		% We just verify the cast succeeds and stores all three entries.
-		{noreply, {_, _, _, PollTimings3}} = handle_cast({poll_timing, "svc_c", 800, false}, State2),
+		{noreply, {_, _, _, PollTimings3, _}} = handle_cast({poll_timing, "svc_c", 800, false}, State2),
 		?assert(maps:is_key("svc_a", PollTimings3)),
 		?assert(maps:is_key("svc_b", PollTimings3)),
 		?assert(maps:is_key("svc_c", PollTimings3)).
 
 	% poll_timing: healthy polls do not accumulate towards burst threshold.
 	poll_timing_healthy_polls_no_burst_test() ->
-		State = {#{}, #{}, [], #{}},
+		State = {#{}, #{}, [], #{}, fun(_) -> ok end},
 		{noreply, State1} = handle_cast({poll_timing, "svc_a", 200, true}, State),
 		{noreply, State2} = handle_cast({poll_timing, "svc_b", 150, true}, State1),
-		{noreply, {_, _, _, PollTimings}} = handle_cast({poll_timing, "svc_c", 180, true}, State2),
+		{noreply, {_, _, _, PollTimings, _}} = handle_cast({poll_timing, "svc_c", 180, true}, State2),
 		% All three stored with ok=true
 		?assertEqual(true, maps:get(ok, maps:get("svc_a", PollTimings))),
 		?assertEqual(true, maps:get(ok, maps:get("svc_b", PollTimings))),
@@ -1471,13 +1485,13 @@ computePollStats(Timings) ->
 
 	% {fetch, poll_stats} call returns stats from stored timings.
 	fetch_poll_stats_empty_test() ->
-		State = {#{}, #{}, [], #{}},
+		State = {#{}, #{}, [], #{}, fun(_) -> ok end},
 		{reply, Stats, _} = handle_call({fetch, poll_stats}, from, State),
 		?assertEqual(0, maps:get(count, Stats)).
 
 	% {fetch, poll_stats} call returns correct stats after poll_timing updates.
 	fetch_poll_stats_after_timings_test() ->
-		State = {#{}, #{}, [], #{}},
+		State = {#{}, #{}, [], #{}, fun(_) -> ok end},
 		{noreply, State1} = handle_cast({poll_timing, "svc_a", 400, true}, State),
 		{noreply, State2} = handle_cast({poll_timing, "svc_b", 800, false}, State1),
 		{reply, Stats, _} = handle_call({fetch, poll_stats}, from, State2),

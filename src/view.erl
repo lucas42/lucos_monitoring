@@ -1,18 +1,24 @@
 -module(view).
--export([render_page/1]).
+-export([render_page/1, render_dashboard_block/1]).
 
 % Renders the full HTML page for a list of systems.
-% Reads the page shell from index.html, builds the body via renderAll/1,
+% Reads the page shell from index.html, builds the dashboard block via render_dashboard_block/1,
 % then substitutes <<TITLE>>, <<STYLESHEET_HREF>>, and <<BODY>> placeholders.
 % The <<PLACEHOLDER>> syntax is safe because htmlEscape converts '<' to '&lt;',
 % so user-supplied content can never contain '<<' after escaping.
 render_page(Systems) ->
 	{ok, Template} = file:read_file("index.html"),
-	Body = renderAll(Systems),
+	Block = render_dashboard_block(Systems),
 	Page0 = binary:replace(Template, <<"<<TITLE>>">>, <<"Lucos Monitoring">>),
 	Page1 = binary:replace(Page0, <<"<<STYLESHEET_HREF>>">>, <<"/style.css">>),
-	Page2 = binary:replace(Page1, <<"<<BODY>>">>, list_to_binary(Body)),
+	Page2 = binary:replace(Page1, <<"<<BODY>>">>, list_to_binary(Block)),
 	binary_to_list(Page2).
+
+% Renders the dashboard block (the <div id="checks"> element and its contents)
+% for a list of systems. Called by render_page/1 for the initial page load
+% and by stream_handler when pushing SSE updates to connected clients.
+render_dashboard_block(Systems) ->
+	"<div id=\"checks\">\n" ++ renderAll(Systems) ++ "\n</div>".
 
 
 formatStringFromInfo(Key, CheckInfo) ->
@@ -297,5 +303,23 @@ renderAll(Systems) ->
 		Result = formatString(<<"debug">>, <<"See https://example.com/path for details">>),
 		?assert(string:str(Result, "<a href=") > 0),
 		?assert(string:str(Result, "https://example.com/path") > 0).
+
+	render_dashboard_block_has_checks_div_test() ->
+		Systems = [],
+		Html = render_dashboard_block(Systems),
+		?assert(string:str(Html, "<div id=\"checks\">") > 0),
+		?assert(string:str(Html, "</div>") > 0).
+
+	render_dashboard_block_contains_system_test() ->
+		Systems = [#{
+			<<"host">> => <<"example.l42.eu">>,
+			<<"name">> => <<"lucos_example">>,
+			<<"status">> => healthy,
+			<<"checks">> => [],
+			<<"metrics">> => []
+		}],
+		Html = render_dashboard_block(Systems),
+		?assert(string:str(Html, "<div id=\"checks\">") > 0),
+		?assert(string:str(Html, "lucos example") > 0).
 
 -endif.
