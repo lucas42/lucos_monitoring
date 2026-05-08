@@ -1,12 +1,6 @@
 -module(monitoring_state_server).
 -behaviour(gen_server).
--export([start_link/0, start_link/1, start_link/2, init/1, handle_cast/2, handle_call/3]).
-
-start_link() ->
-	start_link([fun loganne:notify/5, fun email:notify/5]).
-
-start_link(Notifiers) ->
-	start_link(Notifiers, fun(_) -> ok end).
+-export([start_link/2, init/1, handle_cast/2, handle_call/3]).
 
 start_link(Notifiers, Publish) ->
 	gen_server:start_link(?MODULE, {Notifiers, Publish}, []).
@@ -89,8 +83,18 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 			end,
 			AnnotatedChecks = annotateCheckStatuses(NormalisedChecks),
 			NewSystemMap = maps:put(Host, {System, SystemType, NewSourceChecksMap, AnnotatedChecks, NewMetrics}, SystemMap),
-			SystemList = build_system_list(NewSystemMap, NewSuppressionMap),
-			Publish(SystemList),
+			% Only publish an SSE event if something visible actually changed.
+			% AnnotatedChecks =/= OldNormalisedCache catches check state changes;
+			% NewMetrics =/= OldMetrics catches metric value changes;
+			% NewSuppressionMap =/= SuppressionMap catches suppress/unsuppress side-effects;
+			% IsFirstSeen catches first appearance of a new system.
+			case IsFirstSeen orelse (AnnotatedChecks =/= OldNormalisedCache) orelse (NewMetrics =/= OldMetrics) orelse (NewSuppressionMap =/= SuppressionMap) of
+				true ->
+					SystemList = build_system_list(NewSystemMap, NewSuppressionMap),
+					Publish(SystemList);
+				false ->
+					ok
+			end,
 			{noreply, {NewSystemMap, NewSuppressionMap, Notifiers, PollTimings, Publish}};
 		{poll_timing, SystemId, DurationMs, IsOk} ->
 			BurstThreshold = 3,
@@ -1499,5 +1503,50 @@ computePollStats(Timings) ->
 		?assertEqual(800, maps:get(max_duration_ms, Stats)),
 		?assertEqual(600, maps:get(mean_duration_ms, Stats)),  % (400+800) div 2 = 600
 		?assertEqual(1, maps:get(failed_count, Stats)).
+
+	% Publish is called when a system's checks change.
+	publish_called_when_checks_change_test() ->
+		Self = self(),
+		PublishFun = fun(SystemList) -> Self ! {published, SystemList} end,
+		Checks1 = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		Checks2 = #{<<"fetch-info">> => #{<<"ok">> => false}},
+		ExistingAnnotated = annotateCheckStatuses(normaliseChecks(#{}, Checks1, sets:new([{version, 2}]))),
+		ExistingState = {
+			#{"host1.example.com" => {"lucos_foo", system, #{info => Checks1}, ExistingAnnotated, #{}}},
+			#{},
+			[],
+			#{}, PublishFun
+		},
+		handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, Checks2, #{}},
+			ExistingState
+		),
+		receive
+			{published, _} -> ok
+		after 100 ->
+			?assert(false, "Expected publish to be called when checks changed, but it was not")
+		end.
+
+	% Publish is NOT called when an update doesn't change the visible state.
+	publish_not_called_when_nothing_changes_test() ->
+		Self = self(),
+		PublishFun = fun(_SystemList) -> Self ! published end,
+		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		ExistingAnnotated = annotateCheckStatuses(normaliseChecks(#{}, Checks, sets:new([{version, 2}]))),
+		ExistingState = {
+			#{"host1.example.com" => {"lucos_foo", system, #{info => Checks}, ExistingAnnotated, #{}}},
+			#{},
+			[],
+			#{}, PublishFun
+		},
+		handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, Checks, #{}},
+			ExistingState
+		),
+		receive
+			published -> ?assert(false, "Expected publish NOT to be called when nothing changed, but it was")
+		after 100 ->
+			ok
+		end.
 
 -endif.

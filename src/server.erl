@@ -404,7 +404,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 	suppress_clear_requires_auth_test() ->
 		% Phase 3: /suppress/clear requires a valid token
 		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		{ok, StatePid} = monitoring_state_server:start_link(),
+		{ok, StatePid} = monitoring_state_server:start_link([], fun(_) -> ok end),
 		Body = "{\"systemDeployed\":\"lucos_test\"}",
 		{UnauthStatus, _, _} = tryController('POST', "/suppress/clear", Body, #{}, StatePid),
 		{AuthStatus, _, _} = tryController('POST', "/suppress/clear", Body, #{'Authorization' => "Bearer mysecrettoken"}, StatePid),
@@ -416,7 +416,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 	suppress_clear_invalid_token_rejected_test() ->
 		% Phase 1: /suppress/clear must reject requests with an invalid token
 		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		{ok, StatePid} = monitoring_state_server:start_link(),
+		{ok, StatePid} = monitoring_state_server:start_link([], fun(_) -> ok end),
 		Body = "{\"systemDeployed\":\"lucos_test\"}",
 		{StatusCode, _, _} = tryController('POST', "/suppress/clear", Body, #{'Authorization' => "Bearer wrongtoken"}, StatePid),
 		gen_server:stop(StatePid),
@@ -426,7 +426,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 	suppress_other_routes_still_require_auth_test() ->
 		% Other /suppress/* routes must still require auth
 		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		{ok, StatePid} = monitoring_state_server:start_link(),
+		{ok, StatePid} = monitoring_state_server:start_link([], fun(_) -> ok end),
 		{StatusCode, _, _} = tryController('PUT', "/suppress/lucos_test", "", #{}, StatePid),
 		gen_server:stop(StatePid),
 		os:unsetenv("CLIENT_KEYS"),
