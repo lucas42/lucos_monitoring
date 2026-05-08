@@ -9,9 +9,13 @@
 	</head>
 	<body>
 		<lucos-navbar>Monitoring</lucos-navbar>
-		<div id="checks">
 		<<BODY>>
-		</div>
 		<script src="/lucos_navbar.js" type="text/javascript"></script>
+		<script>
+			const source = new EventSource('/event-stream');
+			source.onmessage = function(event) {
+				document.getElementById('checks').outerHTML = event.data;
+			};
+		</script>
 	</body>
 </html>

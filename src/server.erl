@@ -6,7 +6,11 @@ start(_StartType, _StartArgs) ->
 	configureLogLevel(),
 	try
 		{Port, _} = string:to_integer(os:getenv("PORT", "8080")),
-		{ok, StatePid} = monitoring_state_server:start_link(),
+		stream_handler:start(),
+		{ok, StatePid} = monitoring_state_server:start_link(
+			[fun loganne:notify/5, fun email:notify/5],
+			stream_handler:make_publish_fun()
+		),
 		SchedulerCount = erlang:system_info(schedulers),
 		Opts = [{active, false},
 				binary,
@@ -64,16 +68,32 @@ handleRequest(Socket, StatePid) ->
 handleRequest(Socket, Method, RequestUri, Headers, StatePid) ->
 	case gen_tcp:recv(Socket, 0) of
 		{ok, http_eoh} ->
-			ContentLength = maps:get('Content-Length', Headers, 0),
-			RequestBody = readBody(Socket, ContentLength),
-			ClientIP = getClientIP(Socket),
-			{StatusCode, ContentType, ResponseBody} = tryController(Method, RequestUri, RequestBody, Headers, StatePid),
-			Response = getHeaders(StatusCode, ContentType) ++ ResponseBody,
-			gen_tcp:send(Socket, Response),
-			gen_tcp:close(Socket),
-			AccessLogLevel = accessLogLevel(RequestUri),
-			logger:log(AccessLogLevel, "~p ~p ~p ~p", [ClientIP, Method, StatusCode, RequestUri]),
-			ok;
+			Path = re:replace(RequestUri, "\\?.*$", "", [{return, list}]),
+			case {Method, Path} of
+				{'GET', "/event-stream"} ->
+					ClientIP = getClientIP(Socket),
+					SseHeaders = "HTTP/1.1 200 OK\n"
+						++ "Content-Type: text/event-stream; charset=utf-8\n"
+						++ "Cache-Control: no-cache\n"
+						++ "Connection: keep-alive\n"
+						++ "X-Accel-Buffering: no\n"
+						++ "\n",
+					gen_tcp:send(Socket, SseHeaders),
+					inet:setopts(Socket, [{packet, raw}]),
+					logger:notice("~p GET 200 /event-stream", [ClientIP]),
+					stream_handler:subscribe(Socket);
+				_ ->
+					ContentLength = maps:get('Content-Length', Headers, 0),
+					RequestBody = readBody(Socket, ContentLength),
+					ClientIP = getClientIP(Socket),
+					{StatusCode, ContentType, ResponseBody} = tryController(Method, RequestUri, RequestBody, Headers, StatePid),
+					Response = getHeaders(StatusCode, ContentType) ++ ResponseBody,
+					gen_tcp:send(Socket, Response),
+					gen_tcp:close(Socket),
+					AccessLogLevel = accessLogLevel(RequestUri),
+					logger:log(AccessLogLevel, "~p ~p ~p ~p", [ClientIP, Method, StatusCode, RequestUri]),
+					ok
+			end;
 		{ok, {http_header, _, 'Content-Length', _, Value}} ->
 			{Length, _} = string:to_integer(binary_to_list(Value)),
 			handleRequest(Socket, Method, RequestUri, maps:put('Content-Length', Length, Headers), StatePid);
@@ -384,7 +404,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 	suppress_clear_requires_auth_test() ->
 		% Phase 3: /suppress/clear requires a valid token
 		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		{ok, StatePid} = monitoring_state_server:start_link(),
+		{ok, StatePid} = monitoring_state_server:start_link([], fun(_) -> ok end),
 		Body = "{\"systemDeployed\":\"lucos_test\"}",
 		{UnauthStatus, _, _} = tryController('POST', "/suppress/clear", Body, #{}, StatePid),
 		{AuthStatus, _, _} = tryController('POST', "/suppress/clear", Body, #{'Authorization' => "Bearer mysecrettoken"}, StatePid),
@@ -396,7 +416,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 	suppress_clear_invalid_token_rejected_test() ->
 		% Phase 1: /suppress/clear must reject requests with an invalid token
 		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		{ok, StatePid} = monitoring_state_server:start_link(),
+		{ok, StatePid} = monitoring_state_server:start_link([], fun(_) -> ok end),
 		Body = "{\"systemDeployed\":\"lucos_test\"}",
 		{StatusCode, _, _} = tryController('POST', "/suppress/clear", Body, #{'Authorization' => "Bearer wrongtoken"}, StatePid),
 		gen_server:stop(StatePid),
@@ -406,7 +426,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 	suppress_other_routes_still_require_auth_test() ->
 		% Other /suppress/* routes must still require auth
 		os:putenv("CLIENT_KEYS", "lucos_deploy_orb=mysecrettoken"),
-		{ok, StatePid} = monitoring_state_server:start_link(),
+		{ok, StatePid} = monitoring_state_server:start_link([], fun(_) -> ok end),
 		{StatusCode, _, _} = tryController('PUT', "/suppress/lucos_test", "", #{}, StatePid),
 		gen_server:stop(StatePid),
 		os:unsetenv("CLIENT_KEYS"),
