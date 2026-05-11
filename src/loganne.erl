@@ -18,11 +18,14 @@ buildEvent(Host, System, FailingChecks, Suppressed) ->
 			{"monitoringRecovery", "All checks healthy on " ++ SystemTitle ++ " (" ++ Host ++ ")"};
 		{FailCount, true} ->
 			FailNames = string:join([binary_to_list(K) || K <- maps:keys(FailingChecks)], ", "),
-			{"monitoringAlertSuppressed", integer_to_list(FailCount) ++ " failing check(s) on " ++ SystemTitle ++ " (" ++ Host ++ "): " ++ FailNames ++ " (suppressed during deploy window)"};
+			{"monitoringAlertSuppressed", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ " (" ++ Host ++ "): " ++ FailNames ++ " (suppressed during deploy window)"};
 		{FailCount, false} ->
 			FailNames = string:join([binary_to_list(K) || K <- maps:keys(FailingChecks)], ", "),
-			{"monitoringAlert", integer_to_list(FailCount) ++ " failing check(s) on " ++ SystemTitle ++ " (" ++ Host ++ "): " ++ FailNames}
+			{"monitoringAlert", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ " (" ++ Host ++ "): " ++ FailNames}
 	end.
+
+plural_checks(1) -> "check";
+plural_checks(_) -> "checks".
 
 emit_event(EventType, HumanReadable, Url) ->
 	Endpoint = os:getenv("LOGANNE_ENDPOINT"),
@@ -65,21 +68,29 @@ emit_event(EventType, HumanReadable, Url) ->
 			{"monitoringRecovery", "All checks healthy on lucos foo (foo.example.com)"},
 			buildEvent("foo.example.com", "lucos_foo", #{}, true)
 		),
-		%% Alert: one failing check, not suppressed
+		%% Alert: one failing check, not suppressed (singular)
 		?assertEqual(
-			{"monitoringAlert", "1 failing check(s) on lucos foo (foo.example.com): ci"},
+			{"monitoringAlert", "1 failing check on lucos foo (foo.example.com): ci"},
 			buildEvent("foo.example.com", "lucos_foo", #{<<"ci">> => #{<<"ok">> => false}}, false)
 		),
-		%% Alert: one failing check, suppressed
+		%% Alert: one failing check, suppressed (singular)
 		?assertEqual(
-			{"monitoringAlertSuppressed", "1 failing check(s) on lucos foo (foo.example.com): ci (suppressed during deploy window)"},
+			{"monitoringAlertSuppressed", "1 failing check on lucos foo (foo.example.com): ci (suppressed during deploy window)"},
 			buildEvent("foo.example.com", "lucos_foo", #{<<"ci">> => #{<<"ok">> => false}}, true)
 		).
+
+	plural_checks_test() ->
+		%% Singular for FailCount = 1
+		?assertEqual("check", plural_checks(1)),
+		%% Plural for FailCount = 2
+		?assertEqual("checks", plural_checks(2)),
+		%% Plural for larger counts
+		?assertEqual("checks", plural_checks(10)).
 
 	buildEvent_unknown_system_test() ->
 		%% System = unknown (atom) should not crash — happens when /_info returns non-200
 		?assertEqual(
-			{"monitoringAlert", "1 failing check(s) on unknown (foo.example.com): fetch-info"},
+			{"monitoringAlert", "1 failing check on unknown (foo.example.com): fetch-info"},
 			buildEvent("foo.example.com", unknown, #{<<"fetch-info">> => #{<<"ok">> => false}}, false)
 		).
 
