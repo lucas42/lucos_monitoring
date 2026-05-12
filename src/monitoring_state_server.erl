@@ -375,41 +375,58 @@ partitionByPreExisting(FailingNow, HostPreExisting) ->
 		end
 	end, {#{}, #{}}, FailingNow).
 
-% Returns true if this check's dependsOn system is currently under an active suppression window.
-% Guards against self-references (CurrentSystem == dependsOn) and treats pending_verification
-% as "suppression lifted" (returns false). Does NOT follow transitive dependsOn chains.
-is_dependency_suppressed(Check, CurrentSystem, SuppressionMap) ->
+% Normalises a check's dependsOn field into a list of system ID strings.
+% Accepts either:
+%   - absent: []
+%   - single binary (legacy single-dep shape): [binary_to_list(B)]
+%   - list of binaries (aggregate/cross-cutting shape): [binary_to_list(E) || ...]
+% Any unrecognised value (or non-binary element inside a list) is silently
+% dropped. See ADR-0002.
+normalise_depends_on(Check) ->
 	case maps:get(<<"dependsOn">>, Check, undefined) of
-		undefined -> false;
-		DependsOn when is_binary(DependsOn) ->
-			DependsOnStr = binary_to_list(DependsOn),
-			% Guard: ignore self-references to prevent circular evaluation
-			case DependsOnStr =:= CurrentSystem of
-				true -> false;
-				false ->
-					case maps:get(DependsOnStr, SuppressionMap, undefined) of
-						undefined -> false;
-						{pending_verification, _} -> false;  % Suppression has been lifted
-						{ExpiryTime, _PreExisting} ->
-							Now = erlang:system_time(second),
-							Now < ExpiryTime
-					end
-			end;
-		_ -> false  % Non-binary dependsOn value — ignore
+		undefined -> [];
+		B when is_binary(B) -> [binary_to_list(B)];
+		L when is_list(L) ->
+			[binary_to_list(E) || E <- L, is_binary(E)];
+		_ -> []
 	end.
 
-% Returns a list of system IDs whose normalised checks include a dependsOn pointing at TargetSystem.
-% Used to cascade pending_verification when TargetSystem unsuppresses.
-% Excludes TargetSystem itself (self-reference guard).
+% Returns true if any system in this check's normalised dependsOn list is
+% currently under an active suppression window. OR semantics: a single
+% suppressed element is sufficient. Guards against self-references
+% (CurrentSystem appearing in the list) and treats pending_verification as
+% "suppression lifted" per element. Does NOT follow transitive dependsOn
+% chains — list elements are not themselves resolved against their own
+% dependsOn declarations. See ADR-0002.
+is_dependency_suppressed(Check, CurrentSystem, SuppressionMap) ->
+	DependsOnList = normalise_depends_on(Check),
+	lists:any(fun(DependsOnStr) ->
+		% Guard: ignore self-references to prevent circular evaluation
+		case DependsOnStr =:= CurrentSystem of
+			true -> false;
+			false ->
+				case maps:get(DependsOnStr, SuppressionMap, undefined) of
+					undefined -> false;
+					{pending_verification, _} -> false;  % Suppression has been lifted
+					{ExpiryTime, _PreExisting} ->
+						Now = erlang:system_time(second),
+						Now < ExpiryTime
+				end
+		end
+	end, DependsOnList).
+
+% Returns a list of system IDs whose normalised checks include TargetSystem
+% in their dependsOn list (after polymorphic normalisation). Used to cascade
+% pending_verification when TargetSystem unsuppresses. Excludes TargetSystem
+% itself (self-reference guard).
 find_dependent_systems(TargetSystem, SystemMap) ->
-	TargetBin = list_to_binary(TargetSystem),
 	lists:usort(maps:fold(fun(_Host, {System, _SystemType, SourceChecksMap, _, _}, Acc) ->
 		case System =:= TargetSystem of
 			true -> Acc;  % Guard: skip self
 			false ->
 				MergedChecks = mergeSourceChecks(SourceChecksMap),
 				HasDependency = maps:fold(fun(_, Check, Found) ->
-					Found orelse (maps:get(<<"dependsOn">>, Check, undefined) =:= TargetBin)
+					Found orelse lists:member(TargetSystem, normalise_depends_on(Check))
 				end, false, MergedChecks),
 				case HasDependency of
 					true -> [System | Acc];
@@ -1109,6 +1126,91 @@ computePollStats(Timings) ->
 		},
 		Deps = find_dependent_systems("lucos_eolas", SystemMap),
 		?assertEqual(["lucos_arachne", "lucos_time"], lists:sort(Deps)).
+
+	% --- Polymorphic dependsOn (ADR-0002): list-shape tests ---
+
+	% is_dependency_suppressed: list shape, none of the listed systems suppressed → false
+	is_dependency_suppressed_list_none_suppressed_test() ->
+		Check = #{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_a">>, <<"lucos_b">>]},
+		?assertEqual(false, is_dependency_suppressed(Check, "lucos_loganne", #{})).
+
+	% is_dependency_suppressed: list shape, one listed system actively suppressed → true (OR semantics)
+	is_dependency_suppressed_list_one_suppressed_test() ->
+		Check = #{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_a">>, <<"lucos_b">>]},
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{"lucos_b" => {FutureExpiry, #{}}},
+		?assertEqual(true, is_dependency_suppressed(Check, "lucos_loganne", SuppressionMap)).
+
+	% is_dependency_suppressed: list shape, one listed system in pending_verification → false (suppression lifted for that element)
+	is_dependency_suppressed_list_pending_verification_test() ->
+		Check = #{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_a">>, <<"lucos_b">>]},
+		PendingSources = sets:from_list([info]),
+		SuppressionMap = #{"lucos_b" => {pending_verification, PendingSources}},
+		?assertEqual(false, is_dependency_suppressed(Check, "lucos_loganne", SuppressionMap)).
+
+	% is_dependency_suppressed: list shape containing the current system (self-reference) →
+	% the self element is ignored, but other elements still get evaluated normally
+	is_dependency_suppressed_list_self_reference_test() ->
+		Check = #{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_loganne">>, <<"lucos_b">>]},
+		FutureExpiry = erlang:system_time(second) + 600,
+		% Self is "suppressed" too, but that element is ignored; lucos_b is not suppressed → false
+		SuppressionMap = #{"lucos_loganne" => {FutureExpiry, #{}}},
+		?assertEqual(false, is_dependency_suppressed(Check, "lucos_loganne", SuppressionMap)),
+		% Now suppress lucos_b — self is still ignored, but the other element triggers true
+		SuppressionMap2 = #{
+			"lucos_loganne" => {FutureExpiry, #{}},
+			"lucos_b" => {FutureExpiry, #{}}
+		},
+		?assertEqual(true, is_dependency_suppressed(Check, "lucos_loganne", SuppressionMap2)).
+
+	% is_dependency_suppressed: list shape, one element expired and one element active → true
+	% (the active one wins under OR semantics)
+	is_dependency_suppressed_list_mixed_expiry_test() ->
+		Check = #{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_a">>, <<"lucos_b">>]},
+		PastExpiry = erlang:system_time(second) - 1,
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{
+			"lucos_a" => {PastExpiry, #{}},
+			"lucos_b" => {FutureExpiry, #{}}
+		},
+		?assertEqual(true, is_dependency_suppressed(Check, "lucos_loganne", SuppressionMap)).
+
+	% is_dependency_suppressed: empty list shape → false (nothing to suppress against)
+	is_dependency_suppressed_list_empty_test() ->
+		Check = #{<<"ok">> => false, <<"dependsOn">> => []},
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{"lucos_a" => {FutureExpiry, #{}}},
+		?assertEqual(false, is_dependency_suppressed(Check, "lucos_loganne", SuppressionMap)).
+
+	% find_dependent_systems: target appears as one of several elements in a list-shaped dependsOn
+	find_dependent_systems_list_multi_element_test() ->
+		SystemMap = #{
+			"host1.example.com" => {"lucos_loganne", system, #{info => #{
+				<<"webhook-error-rate">> =>
+					#{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_a">>, <<"lucos_eolas">>, <<"lucos_b">>]}
+			}}, #{}, #{}}
+		},
+		?assertEqual(["lucos_loganne"], find_dependent_systems("lucos_eolas", SystemMap)).
+
+	% find_dependent_systems: target is the only element in a singleton list
+	find_dependent_systems_list_singleton_test() ->
+		SystemMap = #{
+			"host1.example.com" => {"lucos_loganne", system, #{info => #{
+				<<"webhook-error-rate">> =>
+					#{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_eolas">>]}
+			}}, #{}, #{}}
+		},
+		?assertEqual(["lucos_loganne"], find_dependent_systems("lucos_eolas", SystemMap)).
+
+	% find_dependent_systems: self-reference inside a list is excluded
+	find_dependent_systems_list_self_reference_test() ->
+		SystemMap = #{
+			"host1.example.com" => {"lucos_loganne", system, #{info => #{
+				<<"webhook-error-rate">> =>
+					#{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_loganne">>, <<"lucos_a">>]}
+			}}, #{}, #{}}
+		},
+		?assertEqual([], find_dependent_systems("lucos_loganne", SystemMap)).
 
 	% When all failing checks have an active dependsOn suppression, no alert email is sent.
 	state_change_all_dep_suppressed_test() ->
