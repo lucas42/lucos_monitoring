@@ -39,6 +39,7 @@ listen_with_retry(Port, Opts, StatePid, SchedulerCount, RetriesLeft) ->
 			logger:notice("server listening on port ~b with ~b schedulers", [Port, SchedulerCount]),
 			fetcher_info:start(StatePid),
 			fetcher_circleci:start(StatePid),
+			fetcher_scheduled_jobs:start(StatePid),
 			receive
 				Any -> logger:notice("~p", [Any])
 			end;
