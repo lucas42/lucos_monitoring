@@ -13,6 +13,7 @@ services:
       - LOGANNE_ENDPOINT
       - APP_ORIGIN
       - CLIENT_KEYS
+      - SCHEDULE_TRACKER_ENDPOINT
     image: lucas42/lucos_monitoring:${VERSION:-latest}
     restart: always
     healthcheck:
