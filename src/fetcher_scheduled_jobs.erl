@@ -35,8 +35,7 @@ scheduledJobsLoop(StatePid, SystemsMap) ->
 	scheduledJobsLoop(StatePid, SystemsMap).
 
 fetchAndUpdate(StatePid, SystemsMap) ->
-	Endpoint = os:getenv("SCHEDULE_TRACKER_ENDPOINT", ""),
-	Url = Endpoint ++ "/jobs",
+	Url = os:getenv("SCHEDULE_TRACKER_ENDPOINT", ""),
 	UAHeader = {"User-Agent", os:getenv("SYSTEM", "")},
 	SslOpts = [{verify, verify_peer}, {cacerts, public_key:cacerts_get()}],
 	Result = httpc:request(get, {Url, [{"Accept", "application/json"}, UAHeader]},
