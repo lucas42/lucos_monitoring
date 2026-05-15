@@ -19,7 +19,7 @@ buildSystemsMap(Body) ->
 		Id   = binary_to_list(maps:get(<<"id">>, System)),
 		Type = binary_to_atom(maps:get(<<"type">>, System, <<"system">>), utf8),
 		Host = case maps:get(<<"domain">>, System, null) of
-			null   -> Id;
+			null   -> "";
 			Domain -> binary_to_list(Domain)
 		end,
 		maps:put(Id, {Host, Type}, Acc)
@@ -161,15 +161,16 @@ parseJobEntry(Job) ->
 		Map = buildSystemsMap(Body),
 		?assertEqual({"arachne.l42.eu", system}, maps:get("lucos_arachne", Map)).
 
-	buildSystemsMap_null_domain_falls_back_to_id_test() ->
+	buildSystemsMap_null_domain_uses_empty_host_test() ->
+		% Components with no domain get an empty string host — they have no URL to check.
 		Body = "[{\"id\":\"lucos_internal\",\"domain\":null}]",
 		Map = buildSystemsMap(Body),
-		?assertEqual({"lucos_internal", system}, maps:get("lucos_internal", Map)).
+		?assertEqual({"", system}, maps:get("lucos_internal", Map)).
 
 	buildSystemsMap_explicit_type_test() ->
 		Body = "[{\"id\":\"lucos_comp\",\"domain\":null,\"type\":\"component\"}]",
 		Map = buildSystemsMap(Body),
-		?assertEqual({"lucos_comp", component}, maps:get("lucos_comp", Map)).
+		?assertEqual({"", component}, maps:get("lucos_comp", Map)).
 
 	buildSystemsMap_empty_list_test() ->
 		?assertEqual(#{}, buildSystemsMap("[]")).

@@ -7,9 +7,11 @@ notify(_Host, _SystemName, _FailingChecks, true, _SystemMetrics) ->
 	ok;
 notify(Host, SystemName, FailingChecks, _Suppressed, SystemMetrics) ->
 	System = getSystemTitle(Host, SystemName),
-	% Use Host for consistent Subject lines so things get bundled into nice threads
-	EmailSubject = "Monitoring issue on "++Host,
-	EmailBody = getEmailBody(Host, System, FailingChecks, SystemMetrics),
+	% Use Host for consistent Subject lines so things get bundled into nice threads;
+	% fall back to system name when there's no host (e.g. components without a domain).
+	SubjectRef = case Host of "" -> SystemName; _ -> Host end,
+	EmailSubject = "Monitoring issue on "++SubjectRef,
+	EmailBody = getEmailBody(SystemName, System, FailingChecks, SystemMetrics),
 	logger:notice("Send notifications for ~p", [System]),
 	sendEmail(EmailSubject, EmailBody).
 
@@ -22,10 +24,10 @@ getSystemTitle(Host, Name) ->
 			re:replace(Name, "_", " ", [global, {return,list}])
 	end.
 
-getEmailBody(Host, System, FailingChecks, SystemMetrics) ->
+getEmailBody(SystemId, System, FailingChecks, SystemMetrics) ->
 	getEmailSummary(System, FailingChecks)
 	++ "\r\n\r\n" ++
-	getSystemLink(Host)
+	getSystemLink(SystemId)
 	++ "\r\n\r\n" ++
 	getMetricSummary(SystemMetrics).
 
@@ -56,9 +58,9 @@ getFailCountSummary(FailCount, System) ->
 			"There are "++integer_to_list(FailCount)++" failing checks on "++System++":"
 	end.
 
-getSystemLink(Host) ->
+getSystemLink(SystemId) ->
 	AppOrigin = os:getenv("APP_ORIGIN", ""),
-	AppOrigin ++ "/#host-" ++ Host.
+	AppOrigin ++ "/#system-" ++ SystemId.
 
 getMetricSummary(SystemMetrics) ->
 	case maps:size(SystemMetrics) of

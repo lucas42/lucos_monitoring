@@ -149,7 +149,7 @@ getReasonPhrase(StatusCode) ->
 encodeStatus(Systems) ->
 	EncodedSystems = maps:from_list(lists:map(
 		fun (System) ->
-			Host = maps:get(<<"host">>, System),
+			SystemId = maps:get(<<"id">>, System),
 			Name = maps:get(<<"name">>, System),
 			Status = maps:get(<<"status">>, System),
 			% Rebuild checks as a map keyed by check id, omitting the id field from the value
@@ -166,7 +166,7 @@ encodeStatus(Systems) ->
 				<<"checks">>  => Checks,
 				<<"metrics">> => Metrics
 			},
-			{Host, SystemJson}
+			{SystemId, SystemJson}
 		end, Systems)),
 	% Summary counts: healthy, failing, anything else (unknown/buffering/suppressed/pending) → unknown
 	{TotalSystems, HealthyCount, FailingCount, UnknownCount} = lists:foldl(
@@ -329,6 +329,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 
 	encodeStatus_healthy_system_test() ->
 		Systems = [#{
+			<<"id">>      => <<"lucos_example">>,
 			<<"host">>    => <<"example.l42.eu">>,
 			<<"name">>    => <<"lucos_example">>,
 			<<"status">>  => healthy,
@@ -337,7 +338,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		}],
 		Result = jiffy:decode(encodeStatus(Systems), [return_maps]),
 		SystemsMap = maps:get(<<"systems">>, Result),
-		System = maps:get(<<"example.l42.eu">>, SystemsMap),
+		System = maps:get(<<"lucos_example">>, SystemsMap),
 		?assertEqual(<<"lucos_example">>, maps:get(<<"name">>, System)),
 		?assertEqual(<<"healthy">>, maps:get(<<"status">>, System)),
 		Summary = maps:get(<<"summary">>, Result),
@@ -348,6 +349,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 
 	encodeStatus_failing_system_test() ->
 		Systems = [#{
+			<<"id">>      => <<"lucos_broken">>,
 			<<"host">>    => <<"broken.l42.eu">>,
 			<<"name">>    => <<"lucos_broken">>,
 			<<"status">>  => failing,
@@ -356,7 +358,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		}],
 		Result = jiffy:decode(encodeStatus(Systems), [return_maps]),
 		SystemsMap = maps:get(<<"systems">>, Result),
-		System = maps:get(<<"broken.l42.eu">>, SystemsMap),
+		System = maps:get(<<"lucos_broken">>, SystemsMap),
 		?assertEqual(<<"failing">>, maps:get(<<"status">>, System)),
 		Checks = maps:get(<<"checks">>, System),
 		FetchInfo = maps:get(<<"fetch-info">>, Checks),
@@ -370,6 +372,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 
 	encodeStatus_unknown_system_test() ->
 		Systems = [#{
+			<<"id">>      => <<"lucos_unreachable">>,
 			<<"host">>    => <<"unreachable.l42.eu">>,
 			<<"name">>    => <<"lucos_unreachable">>,
 			<<"status">>  => unknown,
@@ -378,7 +381,7 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 		}],
 		Result = jiffy:decode(encodeStatus(Systems), [return_maps]),
 		SystemsMap = maps:get(<<"systems">>, Result),
-		System = maps:get(<<"unreachable.l42.eu">>, SystemsMap),
+		System = maps:get(<<"lucos_unreachable">>, SystemsMap),
 		?assertEqual(<<"lucos_unreachable">>, maps:get(<<"name">>, System)),
 		?assertEqual(<<"unknown">>, maps:get(<<"status">>, System)),
 		Summary = maps:get(<<"summary">>, Result),
@@ -389,10 +392,10 @@ tryController(Method, RequestUri, Body, Headers, StatePid) ->
 
 	encodeStatus_multiple_systems_summary_test() ->
 		Systems = [
-			#{<<"host">> => <<"healthy.l42.eu">>,   <<"name">> => <<"lucos_healthy">>,   <<"status">> => healthy,   <<"checks">> => [], <<"metrics">> => []},
-			#{<<"host">> => <<"failing.l42.eu">>,   <<"name">> => <<"lucos_failing">>,   <<"status">> => failing,   <<"checks">> => [], <<"metrics">> => []},
-			#{<<"host">> => <<"unknown.l42.eu">>,   <<"name">> => <<"lucos_unknown">>,   <<"status">> => unknown,   <<"checks">> => [], <<"metrics">> => []},
-			#{<<"host">> => <<"buffering.l42.eu">>, <<"name">> => <<"lucos_buffering">>, <<"status">> => buffering, <<"checks">> => [], <<"metrics">> => []}
+			#{<<"id">> => <<"lucos_healthy">>,   <<"host">> => <<"healthy.l42.eu">>,   <<"name">> => <<"lucos_healthy">>,   <<"status">> => healthy,   <<"checks">> => [], <<"metrics">> => []},
+			#{<<"id">> => <<"lucos_failing">>,   <<"host">> => <<"failing.l42.eu">>,   <<"name">> => <<"lucos_failing">>,   <<"status">> => failing,   <<"checks">> => [], <<"metrics">> => []},
+			#{<<"id">> => <<"lucos_unknown">>,   <<"host">> => <<"unknown.l42.eu">>,   <<"name">> => <<"lucos_unknown">>,   <<"status">> => unknown,   <<"checks">> => [], <<"metrics">> => []},
+			#{<<"id">> => <<"lucos_buffering">>, <<"host">> => <<"buffering.l42.eu">>, <<"name">> => <<"lucos_buffering">>, <<"status">> => buffering, <<"checks">> => [], <<"metrics">> => []}
 		],
 		Result = jiffy:decode(encodeStatus(Systems), [return_maps]),
 		Summary = maps:get(<<"summary">>, Result),

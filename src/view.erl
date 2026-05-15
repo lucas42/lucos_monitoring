@@ -127,19 +127,22 @@ renderSystemMetrics(SystemMetrics) ->
 	end.
 
 renderSystemHeader(Name, Host, DupNameCount) ->
-	InfoURL = "https://" ++ Host ++ "/_info",
-	ReadableName = re:replace(binary_to_list(Name), "_", " ", [global, {return,list}]),
+	SystemId = binary_to_list(Name),
+	ReadableName = re:replace(SystemId, "_", " ", [global, {return,list}]),
+	InfoLinkHtml = case Host of
+		"" -> "";
+		_ ->
+			InfoURL = "https://" ++ Host ++ "/_info",
+			"<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>\n\t\t\t\t"
+	end,
+	Disambiguator = case Host of "" -> SystemId; _ -> Host end,
 	case DupNameCount of
 		1 ->
-			"<h2 id=\"host-"++Host++"\">
-				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
-				<span class=\"system-name\">"++ReadableName++"</span>
-			</h2>";
+			"<h2 id=\"system-"++SystemId++"\">\n\t\t\t\t"++InfoLinkHtml++
+			"<span class=\"system-name\">"++ReadableName++"</span>\n\t\t\t</h2>";
 		_ ->
-			"<h2 id=\"host-"++Host++"\">
-				<a href=\""++InfoURL++"\" target=\"_blank\" class=\"rawInfoURL\">&#128279;</a>
-				<span class=\"system-name\">"++ReadableName++"</span> ("++Host++")
-			</h2>"
+			"<h2 id=\"system-"++SystemId++"\">\n\t\t\t\t"++InfoLinkHtml++
+			"<span class=\"system-name\">"++ReadableName++"</span> ("++Disambiguator++")\n\t\t\t</h2>"
 	end.
 
 % Renders all systems. Systems is the list returned by {fetch, all} — each
@@ -160,7 +163,7 @@ renderAll(Systems) ->
 	lists:foldl(
 		fun (System, Output) ->
 			Name = maps:get(<<"name">>, System),
-			Host = binary_to_list(maps:get(<<"host">>, System)),
+			Host = binary_to_list(maps:get(<<"host">>, System, <<"">>)),
 			Status = maps:get(<<"status">>, System),
 			SystemChecks = maps:get(<<"checks">>, System, []),
 			SystemMetrics = maps:get(<<"metrics">>, System, []),
@@ -314,12 +317,29 @@ renderAll(Systems) ->
 		Systems = [#{
 			<<"host">> => <<"example.l42.eu">>,
 			<<"name">> => <<"lucos_example">>,
+			<<"id">> => <<"lucos_example">>,
 			<<"status">> => healthy,
 			<<"checks">> => [],
 			<<"metrics">> => []
 		}],
 		Html = render_dashboard_block(Systems),
 		?assert(string:str(Html, "<div id=\"checks\">") > 0),
-		?assert(string:str(Html, "lucos example") > 0).
+		?assert(string:str(Html, "lucos example") > 0),
+		?assert(string:str(Html, "id=\"system-lucos_example\"") > 0),
+		?assert(string:str(Html, "rawInfoURL") > 0).
+
+	render_dashboard_block_no_host_test() ->
+		% Systems without a host (components) should not show a rawInfoURL link
+		Systems = [#{
+			<<"host">> => <<"">>,
+			<<"name">> => <<"lucos_component">>,
+			<<"id">> => <<"lucos_component">>,
+			<<"status">> => healthy,
+			<<"checks">> => [],
+			<<"metrics">> => []
+		}],
+		Html = render_dashboard_block(Systems),
+		?assert(string:str(Html, "id=\"system-lucos_component\"") > 0),
+		?assertEqual(0, string:str(Html, "rawInfoURL")).
 
 -endif.

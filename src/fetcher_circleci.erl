@@ -26,7 +26,7 @@ parseConfigyRepos(Body, DefaultType) ->
 
 repoHost(Repo) ->
 	case maps:get(<<"domain">>, Repo, null) of
-		null -> binary_to_list(maps:get(<<"id">>, Repo));
+		null -> "";
 		Domain -> binary_to_list(Domain)
 	end.
 
@@ -191,15 +191,16 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 -ifdef(TEST).
 	parseConfigyRepos_test() ->
 		% System with a domain: host is the domain.
-		% Component with no domain: host falls back to the repo id.
+		% Entry with no domain: host is empty string (no URL to check).
 		% DefaultType is used when no "type" field is present.
 		Body = "[{\"id\":\"lucos_foo\",\"domain\":\"foo.l42.eu\"},{\"id\":\"lucos_bar\",\"domain\":null}]",
-		?assertEqual([{"lucos_foo", system, "foo.l42.eu"}, {"lucos_bar", system, "lucos_bar"}], parseConfigyRepos(Body, system)).
+		?assertEqual([{"lucos_foo", system, "foo.l42.eu"}, {"lucos_bar", system, ""}], parseConfigyRepos(Body, system)).
 
 	parseConfigyRepos_default_type_component_test() ->
 		% DefaultType component: entries from ci-components-list.json use the component atom.
+		% Components with no domain get an empty string host.
 		Body = "[{\"id\":\"lucos_comp\",\"domain\":null}]",
-		?assertEqual([{"lucos_comp", component, "lucos_comp"}], parseConfigyRepos(Body, component)).
+		?assertEqual([{"lucos_comp", component, ""}], parseConfigyRepos(Body, component)).
 
 	parseConfigyRepos_explicit_type_overrides_default_test() ->
 		% When an entry has an explicit "type" field, it overrides DefaultType.

@@ -4,7 +4,9 @@
 notify(Host, System, FailingChecks, Suppressed, _Metrics) ->
 	{EventType, HumanReadable} = buildEvent(Host, System, FailingChecks, Suppressed),
 	AppOrigin = os:getenv("APP_ORIGIN", ""),
-	Url = AppOrigin ++ "/#host-" ++ Host,
+	% Use the system ID for the anchor; host-based anchor was broken for components without a domain.
+	SystemStr = case System of unknown -> "unknown"; _ -> System end,
+	Url = AppOrigin ++ "/#system-" ++ SystemStr,
 	emit_event(EventType, HumanReadable, Url).
 
 buildEvent(Host, System, FailingChecks, Suppressed) ->
@@ -13,15 +15,17 @@ buildEvent(Host, System, FailingChecks, Suppressed) ->
 		_ -> System
 	end,
 	SystemTitle = lists:flatten(re:replace(SystemStr, "_", " ", [global, {return, list}])),
+	% Include host in parentheses only when set (components may have no domain).
+	HostSuffix = case Host of "" -> ""; _ -> " (" ++ Host ++ ")" end,
 	case {maps:size(FailingChecks), Suppressed} of
 		{0, _} ->
-			{"monitoringRecovery", "All checks healthy on " ++ SystemTitle ++ " (" ++ Host ++ ")"};
+			{"monitoringRecovery", "All checks healthy on " ++ SystemTitle ++ HostSuffix};
 		{FailCount, true} ->
 			FailNames = string:join([binary_to_list(K) || K <- maps:keys(FailingChecks)], ", "),
-			{"monitoringAlertSuppressed", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ " (" ++ Host ++ "): " ++ FailNames ++ " (suppressed during deploy window)"};
+			{"monitoringAlertSuppressed", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ HostSuffix ++ ": " ++ FailNames ++ " (suppressed during deploy window)"};
 		{FailCount, false} ->
 			FailNames = string:join([binary_to_list(K) || K <- maps:keys(FailingChecks)], ", "),
-			{"monitoringAlert", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ " (" ++ Host ++ "): " ++ FailNames}
+			{"monitoringAlert", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ HostSuffix ++ ": " ++ FailNames}
 	end.
 
 plural_checks(1) -> "check";
@@ -58,7 +62,7 @@ emit_event(EventType, HumanReadable, Url) ->
 	-include_lib("eunit/include/eunit.hrl").
 
 	buildEvent_test() ->
-		%% Recovery: no failing checks
+		%% Recovery: no failing checks (host present — shown in parentheses)
 		?assertEqual(
 			{"monitoringRecovery", "All checks healthy on lucos foo (foo.example.com)"},
 			buildEvent("foo.example.com", "lucos_foo", #{}, false)
@@ -79,6 +83,21 @@ emit_event(EventType, HumanReadable, Url) ->
 			buildEvent("foo.example.com", "lucos_foo", #{<<"ci">> => #{<<"ok">> => false}}, true)
 		).
 
+	buildEvent_no_host_test() ->
+		%% Components with no domain: host suffix is omitted from human-readable strings
+		?assertEqual(
+			{"monitoringRecovery", "All checks healthy on lucos component"},
+			buildEvent("", "lucos_component", #{}, false)
+		),
+		?assertEqual(
+			{"monitoringAlert", "1 failing check on lucos component: ci"},
+			buildEvent("", "lucos_component", #{<<"ci">> => #{<<"ok">> => false}}, false)
+		),
+		?assertEqual(
+			{"monitoringAlertSuppressed", "1 failing check on lucos component: ci (suppressed during deploy window)"},
+			buildEvent("", "lucos_component", #{<<"ci">> => #{<<"ok">> => false}}, true)
+		).
+
 	plural_checks_test() ->
 		%% Singular for FailCount = 1
 		?assertEqual("check", plural_checks(1)),
@@ -97,10 +116,10 @@ emit_event(EventType, HumanReadable, Url) ->
 	emit_event_no_endpoint_test() ->
 		%% When LOGANNE_ENDPOINT is unset, emit_event/3 should return without crashing
 		os:unsetenv("LOGANNE_ENDPOINT"),
-		?assertEqual(ok, emit_event("monitoringAlert", "Some alert", "https://monitoring.l42.eu/#host-foo.example.com")).
+		?assertEqual(ok, emit_event("monitoringAlert", "Some alert", "https://monitoring.l42.eu/#system-lucos_foo")).
 
 	notify_builds_url_test() ->
-		%% notify/5 should derive the URL from APP_ORIGIN and Host.
+		%% notify/5 should derive the URL from APP_ORIGIN and System (as anchor).
 		%% We can't easily intercept the HTTP call, so we test via emit_event behaviour:
 		%% with no LOGANNE_ENDPOINT set, notify should return ok without crashing.
 		os:unsetenv("LOGANNE_ENDPOINT"),
