@@ -1,4 +1,4 @@
-.system h2 { background-color: #666; color: #fff; padding: 0.1em 1em; border-radius: 0.2em; }
+.system h2 { background-color: #666; color: #fff; padding: 0.1em 1em; border-radius: 0.2em; margin-bottom: 0; overflow: hidden; }
 h2 .system-name { text-transform:capitalize; }
 h2 .rawInfoURL { float: right; text-decoration: none; }
 h2 .type-icon { font-size: 13px; margin: 0 10px 0 -14px; text-shadow: 0px 0px 2px lightblue; float: left; line-height: 30px; }
@@ -26,3 +26,5 @@ tr.metric[title] { cursor: help; }
 #checks { max-width: 720px; display: block; margin: 0 auto;}
 .system-checks { display: block; width: 100%; }
 .system-checks > table { width: 100%; }
+.freshness-indicator { font-size: 0.75em; color: #888; text-align: right; margin: 0.1em 0 0; padding: 0 1em; font-style: italic; }
+.freshness-indicator.stale { color: #7a3b00; font-style: normal; font-weight: bold; background: #fff3e0; padding: 0.2em 1em; border-left: 3px solid #da9000; }
