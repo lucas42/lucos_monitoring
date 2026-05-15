@@ -1,5 +1,5 @@
 -module(fetcher_circleci).
--export([start/1, parseConfigyRepos/2, make_third_party_probe_check/2]).
+-export([start/1, parseConfigyRepos/2]).
 -include_lib("eunit/include/eunit.hrl").
 
 % Reads the CI repo lists (written at build time from configy) and spawns a
