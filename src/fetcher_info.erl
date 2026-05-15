@@ -11,9 +11,11 @@ start(StatePid) ->
 	% DefaultType is used when the JSON entry has no "type" field.
 	Systems = parseInfoSystems(binary_to_list(SystemsBody), system) ++
 	          parseInfoSystems(binary_to_list(HostsBody), host),
+	% Skip entries with no domain — there's no /_info URL to fetch without one.
+	SystemsWithHost = [S || S = {_, _, H} <- Systems, H =/= ""],
 	lists:foreach(fun({Id, Type, Host}) ->
 		spawn(?MODULE, tryRunChecks, [StatePid, Id, Type, Host])
-	end, Systems).
+	end, SystemsWithHost).
 
 % Parses a JSON array of system/host entries. DefaultType is the atom to use
 % when an entry has no "type" field. Returns a list of {Id, Type, Host} triples.
@@ -21,7 +23,10 @@ parseInfoSystems(Body, DefaultType) ->
 	Entries = jiffy:decode(Body, [return_maps]),
 	[{binary_to_list(maps:get(<<"id">>, Entry)),
 	  binary_to_atom(maps:get(<<"type">>, Entry, atom_to_binary(DefaultType)), utf8),
-	  binary_to_list(maps:get(<<"domain">>, Entry))} || Entry <- Entries].
+	  case maps:get(<<"domain">>, Entry, null) of
+	  	null -> "";
+	  	Domain -> binary_to_list(Domain)
+	  end} || Entry <- Entries].
 
 tryRunChecks(StatePid, Id, Type, Host) ->
 	try runChecks(StatePid, Id, Type, Host) of
@@ -258,6 +263,16 @@ fetchInfo(Host) ->
 		% When an entry has an explicit "type" field, it overrides DefaultType.
 		Body = "[{\"id\":\"lucos_comp\",\"domain\":\"comp.l42.eu\",\"type\":\"component\"}]",
 		?assertEqual([{"lucos_comp", component, "comp.l42.eu"}], parseInfoSystems(Body, system)).
+
+	parseInfoSystems_null_domain_test() ->
+		% Entries with null domain get an empty string as host.
+		Body = "[{\"id\":\"lucos_comp\",\"domain\":null}]",
+		?assertEqual([{"lucos_comp", system, ""}], parseInfoSystems(Body, system)).
+
+	parseInfoSystems_absent_domain_test() ->
+		% Entries with no domain field at all also get an empty string as host.
+		Body = "[{\"id\":\"lucos_comp\"}]",
+		?assertEqual([{"lucos_comp", system, ""}], parseInfoSystems(Body, system)).
 
 	parseInfoSystems_empty_test() ->
 		?assertEqual([], parseInfoSystems("[]", system)).
