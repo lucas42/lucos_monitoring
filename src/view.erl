@@ -76,10 +76,10 @@ typeToEmoji(component) -> {"&#128451;&#65039;", "Component"};  % 🗃️
 typeToEmoji(_)         -> {"&#10068;", "Unknown type"}.        % ❔
 
 % Returns a human-readable string for a duration in seconds.
-% Sub-minute precision is omitted: showing seconds is misleading when the
-% indicator only refreshes every 30s, so anything under a minute reads as "< 1 min ago".
-% Examples: "< 1 min ago", "3m ago", "1h ago", "7h 20m ago".
-formatAge(AgeSecs) when AgeSecs < 60 -> "< 1 min ago";
+% Examples: "just now", "45s ago", "3m ago", "1h ago", "7h 20m ago".
+formatAge(0) -> "just now";
+formatAge(AgeSecs) when AgeSecs < 60 ->
+	integer_to_list(AgeSecs) ++ "s ago";
 formatAge(AgeSecs) when AgeSecs < 3600 ->
 	Mins = AgeSecs div 60,
 	integer_to_list(Mins) ++ "m ago";
@@ -454,13 +454,13 @@ renderAll(Systems) ->
 	% ── formatAge ────────────────────────────────────────────────────────────
 
 	format_age_zero_test() ->
-		?assertEqual("< 1 min ago", formatAge(0)).
+		?assertEqual("just now", formatAge(0)).
 
 	format_age_seconds_test() ->
-		?assertEqual("< 1 min ago", formatAge(45)).
+		?assertEqual("45s ago", formatAge(45)).
 
 	format_age_just_under_minute_test() ->
-		?assertEqual("< 1 min ago", formatAge(59)).
+		?assertEqual("59s ago", formatAge(59)).
 
 	format_age_minutes_test() ->
 		?assertEqual("3m ago", formatAge(180)).
