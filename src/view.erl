@@ -63,6 +63,14 @@ systemStatusSortPriority(_)                    -> 4. % healthy
 statusToCssClass(pending_verification) -> "pending-verification";
 statusToCssClass(Status) -> atom_to_list(Status).
 
+% Maps a configy type atom to {EmojiHtml, TypeLabel}.
+% EmojiHtml is an HTML entity string; TypeLabel is a human-readable type name
+% used for aria-label and title attributes on the icon span.
+typeToEmoji(system)    -> {"&#127961;&#65039;", "System"};     % 🏙️
+typeToEmoji(host)      -> {"&#128421;&#65039;", "Host"};       % 🖥️
+typeToEmoji(component) -> {"&#128451;&#65039;", "Component"};  % 🗃️
+typeToEmoji(_)         -> {"&#10068;", "Unknown type"}.        % ❔
+
 renderSystemChecks(SystemChecks) ->
 	SortedChecks = lists:sort(
 		fun (CheckA, CheckB) ->
@@ -126,9 +134,11 @@ renderSystemMetrics(SystemMetrics) ->
 			</table>"
 	end.
 
-renderSystemHeader(Name, Host, DupNameCount) ->
+renderSystemHeader(Name, Host, Type, DupNameCount) ->
 	SystemId = binary_to_list(Name),
 	ReadableName = re:replace(SystemId, "_", " ", [global, {return,list}]),
+	{Emoji, TypeLabel} = typeToEmoji(Type),
+	EmojiHtml = "<span class=\"type-icon\" role=\"img\" aria-label=\""++TypeLabel++"\" title=\""++TypeLabel++"\">"++Emoji++"</span>\n\t\t\t\t",
 	InfoLinkHtml = case Host of
 		"" -> "";
 		_ ->
@@ -138,10 +148,10 @@ renderSystemHeader(Name, Host, DupNameCount) ->
 	Disambiguator = case Host of "" -> SystemId; _ -> Host end,
 	case DupNameCount of
 		1 ->
-			"<h2 id=\"system-"++SystemId++"\">\n\t\t\t\t"++InfoLinkHtml++
+			"<h2 id=\"system-"++SystemId++"\">\n\t\t\t\t"++EmojiHtml++InfoLinkHtml++
 			"<span class=\"system-name\">"++ReadableName++"</span>\n\t\t\t</h2>";
 		_ ->
-			"<h2 id=\"system-"++SystemId++"\">\n\t\t\t\t"++InfoLinkHtml++
+			"<h2 id=\"system-"++SystemId++"\">\n\t\t\t\t"++EmojiHtml++InfoLinkHtml++
 			"<span class=\"system-name\">"++ReadableName++"</span> ("++Disambiguator++")\n\t\t\t</h2>"
 	end.
 
@@ -165,6 +175,7 @@ renderAll(Systems) ->
 			Name = maps:get(<<"name">>, System),
 			Host = binary_to_list(maps:get(<<"host">>, System, <<"">>)),
 			Status = maps:get(<<"status">>, System),
+			Type = maps:get(<<"type">>, System, unknown),
 			SystemChecks = maps:get(<<"checks">>, System, []),
 			SystemMetrics = maps:get(<<"metrics">>, System, []),
 			DupNameCount = length(lists:filter(
@@ -173,7 +184,7 @@ renderAll(Systems) ->
 			CssClass = "system " ++ statusToCssClass(Status),
 			Output++"
 			<div class=\""++CssClass++"\">
-				"++renderSystemHeader(Name, Host, DupNameCount)++"
+				"++renderSystemHeader(Name, Host, Type, DupNameCount)++"
 				"++renderSystemChecks(SystemChecks)++"
 				"++renderSystemMetrics(SystemMetrics)++"
 			</div>
@@ -341,5 +352,54 @@ renderAll(Systems) ->
 		Html = render_dashboard_block(Systems),
 		?assert(string:str(Html, "id=\"system-lucos_component\"") > 0),
 		?assertEqual(0, string:str(Html, "rawInfoURL")).
+
+	typeToEmoji_system_test() ->
+		{Emoji, Label} = typeToEmoji(system),
+		?assert(string:str(Emoji, "&#127961;") > 0, "system must use cityscape emoji (U+1F3D9)"),
+		?assertEqual("System", Label).
+
+	typeToEmoji_host_test() ->
+		{Emoji, Label} = typeToEmoji(host),
+		?assert(string:str(Emoji, "&#128421;") > 0, "host must use desktop computer emoji (U+1F5A5)"),
+		?assertEqual("Host", Label).
+
+	typeToEmoji_component_test() ->
+		{Emoji, Label} = typeToEmoji(component),
+		?assert(string:str(Emoji, "&#128451;") > 0, "component must use card file box emoji (U+1F5C3)"),
+		?assertEqual("Component", Label).
+
+	typeToEmoji_unknown_type_test() ->
+		{Emoji, Label} = typeToEmoji(not_a_real_type),
+		?assert(string:str(Emoji, "&#10068;") > 0, "unknown type must use question mark emoji (U+2754)"),
+		?assertEqual("Unknown type", Label).
+
+	render_dashboard_block_shows_type_icon_test() ->
+		% A system with a known type should show a labelled type-icon span in the heading.
+		Systems = [#{
+			<<"host">> => <<"example.l42.eu">>,
+			<<"name">> => <<"lucos_example">>,
+			<<"id">> => <<"lucos_example">>,
+			<<"status">> => healthy,
+			<<"type">> => system,
+			<<"checks">> => [],
+			<<"metrics">> => []
+		}],
+		Html = render_dashboard_block(Systems),
+		?assert(string:str(Html, "type-icon") > 0, "heading must include a type-icon span"),
+		?assert(string:str(Html, "System") > 0, "type-icon must be labelled with the type name").
+
+	render_dashboard_block_unknown_type_fallback_test() ->
+		% A system with no type field should fall back to the unknown-type icon.
+		Systems = [#{
+			<<"host">> => <<"example.l42.eu">>,
+			<<"name">> => <<"lucos_example">>,
+			<<"id">> => <<"lucos_example">>,
+			<<"status">> => healthy,
+			<<"checks">> => [],
+			<<"metrics">> => []
+		}],
+		Html = render_dashboard_block(Systems),
+		?assert(string:str(Html, "type-icon") > 0, "heading must include a type-icon span even without a type"),
+		?assert(string:str(Html, "Unknown type") > 0, "missing type must fall back to unknown-type label").
 
 -endif.
