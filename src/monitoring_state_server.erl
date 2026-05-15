@@ -1612,7 +1612,7 @@ computePollStats(Timings) ->
 		Checks2 = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		ExistingAnnotated = annotateCheckStatuses(normaliseChecks(#{}, Checks1, sets:new([{version, 2}]))),
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", system, #{info => Checks1}, ExistingAnnotated, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks1}, ExistingAnnotated, #{}}},
 			#{},
 			[],
 			#{}, PublishFun
@@ -1634,7 +1634,7 @@ computePollStats(Timings) ->
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingAnnotated = annotateCheckStatuses(normaliseChecks(#{}, Checks, sets:new([{version, 2}]))),
 		ExistingState = {
-			#{"host1.example.com" => {"lucos_foo", system, #{info => Checks}, ExistingAnnotated, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, ExistingAnnotated, #{}}},
 			#{},
 			[],
 			#{}, PublishFun
