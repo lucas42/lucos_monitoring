@@ -1,4 +1,4 @@
-.system h2 { background-color: #666; color: #fff; padding: 0.1em 1em; border-radius: 0.2em; }
+.system h2 { background-color: #666; color: #fff; padding: 0.1em 1em; border-radius: 0.2em; margin-bottom: 0; }
 h2 .system-name { text-transform:capitalize; }
 h2 .rawInfoURL { float: right; text-decoration: none; }
 h2 .type-icon { font-size: 13px; margin: 0 10px 0 -14px; text-shadow: 0px 0px 2px lightblue; float: left; line-height: 30px; }

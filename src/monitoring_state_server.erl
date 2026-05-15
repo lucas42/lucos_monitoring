@@ -105,18 +105,14 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 			% a per-section freshness indicator that reveals data-source-dark states.
 			NewSourceTimestamps = maps:put(Source, erlang:system_time(second), OldSourceTimestamps),
 			NewSystemMap = maps:put(System, {Host, SystemType, NewSourceChecksMap, AnnotatedChecks, NewMetrics, NewSourceTimestamps}, SystemMap),
-			% Only publish an SSE event if something visible actually changed.
-			% AnnotatedChecks =/= OldNormalisedCache catches check state changes;
-			% NewMetrics =/= OldMetrics catches metric value changes;
-			% NewSuppressionMap =/= SuppressionMap catches suppress/unsuppress side-effects;
-			% IsFirstSeen catches first appearance of a new system.
-			case IsFirstSeen orelse (AnnotatedChecks =/= OldNormalisedCache) orelse (NewMetrics =/= OldMetrics) orelse (NewSuppressionMap =/= SuppressionMap) of
-				true ->
-					SystemList = build_system_list(NewSystemMap, NewSuppressionMap),
-					Publish(SystemList);
-				false ->
-					ok
-			end,
+			% Always publish an SSE event on every updateSystem cast.
+			% The source timestamps are updated on every poll, and the client uses them
+			% to render per-section freshness indicators. Suppressing the event when
+			% check state is unchanged would cause client-side age counters to drift
+			% until they falsely trigger the stale warning — even though the server
+			% is polling correctly and the data is fresh.
+			SystemList = build_system_list(NewSystemMap, NewSuppressionMap),
+			Publish(SystemList),
 			{noreply, {NewSystemMap, NewSuppressionMap, Notifiers, PollTimings, Publish}};
 		{poll_timing, SystemId, DurationMs, IsOk} ->
 			BurstThreshold = 3,
@@ -1671,10 +1667,12 @@ computePollStats(Timings) ->
 			?assert(false, "Expected publish to be called when checks changed, but it was not")
 		end.
 
-	% Publish is NOT called when an update doesn't change the visible state.
-	publish_not_called_when_nothing_changes_test() ->
+	% Publish is called on every updateSystem cast, even when check state is unchanged.
+	% Source timestamps are always updated and the client relies on them for freshness
+	% indicators — suppressing the event on stable state would produce false stale warnings.
+	publish_called_on_every_update_test() ->
 		Self = self(),
-		PublishFun = fun(_SystemList) -> Self ! published end,
+		PublishFun = fun(SystemList) -> Self ! {published, SystemList} end,
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingAnnotated = annotateCheckStatuses(normaliseChecks(#{}, Checks, sets:new([{version, 2}]))),
 		ExistingState = {
@@ -1688,9 +1686,9 @@ computePollStats(Timings) ->
 			ExistingState
 		),
 		receive
-			published -> ?assert(false, "Expected publish NOT to be called when nothing changed, but it was")
+			{published, _} -> ok
 		after 100 ->
-			ok
+			?assert(false, "Expected publish to be called on every update, but it was not")
 		end.
 
 	% Source timestamps are recorded in the system entry on each updateSystem cast.
