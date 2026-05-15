@@ -2,6 +2,25 @@
 -behaviour(gen_server).
 -export([start_link/2, init/1, handle_cast/2, handle_call/3]).
 
+% Alert-suppression chain: UnknownsGate → FailsGate.
+%
+% UnknownsGate (replaceUnknowns/4): tracks consecutiveUnknownsCount.  When a check
+%   reports ok: unknown for ≥?CONSECUTIVE_UNKNOWNS_THRESHOLD consecutive polls it
+%   flips to ok: false so the FailsGate can evaluate it.  Used by fetchers that probe
+%   a third-party service (e.g. CircleCI) — third-party unreachability says nothing
+%   about the monitored system's health, so "I couldn't tell" is the right signal.
+%
+% FailsGate (applyFailThreshold/2): tracks consecutiveFailsCount.  When ok: false
+%   is seen for ≥failThreshold consecutive polls (default 1) the failure is surfaced.
+%   Used by fetchers that directly probe the system itself (fetch-info, tls-certificate)
+%   which stamp failThreshold: 2 to absorb single-poll transient blips.
+%
+% The two gates chain: an unknown that persists long enough becomes a false (UnknownsGate),
+% which then goes through the FailsGate with the default threshold of 1.  A direct false
+% (e.g. a workflow failure from circleci) skips the UnknownsGate entirely and is only
+% subject to the FailsGate.
+-define(CONSECUTIVE_UNKNOWNS_THRESHOLD, 3).
+
 start_link(Notifiers, Publish) ->
 	gen_server:start_link(?MODULE, {Notifiers, Publish}, []).
 
@@ -32,7 +51,7 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 			end,
 			% Only count checks as "newly unknown" if they were included in the current
 			% source update — not checks carried forward from other sources. This prevents
-			% double-incrementing unknown_count when two sources (e.g. circleci + info)
+			% double-incrementing consecutiveUnknownsCount when two sources (e.g. circleci + info)
 			% update within the same monitoring cycle.
 			CountableKeys = maps:fold(fun(Key, Check, Acc) ->
 				case maps:get(<<"ok">>, Check, unknown) of
@@ -211,38 +230,6 @@ collect_active_sources(System, SystemMap) ->
 		(_, _, Acc) -> Acc
 	end, sets:new([{version, 2}]), SystemMap).
 
-% Replaces any unknown "ok" with whichever the value was there previously, until 3 consecutive unknowns are recieved at which point ok is set to false.
-% CountableKeys is the set of check keys that should be considered for incrementing.
-% Only keys in this set increment their unknown_count — this prevents double-counting when
-% one source's unknown checks are carried forward in the merged view and processed again
-% during another source's update.
-replaceUnknowns(OldChecks, NewChecks, Iterator, CountableKeys) ->
-	case maps:next(Iterator) of
-		{Key, NewCheck, NextIterator} ->
-			NormalisedCheck = case maps:get(<<"ok">>, NewCheck, unknown) of
-				unknown ->
-					OldCheck = maps:get(Key, OldChecks, #{<<"ok">> => unknown}),
-					OldCount = maps:get(<<"unknown_count">>, OldCheck, 0),
-					NewCount = case sets:is_element(Key, CountableKeys) of
-						true -> OldCount + 1;  % This check was in the current source update
-						false -> OldCount  % Carried over from a previous source, don't re-increment
-					end,
-					IncrementedCheck = maps:put(<<"unknown_count">>, NewCount, NewCheck),
-					case NewCount >= 3 of
-						true ->
-							maps:put(<<"ok">>, false, IncrementedCheck);
-						false ->
-							logger:notice("Not sending alert for ~p as there has only been ~p recurring failures so far.", [Key, NewCount]),
-							maps:put(<<"ok">>, maps:get(<<"ok">>, OldCheck, unknown), IncrementedCheck)
-					end;
-				_ ->
-					maps:put(<<"unknown_count">>, 0, NewCheck)
-			end,
-			maps:put(Key, NormalisedCheck, replaceUnknowns(OldChecks, NewChecks, NextIterator, CountableKeys));
-		none ->
-			maps:new()
-	end.
-
 % If there's a problem with the 'fetch-info' check, merge the old and new checks to avoid flapiness
 mergeMissingInfoChecks(OldChecks, NewChecks) ->
 	case maps:get(<<"ok">>, maps:get(<<"fetch-info">>, NewChecks, #{<<"ok">> => unknown}), unknown) of
@@ -252,18 +239,57 @@ mergeMissingInfoChecks(OldChecks, NewChecks) ->
 			maps:merge(OldChecks, NewChecks)
 	end.
 
-% Applies failThreshold logic: holds the previous ok state until N consecutive
-% failures are seen. The fail_count counter resets to 0 on recovery.
-% failThreshold defaults to 1 (alert immediately on first failure).
+% ── UnknownsGate ──────────────────────────────────────────────────────────────
+% Replaces any ok: unknown with the previously-known value until
+% ?CONSECUTIVE_UNKNOWNS_THRESHOLD consecutive unknowns are seen, at which point ok
+% is flipped to false so the FailsGate (below) can evaluate it.
+%
+% CountableKeys is the set of check keys reported in the current source update.
+% Only those keys increment their consecutiveUnknownsCount — this prevents
+% double-counting when checks from one source are carried forward in the merged
+% view during another source's update.
+replaceUnknowns(OldChecks, NewChecks, Iterator, CountableKeys) ->
+	case maps:next(Iterator) of
+		{Key, NewCheck, NextIterator} ->
+			NormalisedCheck = case maps:get(<<"ok">>, NewCheck, unknown) of
+				unknown ->
+					OldCheck = maps:get(Key, OldChecks, #{<<"ok">> => unknown}),
+					OldCount = maps:get(<<"consecutiveUnknownsCount">>, OldCheck, 0),
+					NewCount = case sets:is_element(Key, CountableKeys) of
+						true -> OldCount + 1;  % This check was in the current source update
+						false -> OldCount  % Carried over from a previous source, don't re-increment
+					end,
+					IncrementedCheck = maps:put(<<"consecutiveUnknownsCount">>, NewCount, NewCheck),
+					case NewCount >= ?CONSECUTIVE_UNKNOWNS_THRESHOLD of
+						true ->
+							maps:put(<<"ok">>, false, IncrementedCheck);
+						false ->
+							logger:notice("Not sending alert for ~p as there has only been ~p recurring failures so far.", [Key, NewCount]),
+							maps:put(<<"ok">>, maps:get(<<"ok">>, OldCheck, unknown), IncrementedCheck)
+					end;
+				_ ->
+					maps:put(<<"consecutiveUnknownsCount">>, 0, NewCheck)
+			end,
+			maps:put(Key, NormalisedCheck, replaceUnknowns(OldChecks, NewChecks, NextIterator, CountableKeys));
+		none ->
+			maps:new()
+	end.
+
+% ── FailsGate ─────────────────────────────────────────────────────────────────
+% Holds the previous ok state until N consecutive ok: false values are seen.
+% failThreshold defaults to 1 (alert on first failure); direct-probe fetchers
+% (fetch-info, tls-certificate) stamp failThreshold: 2 to absorb single-poll
+% transient blips during deploys or container restarts.
+% consecutiveFailsCount resets to 0 on recovery.
 applyFailThreshold(OldChecks, NewChecks) ->
 	maps:map(fun(Key, NewCheck) ->
 		case maps:get(<<"ok">>, NewCheck, unknown) of
 			false ->
 				FailThreshold = maps:get(<<"failThreshold">>, NewCheck, 1),
 				OldCheck = maps:get(Key, OldChecks, #{}),
-				OldFailCount = maps:get(<<"fail_count">>, OldCheck, 0),
+				OldFailCount = maps:get(<<"consecutiveFailsCount">>, OldCheck, 0),
 				NewFailCount = OldFailCount + 1,
-				CheckWithCount = maps:put(<<"fail_count">>, NewFailCount, NewCheck),
+				CheckWithCount = maps:put(<<"consecutiveFailsCount">>, NewFailCount, NewCheck),
 				case NewFailCount < FailThreshold of
 					true ->
 						% Not yet at threshold — hold the previous ok value
@@ -274,14 +300,15 @@ applyFailThreshold(OldChecks, NewChecks) ->
 				end;
 			_ ->
 				% Healthy or unknown — reset the failure counter
-				maps:put(<<"fail_count">>, 0, NewCheck)
+				maps:put(<<"consecutiveFailsCount">>, 0, NewCheck)
 		end
 	end, NewChecks).
 
-% Reduce monitoring flapiness by using existing check data to bolster new checks which may be facing a temporary blip.
-% CountableKeys is the set of check keys from the current source update that are reporting unknown.
-% Only those keys can increment their unknown_count — this prevents double-counting when checks
-% from one source are carried forward in the merged view during another source's update.
+% Reduces monitoring flapiness by running both alert-suppression gates in sequence.
+% CountableKeys is the set of check keys from the current source update that are
+% reporting unknown — only those may increment consecutiveUnknownsCount, preventing
+% double-counting when checks from one source are carried forward during another
+% source's update.
 normaliseChecks(OldChecks, NewChecks, CountableKeys) ->
 	MergedChecks = mergeMissingInfoChecks(OldChecks, NewChecks),
 	AfterUnknowns = replaceUnknowns(OldChecks, MergedChecks, maps:iterator(MergedChecks, reversed), CountableKeys),
@@ -435,17 +462,17 @@ find_dependent_systems(TargetSystem, SystemMap) ->
 
 % Computes the status atom for a single normalised check.
 % Mapping (per ADR-0001):
-%   ok=false                                              → failing
-%   ok=true|unknown with unknown_count>0 or fail buffering → buffering
-%   ok=unknown, no counters                               → unknown
-%   ok=true, no counters                                  → healthy
+%   ok=false                                                         → failing
+%   ok=true|unknown with consecutiveUnknownsCount>0 or fail buffering → buffering
+%   ok=unknown, no counters                                          → unknown
+%   ok=true, no counters                                             → healthy
 computeCheckStatus(Check) ->
 	Ok = maps:get(<<"ok">>, Check, unknown),
 	case Ok of
 		false -> failing;
 		_ ->
-			UnknownCount = maps:get(<<"unknown_count">>, Check, 0),
-			FailCount = maps:get(<<"fail_count">>, Check, 0),
+			UnknownCount = maps:get(<<"consecutiveUnknownsCount">>, Check, 0),
+			FailCount = maps:get(<<"consecutiveFailsCount">>, Check, 0),
 			FailThreshold = maps:get(<<"failThreshold">>, Check, 1),
 			IsBuffering = (UnknownCount > 0) orelse (FailCount > 0 andalso FailThreshold > 1),
 			case IsBuffering of
@@ -462,12 +489,12 @@ computeCheckStatus(Check) ->
 computeCheckStatusText(Status, Check) ->
 	case Status of
 		buffering ->
-			UnknownCount = maps:get(<<"unknown_count">>, Check, 0),
+			UnknownCount = maps:get(<<"consecutiveUnknownsCount">>, Check, 0),
 			case UnknownCount > 0 of
 				true ->
 					list_to_binary("unknown (" ++ integer_to_list(UnknownCount) ++ ")");
 				false ->
-					FailCount = maps:get(<<"fail_count">>, Check, 0),
+					FailCount = maps:get(<<"consecutiveFailsCount">>, Check, 0),
 					FailThreshold = maps:get(<<"failThreshold">>, Check, 1),
 					list_to_binary("failing (" ++ integer_to_list(FailCount) ++ "/" ++ integer_to_list(FailThreshold) ++ ")")
 			end;
@@ -608,19 +635,19 @@ computePollStats(Timings) ->
 		CiCountable = sets:from_list([<<"ci">>], [{version, 2}]),
 		FetchInfoCountable = sets:from_list([<<"fetch-info">>], [{version, 2}]),
 		% Single unknown check: ci goes from ok to unknown (count 0→1, ok held as true)
-		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 1, <<"consecutiveFailsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
 		% Second consecutive unknown for ci (count 1→2, ok still held as true)
-		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 2, <<"consecutiveFailsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
 		% Third consecutive unknown for ci (count 2→3, ok flips to false and alerts)
-		?assertEqual(#{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 3, <<"fail_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 3, <<"consecutiveFailsCount">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
 		% fetch-info goes unknown while other checks are carried forward from old state
-		?assertEqual(#{<<"item-count">> => #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1}, <<"api-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true,  <<"unknown_count">> => 1, <<"fail_count">> => 0}}, normaliseChecks(#{<<"item-count">> => #{<<"ok">> => false}, <<"api-check">> => #{<<"ok">> => true}, <<"fetch-info">> => #{<<"ok">> => true}}, #{<<"fetch-info">> => #{<<"ok">> => unknown}}, FetchInfoCountable)).
+		?assertEqual(#{<<"item-count">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1}, <<"api-check">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => true,  <<"consecutiveUnknownsCount">> => 1, <<"consecutiveFailsCount">> => 0}}, normaliseChecks(#{<<"item-count">> => #{<<"ok">> => false}, <<"api-check">> => #{<<"ok">> => true}, <<"fetch-info">> => #{<<"ok">> => true}}, #{<<"fetch-info">> => #{<<"ok">> => unknown}}, FetchInfoCountable)).
 
 	meaningfulChange_test() ->
-		?assertEqual(false, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}})),
-		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 3}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 2}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}})),
-		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 1}, <<"fetch-info">> => #{<<"ok">> => false, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}})),
-		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0}}, #{<<"ci">> => #{<<"ok">> => false, <<"unknown_count">> => 0}, <<"fetch-info">> => #{<<"ok">> => false, <<"unknown_count">> => 4}})).
+		?assertEqual(false, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0}})),
+		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 3}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 2}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0}})),
+		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 1}, <<"fetch-info">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0}}, #{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0}})),
+		?assertEqual(true, meaningfulChange(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0}}, #{<<"ci">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 4}})).
 
 	systemExists_test() ->
 		SystemMap = #{
@@ -894,12 +921,12 @@ computePollStats(Timings) ->
 
 	% With default failThreshold (1), a single failure is reported immediately.
 	failThreshold_default_alerts_immediately_test() ->
-		OldChecks = #{<<"db-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}},
+		OldChecks = #{<<"db-check">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}},
 		NewChecks = #{<<"db-check">> => #{<<"ok">> => false}},
 		% db-check is false (not unknown), so CountableKeys is empty
 		Result = normaliseChecks(OldChecks, NewChecks, sets:new([{version, 2}])),
 		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result))),
-		?assertEqual(1, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result))).
+		?assertEqual(1, maps:get(<<"consecutiveFailsCount">>, maps:get(<<"db-check">>, Result))).
 
 	% With failThreshold 3, failures 1 and 2 hold the previous ok state.
 	% On the third consecutive failure, ok flips to false.
@@ -907,28 +934,28 @@ computePollStats(Timings) ->
 		NewChecks = #{<<"db-check">> => #{<<"ok">> => false, <<"failThreshold">> => 3}},
 		% db-check is false (not unknown), so CountableKeys is empty
 		EmptyCountable = sets:new([{version, 2}]),
-		% First failure — fail_count goes to 1, ok stays true (held from old)
-		OldChecks1 = #{<<"db-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}},
+		% First failure — consecutiveFailsCount goes to 1, ok stays true (held from old)
+		OldChecks1 = #{<<"db-check">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}},
 		Result1 = normaliseChecks(OldChecks1, NewChecks, EmptyCountable),
 		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result1))),
-		?assertEqual(1, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result1))),
-		% Second failure — fail_count goes to 2, still held
+		?assertEqual(1, maps:get(<<"consecutiveFailsCount">>, maps:get(<<"db-check">>, Result1))),
+		% Second failure — consecutiveFailsCount goes to 2, still held
 		Result2 = normaliseChecks(Result1, NewChecks, EmptyCountable),
 		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result2))),
-		?assertEqual(2, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result2))),
-		% Third failure — fail_count goes to 3, now ok flips to false
+		?assertEqual(2, maps:get(<<"consecutiveFailsCount">>, maps:get(<<"db-check">>, Result2))),
+		% Third failure — consecutiveFailsCount goes to 3, now ok flips to false
 		Result3 = normaliseChecks(Result2, NewChecks, EmptyCountable),
 		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result3))),
-		?assertEqual(3, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result3))).
+		?assertEqual(3, maps:get(<<"consecutiveFailsCount">>, maps:get(<<"db-check">>, Result3))).
 
-	% Recovery (ok: true) resets fail_count to 0.
+	% Recovery (ok: true) resets consecutiveFailsCount to 0.
 	failThreshold_recovery_resets_count_test() ->
-		OldChecks = #{<<"db-check">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 2, <<"failThreshold">> => 3}},
+		OldChecks = #{<<"db-check">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 2, <<"failThreshold">> => 3}},
 		NewChecks = #{<<"db-check">> => #{<<"ok">> => true, <<"failThreshold">> => 3}},
 		% db-check is true (not unknown), so CountableKeys is empty
 		Result = normaliseChecks(OldChecks, NewChecks, sets:new([{version, 2}])),
 		?assertEqual(true, maps:get(<<"ok">>, maps:get(<<"db-check">>, Result))),
-		?assertEqual(0, maps:get(<<"fail_count">>, maps:get(<<"db-check">>, Result))).
+		?assertEqual(0, maps:get(<<"consecutiveFailsCount">>, maps:get(<<"db-check">>, Result))).
 
 	% Bug fix: when circleci returns 404 (no CI for this repo), the circleci check must be
 	% removed from the normalised cache — even when info is already unavailable (fetch-info = unknown).
@@ -943,9 +970,9 @@ computePollStats(Timings) ->
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
 		% Start with a system already known and healthy, with both sources reporting
 		ExistingNormalisedCache = #{
-			<<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
-			<<"tls-certificate">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
-			<<"circleci">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0}
+			<<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0},
+			<<"tls-certificate">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0},
+			<<"circleci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}
 		},
 		ExistingState = {
 			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks, circleci => CIChecks}, ExistingNormalisedCache, #{}}},
@@ -989,9 +1016,9 @@ computePollStats(Timings) ->
 		% The blip update will only carry fetch-info — without the merge logic, tls-certificate
 		% and item-count would disappear from the cache.
 		ExistingNormalisedCache = #{
-			<<"fetch-info">> => #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
-			<<"tls-certificate">> => #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1},
-			<<"item-count">> => #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1}
+			<<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0},
+			<<"tls-certificate">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1},
+			<<"item-count">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1}
 		},
 		ExistingState = {
 			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, ExistingNormalisedCache, #{}}},
@@ -1010,7 +1037,7 @@ computePollStats(Timings) ->
 		?assert(maps:is_key(<<"item-count">>, NormalisedAfterBlip),
 			"item-count must persist during transient /_info blip").
 
-	% Bug fix: multiple source updates in the same monitoring cycle must not double-increment unknown_count.
+	% Bug fix: multiple source updates in the same monitoring cycle must not double-increment consecutiveUnknownsCount.
 	%
 	% When circleci reports unknown, that check is merged into the shared view.  On the next
 	% poll, when info reports (even with no change), the circleci check is still present in the
@@ -1034,7 +1061,7 @@ computePollStats(Timings) ->
 		),
 		{SystemMap2, _, _, _, _} = State2,
 		{"host1.example.com", _, _, NormalisedAfterCI, _} = maps:get("lucos_foo", SystemMap2),
-		?assertEqual(1, maps:get(<<"unknown_count">>, maps:get(<<"circleci">>, NormalisedAfterCI, #{}), -1)),
+		?assertEqual(1, maps:get(<<"consecutiveUnknownsCount">>, maps:get(<<"circleci">>, NormalisedAfterCI, #{}), -1)),
 		% Now info reports (ok, no change) — circleci check is carried over in the merged view
 		{noreply, State3} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, InfoChecks, #{}},
@@ -1043,7 +1070,7 @@ computePollStats(Timings) ->
 		{SystemMap3, _, _, _, _} = State3,
 		{"host1.example.com", _, _, NormalisedAfterInfo, _} = maps:get("lucos_foo", SystemMap3),
 		% circleci count must still be 1, NOT 2 — info's update must not re-increment it
-		?assertEqual(1, maps:get(<<"unknown_count">>, maps:get(<<"circleci">>, NormalisedAfterInfo, #{}), -1)).
+		?assertEqual(1, maps:get(<<"consecutiveUnknownsCount">>, maps:get(<<"circleci">>, NormalisedAfterInfo, #{}), -1)).
 
 	% is_dependency_suppressed: check with no dependsOn field → false
 	is_dependency_suppressed_no_field_test() ->
@@ -1215,7 +1242,7 @@ computePollStats(Timings) ->
 		FutureExpiry = erlang:system_time(second) + 600,
 		SuppressionMap = #{"lucos_eolas" => {FutureExpiry, #{}}},
 		SystemChecks = #{
-			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>, <<"fail_count">> => 0, <<"unknown_count">> => 0}
+			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>, <<"consecutiveFailsCount">> => 0, <<"consecutiveUnknownsCount">> => 0}
 		},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
@@ -1232,8 +1259,8 @@ computePollStats(Timings) ->
 		FutureExpiry = erlang:system_time(second) + 600,
 		SuppressionMap = #{"lucos_eolas" => {FutureExpiry, #{}}},
 		SystemChecks = #{
-			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>, <<"fail_count">> => 0, <<"unknown_count">> => 0},
-			<<"db">> => #{<<"ok">> => false, <<"fail_count">> => 0, <<"unknown_count">> => 0}
+			<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>, <<"consecutiveFailsCount">> => 0, <<"consecutiveUnknownsCount">> => 0},
+			<<"db">> => #{<<"ok">> => false, <<"consecutiveFailsCount">> => 0, <<"consecutiveUnknownsCount">> => 0}
 		},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
@@ -1265,41 +1292,41 @@ computePollStats(Timings) ->
 
 	% computeCheckStatus: healthy check
 	compute_check_status_healthy_test() ->
-		Check = #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 0},
+		Check = #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0},
 		?assertEqual(healthy, computeCheckStatus(Check)).
 
 	% computeCheckStatus: failing check (ok=false)
 	compute_check_status_failing_test() ->
-		Check = #{<<"ok">> => false, <<"unknown_count">> => 0, <<"fail_count">> => 1},
+		Check = #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1},
 		?assertEqual(failing, computeCheckStatus(Check)).
 
 	% computeCheckStatus: unknown check (ok=unknown, no counters)
 	compute_check_status_unknown_test() ->
-		Check = #{<<"ok">> => unknown, <<"unknown_count">> => 0},
+		Check = #{<<"ok">> => unknown, <<"consecutiveUnknownsCount">> => 0},
 		?assertEqual(unknown, computeCheckStatus(Check)).
 
-	% computeCheckStatus: buffering due to unknown_count > 0
+	% computeCheckStatus: buffering due to consecutiveUnknownsCount > 0
 	compute_check_status_buffering_unknown_count_test() ->
-		Check = #{<<"ok">> => true, <<"unknown_count">> => 1, <<"fail_count">> => 0},
+		Check = #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 1, <<"consecutiveFailsCount">> => 0},
 		?assertEqual(buffering, computeCheckStatus(Check)).
 
-	% computeCheckStatus: buffering due to fail_count>0 with failThreshold>1
+	% computeCheckStatus: buffering due to consecutiveFailsCount>0 with failThreshold>1
 	compute_check_status_buffering_fail_count_test() ->
-		Check = #{<<"ok">> => true, <<"unknown_count">> => 0, <<"fail_count">> => 1, <<"failThreshold">> => 3},
+		Check = #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1, <<"failThreshold">> => 3},
 		?assertEqual(buffering, computeCheckStatus(Check)).
 
-	% computeCheckStatus: fail_count=1 with failThreshold=1 is failing (already at threshold)
+	% computeCheckStatus: consecutiveFailsCount=1 with failThreshold=1 is failing (already at threshold)
 	compute_check_status_failing_at_threshold_test() ->
-		Check = #{<<"ok">> => false, <<"fail_count">> => 1, <<"failThreshold">> => 1},
+		Check = #{<<"ok">> => false, <<"consecutiveFailsCount">> => 1, <<"failThreshold">> => 1},
 		?assertEqual(failing, computeCheckStatus(Check)).
 
-	% computeCheckStatus: ok=unknown with unknown_count>0 → buffering.
+	% computeCheckStatus: ok=unknown with consecutiveUnknownsCount>0 → buffering.
 	% This is the case where replaceUnknowns has held the previous ok value as unknown
 	% (e.g. the check was never observed healthy) and the counter hasn't hit the threshold yet.
 	% Without this case, a check stuck in unknown with an incrementing counter would appear
 	% as plain "unknown" in the UI, hiding the fact that it is actively failing its poll.
 	compute_check_status_buffering_unknown_ok_test() ->
-		Check = #{<<"ok">> => unknown, <<"unknown_count">> => 1, <<"fail_count">> => 0},
+		Check = #{<<"ok">> => unknown, <<"consecutiveUnknownsCount">> => 1, <<"consecutiveFailsCount">> => 0},
 		?assertEqual(buffering, computeCheckStatus(Check)).
 
 	% computeCheckStatusText: healthy
@@ -1314,14 +1341,14 @@ computePollStats(Timings) ->
 	compute_check_status_text_unknown_test() ->
 		?assertEqual(<<"unknown">>, computeCheckStatusText(unknown, #{})).
 
-	% computeCheckStatusText: buffering via unknown_count
+	% computeCheckStatusText: buffering via consecutiveUnknownsCount
 	compute_check_status_text_buffering_unknown_count_test() ->
-		Check = #{<<"unknown_count">> => 2},
+		Check = #{<<"consecutiveUnknownsCount">> => 2},
 		?assertEqual(<<"unknown (2)">>, computeCheckStatusText(buffering, Check)).
 
-	% computeCheckStatusText: buffering via fail_count
+	% computeCheckStatusText: buffering via consecutiveFailsCount
 	compute_check_status_text_buffering_fail_count_test() ->
-		Check = #{<<"unknown_count">> => 0, <<"fail_count">> => 1, <<"failThreshold">> => 3},
+		Check = #{<<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1, <<"failThreshold">> => 3},
 		?assertEqual(<<"failing (1/3)">>, computeCheckStatusText(buffering, Check)).
 
 	% computeSystemStatus: no checks → healthy.
@@ -1348,7 +1375,7 @@ computePollStats(Timings) ->
 
 	% computeSystemStatus: any buffering check → buffering
 	compute_system_status_buffering_test() ->
-		Cache = #{<<"a">> => #{<<"ok">> => true, <<"unknown_count">> => 1, <<"status">> => buffering, <<"statusText">> => <<"unknown (1)">>}},
+		Cache = #{<<"a">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 1, <<"status">> => buffering, <<"statusText">> => <<"unknown (1)">>}},
 		?assertEqual(buffering, computeSystemStatus("host1", "lucos_foo", Cache, #{})).
 
 	% computeSystemStatus: active suppression with no pre-existing failures → suppressed
@@ -1424,7 +1451,7 @@ computePollStats(Timings) ->
 	compute_system_status_priority_unknown_over_buffering_test() ->
 		Cache = #{
 			<<"a">> => #{<<"ok">> => unknown, <<"status">> => unknown, <<"statusText">> => <<"unknown">>},
-			<<"b">> => #{<<"ok">> => true, <<"unknown_count">> => 1, <<"status">> => buffering, <<"statusText">> => <<"unknown (1)">>}
+			<<"b">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 1, <<"status">> => buffering, <<"statusText">> => <<"unknown (1)">>}
 		},
 		?assertEqual(unknown, computeSystemStatus("host1", "lucos_foo", Cache, #{})).
 
@@ -1432,7 +1459,7 @@ computePollStats(Timings) ->
 	% state_change with the same checks should split the alert into a Suppressed=false
 	% notification (continuing problem) — NOT collapse to a single Suppressed=true.
 	suppress_snapshots_pre_existing_failures_test() ->
-		FailingChecks = #{<<"host-tracking-failures">> => #{<<"ok">> => false, <<"fail_count">> => 1, <<"unknown_count">> => 0}},
+		FailingChecks = #{<<"host-tracking-failures">> => #{<<"ok">> => false, <<"consecutiveFailsCount">> => 1, <<"consecutiveUnknownsCount">> => 0}},
 		AnnotatedFailing = annotateCheckStatuses(FailingChecks),
 		SystemMap = #{"lucos_foo" => {"host1", system, #{info => FailingChecks}, AnnotatedFailing, #{}}},
 		Notifier = recording_notifier(self()),
@@ -1451,7 +1478,7 @@ computePollStats(Timings) ->
 		FutureExpiry = erlang:system_time(second) + 600,
 		PreExisting = #{"host1" => sets:from_list([<<"host-tracking-failures">>], [{version, 2}])},
 		SuppressionMap = #{"lucos_backups" => {FutureExpiry, PreExisting}},
-		SystemChecks = #{<<"host-tracking-failures">> => #{<<"ok">> => false, <<"fail_count">> => 1, <<"unknown_count">> => 0}},
+		SystemChecks = #{<<"host-tracking-failures">> => #{<<"ok">> => false, <<"consecutiveFailsCount">> => 1, <<"consecutiveUnknownsCount">> => 0}},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
 		state_change("host1", "lucos_backups", SystemChecks, #{}, SuppressionMap, [Notifier]),
@@ -1467,7 +1494,7 @@ computePollStats(Timings) ->
 		FutureExpiry = erlang:system_time(second) + 600,
 		PreExisting = #{"host1" => sets:new([{version, 2}])},
 		SuppressionMap = #{"lucos_foo" => {FutureExpiry, PreExisting}},
-		SystemChecks = #{<<"new-failure">> => #{<<"ok">> => false, <<"fail_count">> => 1, <<"unknown_count">> => 0}},
+		SystemChecks = #{<<"new-failure">> => #{<<"ok">> => false, <<"consecutiveFailsCount">> => 1, <<"consecutiveUnknownsCount">> => 0}},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
 		state_change("host1", "lucos_foo", SystemChecks, #{}, SuppressionMap, [Notifier]),
@@ -1485,8 +1512,8 @@ computePollStats(Timings) ->
 		PreExisting = #{"host1" => sets:from_list([<<"old-failure">>], [{version, 2}])},
 		SuppressionMap = #{"lucos_foo" => {FutureExpiry, PreExisting}},
 		SystemChecks = #{
-			<<"old-failure">> => #{<<"ok">> => false, <<"fail_count">> => 1, <<"unknown_count">> => 0},
-			<<"new-failure">> => #{<<"ok">> => false, <<"fail_count">> => 1, <<"unknown_count">> => 0}
+			<<"old-failure">> => #{<<"ok">> => false, <<"consecutiveFailsCount">> => 1, <<"consecutiveUnknownsCount">> => 0},
+			<<"new-failure">> => #{<<"ok">> => false, <<"consecutiveFailsCount">> => 1, <<"consecutiveUnknownsCount">> => 0}
 		},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),

@@ -42,6 +42,22 @@ ciRepoLoop(StatePid, RepoId, Type, Host) ->
 	timer:sleep(timer:seconds(60)),
 	ciRepoLoop(StatePid, RepoId, Type, Host).
 
+% make_third_party_probe_check/2 builds a circleci checks-map in the ok: unknown state
+% for use when a transport or API error prevents fetching from CircleCI.
+%
+% CircleCI is a third-party service: its unreachability says nothing about the probed
+% system's CI health — the UnknownsGate (consecutiveUnknownsCount threshold in
+% monitoring_state_server) is the correct suppression mechanism.  The gate holds the
+% previously-known state until N consecutive unknowns indicate a persistent problem.
+%
+% DO NOT add failThreshold to checks produced by this helper.  failThreshold gates
+% ok: false transitions — the circleci fetcher only emits ok: false for actual
+% workflow failures, never for transport errors.  Adding failThreshold would gate the
+% wrong state and leave transient CircleCI API blips unaddressed.
+% See the FailsGate comment in monitoring_state_server.erl.
+make_third_party_probe_check(TechDetail, Debug) ->
+	#{<<"circleci">> => #{<<"ok">> => unknown, <<"techDetail">> => TechDetail, <<"debug">> => Debug}}.
+
 % CircleCI pipeline check logic. Returns a checks map:
 %   - #{} (empty) when the project has no CI configured (404) — the state
 %     server will prune any stale circleci check from its normalised cache.
@@ -64,21 +80,13 @@ checkCIForSlug(Slug) ->
 			% can prune any stale circleci check from its normalised cache.
 			#{};
 		{ok, {{_Version, StatusCode, ReasonPhrase}, _Headers, _Body}} ->
-			#{<<"circleci">> => #{
-				<<"ok">> => unknown,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint")
-			}};
+			make_third_party_probe_check(TechDetail, list_to_binary("Received HTTP response with status "++integer_to_list(StatusCode)++" "++ReasonPhrase++" from pipeline endpoint"));
 		{error, Error} ->
 			% Transport error — return unknown so existing check state is held
 			% until we can reach CircleCI again. This may be a transient network
 			% issue rather than a missing CI project.
 			logger:warning("CircleCI API request failed for ~p: ~p", [Slug, Error]),
-			#{<<"circleci">> => #{
-				<<"ok">> => unknown,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary(io_lib:format("Transport error contacting CircleCI API: ~p", [Error]))
-			}}
+			make_third_party_probe_check(TechDetail, list_to_binary(io_lib:format("Transport error contacting CircleCI API: ~p", [Error])))
 	end.
 
 % Processes the list of pipeline items returned by the CircleCI API.
@@ -94,11 +102,7 @@ handlePipelineItems(Slug, [LatestPipeline | OtherPipelines], AuthHeader, UAHeade
 		{error, Reason} ->
 			% If the most recent pipeline's workflow fetch fails, return unknown rather
 			% than letting an older pipeline's workflows surface as the current state.
-			#{<<"circleci">> => #{
-				<<"ok">> => unknown,
-				<<"techDetail">> => TechDetail,
-				<<"debug">> => list_to_binary("Workflow fetch failed for most recent pipeline: " ++ Reason)
-			}};
+			make_third_party_probe_check(TechDetail, list_to_binary("Workflow fetch failed for most recent pipeline: " ++ Reason));
 		{ok, LatestWorkflows} ->
 			OlderWorkflows = collectAllWorkflows(OtherPipelines, AuthHeader, UAHeader),
 			checkWorkflowStatuses(Slug, LatestWorkflows ++ OlderWorkflows, LatestPipelineUrl, TechDetail)
@@ -329,5 +333,24 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 		Result = checkWorkflowStatuses("github/lucas42/lucos_test", Workflows, "https://app.circleci.com/pipelines/github/lucas42/lucos_test/44", <<"Checks status of recent circleCI pipelines">>),
 		?assertMatch(#{<<"circleci">> := #{<<"ok">> := false}}, Result).
 
+	% make_third_party_probe_check: positive — produces a circleci check with ok: unknown
+	% and the expected techDetail / debug fields.
+	make_third_party_probe_check_shape_test() ->
+		TechDetail = <<"Checks status of recent circleCI pipelines">>,
+		Debug = <<"Transport error contacting CircleCI API: {failed_connect,[]}">>,
+		Result = make_third_party_probe_check(TechDetail, Debug),
+		#{<<"circleci">> := Check} = Result,
+		?assertEqual(unknown, maps:get(<<"ok">>, Check)),
+		?assertEqual(TechDetail, maps:get(<<"techDetail">>, Check)),
+		?assertEqual(Debug, maps:get(<<"debug">>, Check)).
+
+	% make_third_party_probe_check: negative — the result must NOT carry failThreshold.
+	% Third-party API errors say nothing about the probed system's CI health; the
+	% UnknownsGate (consecutive-unknowns threshold in monitoring_state_server) is the
+	% correct mechanism.  failThreshold would gate the wrong state.
+	make_third_party_probe_check_no_failThreshold_test() ->
+		Result = make_third_party_probe_check(<<"tech">>, <<"debug">>),
+		#{<<"circleci">> := Check} = Result,
+		?assertNot(maps:is_key(<<"failThreshold">>, Check)).
 
 -endif.

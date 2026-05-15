@@ -42,12 +42,13 @@ runChecks(StatePid, Id, Type, Host) ->
 	StartTime = erlang:monotonic_time(millisecond),
 	{TLSCheck} = checkTlsExpiry(Host),
 	{InfoCheck, _System, Checks, Metrics} = fetchInfo(Host),
-	% Option B: require 2 consecutive failures before alerting on the fetcher's own synthetic
-	% checks. These are the checks most likely to see transient blips during deploys or restarts,
-	% so one extra poll of buffer meaningfully reduces false-positive alert volume.
+	% Direct-probe checks: this fetcher reaches the system itself, so transport failures
+	% mean the system is genuinely unreachable (ok: false is the right signal).
+	% make_direct_probe_check/1 stamps failThreshold: 2 so the FailsGate absorbs
+	% single-poll transient blips during deploys or container restarts.
 	AllChecks = maps:merge(#{
-		<<"fetch-info">> => maps:put(<<"failThreshold">>, 2, InfoCheck),
-		<<"tls-certificate">> => maps:put(<<"failThreshold">>, 2, TLSCheck)
+		<<"fetch-info">> => make_direct_probe_check(InfoCheck),
+		<<"tls-certificate">> => make_direct_probe_check(TLSCheck)
 	}, Checks),
 	ok = gen_server:cast(StatePid, {updateSystem, Host, Id, Type, info, AllChecks, Metrics}),
 	DurationMs = erlang:monotonic_time(millisecond) - StartTime,
@@ -57,6 +58,21 @@ runChecks(StatePid, Id, Type, Host) ->
 	IsOk = (InfoOk =:= true),
 	logger:info("Checked ~p: duration_ms=~p fetch_info=~p tls=~p", [Id, DurationMs, InfoOk, TLSOk]),
 	ok = gen_server:cast(StatePid, {poll_timing, Id, DurationMs, IsOk}).
+
+% make_direct_probe_check stamps failThreshold: 2 on a check produced by a fetcher
+% that directly probes the system itself (e.g. fetch-info, tls-certificate).
+%
+% When this fetcher cannot reach the system, it emits ok: false — transport failure
+% here means the system is genuinely unreachable, so the FailsGate
+% (consecutiveFailsCount / failThreshold in monitoring_state_server) is the right
+% suppression mechanism.  Requiring 2 consecutive failures absorbs single-poll
+% transient blips during deploys or container restarts without masking real outages.
+%
+% Use this helper for any synthetic check where the fetcher is the direct probe.
+% Do NOT use it for third-party probes (e.g. CircleCI) — see
+% make_third_party_probe_check/2 in fetcher_circleci.erl for that case.
+make_direct_probe_check(Check) ->
+	maps:put(<<"failThreshold">>, 2, Check).
 
 checkTlsExpiry(Host) ->
 	TechDetail = <<"Checks whether the TLS Certificate is valid and not about to expire">>,
@@ -415,5 +431,24 @@ fetchInfo(Host) ->
 		?assertEqual(946684800, datetimeToUnixSeconds({{2000, 1, 1}, {0, 0, 0}})),
 		% One second before epoch is negative
 		?assertEqual(-1, datetimeToUnixSeconds({{1969, 12, 31}, {23, 59, 59}})).
+
+	% make_direct_probe_check: stamps failThreshold: 2 onto the check.
+	% This encodes the choice that a transport failure from a direct probe means the
+	% system is genuinely unreachable, and the FailsGate is the correct mechanism.
+	make_direct_probe_check_stamps_failThreshold_test() ->
+		BaseCheck = #{<<"ok">> => false, <<"techDetail">> => <<"Makes HTTP request to https://foo.l42.eu/_info">>},
+		Result = make_direct_probe_check(BaseCheck),
+		?assertEqual(2, maps:get(<<"failThreshold">>, Result)),
+		% All original fields are preserved
+		?assertEqual(false, maps:get(<<"ok">>, Result)),
+		?assertEqual(<<"Makes HTTP request to https://foo.l42.eu/_info">>, maps:get(<<"techDetail">>, Result)).
+
+	% make_direct_probe_check: preserves arbitrary check fields (techDetail, debug, link).
+	make_direct_probe_check_preserves_fields_test() ->
+		BaseCheck = #{<<"ok">> => true, <<"techDetail">> => <<"tls check">>, <<"debug">> => <<"ok">>},
+		Result = make_direct_probe_check(BaseCheck),
+		?assertEqual(2, maps:get(<<"failThreshold">>, Result)),
+		?assertEqual(<<"tls check">>, maps:get(<<"techDetail">>, Result)),
+		?assertEqual(<<"ok">>, maps:get(<<"debug">>, Result)).
 
 -endif.
