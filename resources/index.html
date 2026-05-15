@@ -12,9 +12,40 @@
 		<<BODY>>
 		<script src="/lucos_navbar.js" type="text/javascript"></script>
 		<script>
+			function formatAge(seconds) {
+				if (seconds < 1) return 'just now';
+				if (seconds < 60) return seconds + 's ago';
+				if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+				const hours = Math.floor(seconds / 3600);
+				const mins = Math.floor((seconds % 3600) / 60);
+				return mins > 0 ? hours + 'h ' + mins + 'm ago' : hours + 'h ago';
+			}
+
+			function updateFreshnessIndicators() {
+				const now = Math.floor(Date.now() / 1000);
+				document.querySelectorAll('.freshness-indicator[data-last-updated]').forEach(function(el) {
+					const lastUpdated = parseInt(el.dataset.lastUpdated, 10);
+					const oldestSourceTs = parseInt(el.dataset.oldestSourceTs, 10);
+					if (!lastUpdated) return;
+					const mostRecentAge = Math.max(0, now - lastUpdated);
+					const oldestAge = Math.max(0, now - oldestSourceTs);
+					if (oldestAge > 300) {
+						el.classList.add('stale');
+						el.innerHTML = '<span aria-hidden="true">⚠️</span> Data may be outdated — last received ' + formatAge(oldestAge);
+					} else {
+						el.classList.remove('stale');
+						el.textContent = 'Updated ' + formatAge(mostRecentAge);
+					}
+				});
+			}
+
+			updateFreshnessIndicators();
+			setInterval(updateFreshnessIndicators, 30000);
+
 			const source = new EventSource('/event-stream');
 			source.onmessage = function(event) {
 				document.getElementById('checks').outerHTML = event.data;
+				updateFreshnessIndicators();
 			};
 		</script>
 	</body>

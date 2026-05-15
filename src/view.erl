@@ -1,6 +1,10 @@
 -module(view).
 -export([render_page/1, render_dashboard_block/1]).
 
+% Threshold in seconds beyond which a data source is considered stale.
+% At a 60-second poll interval, 300 seconds = 5 missed polls before warning.
+-define(STALE_THRESHOLD_SECS, 300).
+
 % Renders the full HTML page for a list of systems.
 % Reads the page shell from index.html, builds the dashboard block via render_dashboard_block/1,
 % then substitutes <<TITLE>>, <<STYLESHEET_HREF>>, and <<BODY>> placeholders.
@@ -70,6 +74,48 @@ typeToEmoji(system)    -> {"&#127961;&#65039;", "System"};     % 🏙️
 typeToEmoji(host)      -> {"&#128421;&#65039;", "Host"};       % 🖥️
 typeToEmoji(component) -> {"&#128451;&#65039;", "Component"};  % 🗃️
 typeToEmoji(_)         -> {"&#10068;", "Unknown type"}.        % ❔
+
+% Returns a human-readable string for a duration in seconds.
+% Examples: "just now", "45s ago", "3m ago", "1h ago", "7h 20m ago".
+formatAge(0) -> "just now";
+formatAge(AgeSecs) when AgeSecs < 60 ->
+	integer_to_list(AgeSecs) ++ "s ago";
+formatAge(AgeSecs) when AgeSecs < 3600 ->
+	Mins = AgeSecs div 60,
+	integer_to_list(Mins) ++ "m ago";
+formatAge(AgeSecs) ->
+	Hours = AgeSecs div 3600,
+	Mins = (AgeSecs rem 3600) div 60,
+	case Mins of
+		0 -> integer_to_list(Hours) ++ "h ago";
+		_ -> integer_to_list(Hours) ++ "h " ++ integer_to_list(Mins) ++ "m ago"
+	end.
+
+% Renders a freshness indicator <p> element for a system section.
+% LastUpdated is the most recent source timestamp (Unix seconds).
+% OldestSourceTs is the oldest source timestamp (Unix seconds).
+% Returns "" when no timestamps are available (brand-new system before first render).
+% When OldestSourceTs is stale (>STALE_THRESHOLD_SECS), renders a warning that
+% uses both an icon AND text — the distinction does not rely on colour alone.
+renderFreshnessIndicator(0, _) -> "";
+renderFreshnessIndicator(LastUpdated, OldestSourceTs) ->
+	Now = erlang:system_time(second),
+	MostRecentAge = max(0, Now - LastUpdated),
+	OldestAge = max(0, Now - OldestSourceTs),
+	DataAttrs = "data-last-updated=\"" ++ integer_to_list(LastUpdated)
+	         ++ "\" data-oldest-source-ts=\"" ++ integer_to_list(OldestSourceTs) ++ "\"",
+	case OldestAge > ?STALE_THRESHOLD_SECS of
+		true ->
+			AgeStr = formatAge(OldestAge),
+			"<p class=\"freshness-indicator stale\" " ++ DataAttrs ++ ">"
+			++ "<span aria-hidden=\"true\">&#9888;&#65039;</span>"
+			++ " Data may be outdated &mdash; last received " ++ AgeStr
+			++ "</p>";
+		false ->
+			"<p class=\"freshness-indicator\" " ++ DataAttrs ++ ">"
+			++ "Updated " ++ formatAge(MostRecentAge)
+			++ "</p>"
+	end.
 
 renderSystemChecks(SystemChecks) ->
 	SortedChecks = lists:sort(
@@ -178,6 +224,8 @@ renderAll(Systems) ->
 			Type = maps:get(<<"type">>, System, unknown),
 			SystemChecks = maps:get(<<"checks">>, System, []),
 			SystemMetrics = maps:get(<<"metrics">>, System, []),
+			LastUpdated = maps:get(<<"last_updated">>, System, 0),
+			OldestSourceTs = maps:get(<<"oldest_source_ts">>, System, 0),
 			DupNameCount = length(lists:filter(
 				fun(S) -> maps:get(<<"name">>, S, <<>>) =:= Name end,
 				Systems)),
@@ -185,6 +233,7 @@ renderAll(Systems) ->
 			Output++"
 			<div class=\""++CssClass++"\">
 				"++renderSystemHeader(Name, Host, Type, DupNameCount)++"
+				"++renderFreshnessIndicator(LastUpdated, OldestSourceTs)++"
 				"++renderSystemChecks(SystemChecks)++"
 				"++renderSystemMetrics(SystemMetrics)++"
 			</div>
@@ -401,5 +450,99 @@ renderAll(Systems) ->
 		Html = render_dashboard_block(Systems),
 		?assert(string:str(Html, "type-icon") > 0, "heading must include a type-icon span even without a type"),
 		?assert(string:str(Html, "Unknown type") > 0, "missing type must fall back to unknown-type label").
+
+	% ── formatAge ────────────────────────────────────────────────────────────
+
+	format_age_zero_test() ->
+		?assertEqual("just now", formatAge(0)).
+
+	format_age_seconds_test() ->
+		?assertEqual("45s ago", formatAge(45)).
+
+	format_age_just_under_minute_test() ->
+		?assertEqual("59s ago", formatAge(59)).
+
+	format_age_minutes_test() ->
+		?assertEqual("3m ago", formatAge(180)).
+
+	format_age_just_under_hour_test() ->
+		?assertEqual("59m ago", formatAge(3540)).
+
+	format_age_hours_exact_test() ->
+		?assertEqual("2h ago", formatAge(7200)).
+
+	format_age_hours_and_minutes_test() ->
+		?assertEqual("7h 20m ago", formatAge(26400)).
+
+	% ── renderFreshnessIndicator ─────────────────────────────────────────────
+
+	render_freshness_indicator_no_timestamp_test() ->
+		% When LastUpdated is 0, return empty string (no indicator yet).
+		?assertEqual("", renderFreshnessIndicator(0, 0)).
+
+	render_freshness_indicator_fresh_test() ->
+		% When all sources are fresh, shows "Updated Xs ago" with no stale class.
+		Now = erlang:system_time(second),
+		Html = renderFreshnessIndicator(Now - 30, Now - 30),
+		?assert(string:str(Html, "freshness-indicator") > 0, "must have freshness-indicator class"),
+		?assertEqual(0, string:str(Html, "stale"), "must NOT have stale class when data is fresh"),
+		?assert(string:str(Html, "Updated") > 0, "must show Updated prefix when fresh"),
+		?assert(string:str(Html, "data-last-updated") > 0, "must include data-last-updated attribute").
+
+	render_freshness_indicator_stale_test() ->
+		% When oldest source is beyond threshold, shows warning with icon and text.
+		Now = erlang:system_time(second),
+		StaleTs = Now - 26400, % 7h 20m ago
+		Html = renderFreshnessIndicator(Now - 30, StaleTs),
+		?assert(string:str(Html, "stale") > 0, "must have stale class when data is outdated"),
+		?assert(string:str(Html, "Data may be outdated") > 0, "must describe the problem in text (not colour alone)"),
+		?assert(string:str(Html, "7h 20m ago") > 0, "must show the age of the oldest source"),
+		?assert(string:str(Html, "aria-hidden") > 0, "warning icon must be aria-hidden (text carries the meaning)"),
+		?assert(string:str(Html, "data-oldest-source-ts") > 0, "must include data-oldest-source-ts attribute").
+
+	render_freshness_indicator_just_at_threshold_test() ->
+		% At exactly the threshold (300s), the indicator should NOT be stale.
+		Now = erlang:system_time(second),
+		Html = renderFreshnessIndicator(Now - 300, Now - 300),
+		?assertEqual(0, string:str(Html, "stale"), "must NOT be stale at exactly the threshold").
+
+	render_freshness_indicator_just_over_threshold_test() ->
+		% One second past the threshold should trigger the stale state.
+		Now = erlang:system_time(second),
+		Html = renderFreshnessIndicator(Now - 30, Now - 301),
+		?assert(string:str(Html, "stale") > 0, "must be stale one second past threshold").
+
+	render_dashboard_block_includes_freshness_indicator_test() ->
+		% A system with timestamps renders a freshness indicator.
+		Now = erlang:system_time(second),
+		Systems = [#{
+			<<"host">> => <<"example.l42.eu">>,
+			<<"name">> => <<"lucos_example">>,
+			<<"id">> => <<"lucos_example">>,
+			<<"status">> => healthy,
+			<<"checks">> => [],
+			<<"metrics">> => [],
+			<<"last_updated">> => Now - 30,
+			<<"oldest_source_ts">> => Now - 30
+		}],
+		Html = render_dashboard_block(Systems),
+		?assert(string:str(Html, "freshness-indicator") > 0, "dashboard must show freshness indicator").
+
+	render_dashboard_block_stale_freshness_test() ->
+		% A system with a stale source shows the stale warning.
+		Now = erlang:system_time(second),
+		Systems = [#{
+			<<"host">> => <<"example.l42.eu">>,
+			<<"name">> => <<"lucos_example">>,
+			<<"id">> => <<"lucos_example">>,
+			<<"status">> => healthy,
+			<<"checks">> => [],
+			<<"metrics">> => [],
+			<<"last_updated">> => Now - 30,
+			<<"oldest_source_ts">> => Now - 26400
+		}],
+		Html = render_dashboard_block(Systems),
+		?assert(string:str(Html, "stale") > 0, "dashboard must show stale warning for outdated source"),
+		?assert(string:str(Html, "Data may be outdated") > 0, "stale warning must contain explanatory text").
 
 -endif.

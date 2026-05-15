@@ -26,3 +26,5 @@ tr.metric[title] { cursor: help; }
 #checks { max-width: 720px; display: block; margin: 0 auto;}
 .system-checks { display: block; width: 100%; }
 .system-checks > table { width: 100%; }
+.freshness-indicator { font-size: 0.75em; color: #888; text-align: right; margin: 0.1em 0 0; padding: 0 1em; font-style: italic; }
+.freshness-indicator.stale { color: #7a3b00; font-style: normal; font-weight: bold; background: #fff3e0; padding: 0.2em 1em; border-left: 3px solid #da9000; }

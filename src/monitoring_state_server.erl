@@ -32,7 +32,7 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 		{updateSystem, Host, System, SystemType, Source, SourceChecks, SystemMetrics} ->
 			logger:info("Received update for system ~p (Host ~p, Source ~p)", [System, Host, Source]),
 			IsFirstSeen = not maps:is_key(System, SystemMap),
-			{_, _, OldSourceChecksMap, OldNormalisedCache, OldMetrics} = maps:get(System, SystemMap, {nil, system, #{}, #{}, #{}}),
+			{_, _, OldSourceChecksMap, OldNormalisedCache, OldMetrics, OldSourceTimestamps} = maps:get(System, SystemMap, {nil, system, #{}, #{}, #{}, #{}}),
 			NewSourceChecksMap = maps:put(Source, SourceChecks, OldSourceChecksMap),
 			NewMergedChecks = mergeSourceChecks(NewSourceChecksMap),
 			% When a source explicitly reports no checks (e.g. circleci returns 404,
@@ -101,7 +101,10 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 					end
 			end,
 			AnnotatedChecks = annotateCheckStatuses(NormalisedChecks),
-			NewSystemMap = maps:put(System, {Host, SystemType, NewSourceChecksMap, AnnotatedChecks, NewMetrics}, SystemMap),
+			% Record the current time for this source. Used by the view to render
+			% a per-section freshness indicator that reveals data-source-dark states.
+			NewSourceTimestamps = maps:put(Source, erlang:system_time(second), OldSourceTimestamps),
+			NewSystemMap = maps:put(System, {Host, SystemType, NewSourceChecksMap, AnnotatedChecks, NewMetrics, NewSourceTimestamps}, SystemMap),
 			% Only publish an SSE event if something visible actually changed.
 			% AnnotatedChecks =/= OldNormalisedCache catches check state changes;
 			% NewMetrics =/= OldMetrics catches metric value changes;
@@ -169,7 +172,7 @@ handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers, PollTimings, 
 					% partitioning in state_change. A system could in principle span multiple
 					% hosts (today it's 1:1; the data model supports more).
 					PreExisting = maps:fold(fun
-						(S, {Host, _, _, NormalisedCache, _}, Acc) when S =:= System ->
+						(S, {Host, _, _, NormalisedCache, _, _}, Acc) when S =:= System ->
 							FailingKeys = sets:from_list(maps:keys(failingChecks(NormalisedCache)), [{version, 2}]),
 							maps:put(Host, FailingKeys, Acc);
 						(_, _, Acc) -> Acc
@@ -225,7 +228,7 @@ systemExists(System, SystemMap) ->
 % across all hosts. Used to build the PendingSources set on unsuppress.
 collect_active_sources(System, SystemMap) ->
 	maps:fold(fun
-		(S, {_, _, SourceChecksMap, _, _}, Acc) when S =:= System ->
+		(S, {_, _, SourceChecksMap, _, _, _}, Acc) when S =:= System ->
 			sets:union(Acc, sets:from_list(maps:keys(SourceChecksMap)));
 		(_, _, Acc) -> Acc
 	end, sets:new([{version, 2}]), SystemMap).
@@ -445,7 +448,7 @@ is_dependency_suppressed(Check, CurrentSystem, SuppressionMap) ->
 % pending_verification when TargetSystem unsuppresses. Excludes TargetSystem
 % itself (self-reference guard).
 find_dependent_systems(TargetSystem, SystemMap) ->
-	lists:usort(maps:fold(fun(System, {_Host, _SystemType, SourceChecksMap, _, _}, Acc) ->
+	lists:usort(maps:fold(fun(System, {_Host, _SystemType, SourceChecksMap, _, _, _}, Acc) ->
 		case System =:= TargetSystem of
 			true -> Acc;  % Guard: skip self
 			false ->
@@ -565,25 +568,39 @@ aggregateCheckStatuses(SystemId, NormalisedCache, SuppressionMap) ->
 % Builds the full system list as returned by {fetch, all}.
 % Used by both {fetch, all} handler and the publish hook at each mutation site.
 build_system_list(SystemMap, SuppressionMap) ->
-	maps:fold(fun(SystemId, {Host, SystemType, _SourceChecksMap, NormalisedCache, Metrics}, Acc) ->
-		[buildSystemOutput(Host, SystemId, SystemType, NormalisedCache, Metrics, SuppressionMap) | Acc]
+	maps:fold(fun(SystemId, {Host, SystemType, _SourceChecksMap, NormalisedCache, Metrics, SourceTimestamps}, Acc) ->
+		[buildSystemOutput(Host, SystemId, SystemType, NormalisedCache, Metrics, SuppressionMap, SourceTimestamps) | Acc]
 	end, [], SystemMap).
 
 % Builds the system output map returned by {fetch, all}.
 % Includes <<"host">> for view-layer URL construction (not in ADR spec but required for rendering).
-buildSystemOutput(Host, SystemId, SystemType, NormalisedCache, Metrics, SuppressionMap) ->
+% SourceTimestamps is #{source_atom => unix_seconds} — used to compute freshness fields.
+buildSystemOutput(Host, SystemId, SystemType, NormalisedCache, Metrics, SuppressionMap, SourceTimestamps) ->
 	Checks = [buildCheckOutput(CheckId, Check) || {CheckId, Check} <- maps:to_list(NormalisedCache)],
 	MetricsList = [buildMetricOutput(MetricId, Metric) || {MetricId, Metric} <- maps:to_list(Metrics)],
 	SystemStatus = computeSystemStatus(Host, SystemId, NormalisedCache, SuppressionMap),
+	{LastUpdated, OldestSourceTs} = computeFreshnessTimestamps(SourceTimestamps),
 	#{
-		<<"id">>      => list_to_binary(SystemId),
-		<<"type">>    => SystemType,
-		<<"name">>    => list_to_binary(SystemId),
-		<<"host">>    => list_to_binary(Host),
-		<<"checks">>  => Checks,
-		<<"metrics">> => MetricsList,
-		<<"status">>  => SystemStatus
+		<<"id">>               => list_to_binary(SystemId),
+		<<"type">>             => SystemType,
+		<<"name">>             => list_to_binary(SystemId),
+		<<"host">>             => list_to_binary(Host),
+		<<"checks">>           => Checks,
+		<<"metrics">>          => MetricsList,
+		<<"status">>           => SystemStatus,
+		<<"last_updated">>     => LastUpdated,
+		<<"oldest_source_ts">> => OldestSourceTs
 	}.
+
+% Returns {MostRecentTimestamp, OldestTimestamp} across all source entries.
+% When no sources have reported yet, returns {0, 0} as a safe default.
+computeFreshnessTimestamps(SourceTimestamps) ->
+	case maps:size(SourceTimestamps) of
+		0 -> {0, 0};
+		_ ->
+			Timestamps = maps:values(SourceTimestamps),
+			{lists:max(Timestamps), lists:min(Timestamps)}
+	end.
 
 % Builds the check output map. Includes optional string fields (techDetail, debug, link)
 % only when present and non-empty; omits internal counter fields.
@@ -651,8 +668,8 @@ computePollStats(Timings) ->
 
 	systemExists_test() ->
 		SystemMap = #{
-			"lucos_foo" => {"host1.example.com", system, #{}, #{}, #{}},
-			"lucos_bar" => {"host2.example.com", host, #{}, #{}, #{}}
+			"lucos_foo" => {"host1.example.com", system, #{}, #{}, #{}, #{}},
+			"lucos_bar" => {"host2.example.com", host, #{}, #{}, #{}, #{}}
 		},
 		?assertEqual(true, systemExists("lucos_foo", SystemMap)),
 		?assertEqual(true, systemExists("lucos_bar", SystemMap)),
@@ -685,7 +702,7 @@ computePollStats(Timings) ->
 		),
 		% System ID should now be in the SystemMap
 		?assert(maps:is_key("lucos_foo", SystemMap)),
-		{"host1.example.com", _Type, SourceChecksMap, _, _} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _Type, SourceChecksMap, _, _, _} = maps:get("lucos_foo", SystemMap),
 		StoredChecks = mergeSourceChecks(SourceChecksMap),
 		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"fetch-info">>, StoredChecks))).
 
@@ -694,7 +711,7 @@ computePollStats(Timings) ->
 	warmup_second_update_not_suppressed_test() ->
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, #{}, #{}, #{}}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -712,7 +729,7 @@ computePollStats(Timings) ->
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => false}},
 		% Start with info checks already stored
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, #{}, #{}, #{}}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -722,7 +739,7 @@ computePollStats(Timings) ->
 			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
 			ExistingState
 		),
-		{"host1.example.com", _Type, SourceChecksMap, _, _} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _Type, SourceChecksMap, _, _, _} = maps:get("lucos_foo", SystemMap),
 		Merged = mergeSourceChecks(SourceChecksMap),
 		% All three checks must be present
 		?assert(maps:is_key(<<"fetch-info">>, Merged)),
@@ -736,7 +753,7 @@ computePollStats(Timings) ->
 		OldInfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}, <<"custom-check">> => #{<<"ok">> => true}},
 		NewInfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => OldInfoChecks}, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => OldInfoChecks}, #{}, #{}, #{}}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -745,7 +762,7 @@ computePollStats(Timings) ->
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, NewInfoChecks, #{}},
 			ExistingState
 		),
-		{"host1.example.com", _Type, SourceChecksMap, _, _} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _Type, SourceChecksMap, _, _, _} = maps:get("lucos_foo", SystemMap),
 		Merged = mergeSourceChecks(SourceChecksMap),
 		?assertNot(maps:is_key(<<"custom-check">>, Merged)).
 
@@ -755,7 +772,7 @@ computePollStats(Timings) ->
 		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		Metrics = #{<<"agent-count">> => #{<<"value">> => 42, <<"techDetail">> => <<"count">>}},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, #{}, Metrics}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, #{}, Metrics, #{}}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -765,7 +782,7 @@ computePollStats(Timings) ->
 			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
 			ExistingState
 		),
-		{"host1.example.com", _, _, _, StoredMetrics} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _, _, _, StoredMetrics, _} = maps:get("lucos_foo", SystemMap),
 		?assertEqual(Metrics, StoredMetrics).
 
 	% When a source provides non-empty metrics, they replace the existing ones.
@@ -773,7 +790,7 @@ computePollStats(Timings) ->
 		OldMetrics = #{<<"agent-count">> => #{<<"value">> => 42, <<"techDetail">> => <<"count">>}},
 		NewMetrics = #{<<"agent-count">> => #{<<"value">> => 99, <<"techDetail">> => <<"count">>}},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, OldMetrics}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, OldMetrics, #{}}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -782,7 +799,7 @@ computePollStats(Timings) ->
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, #{<<"fetch-info">> => #{<<"ok">> => true}}, NewMetrics},
 			ExistingState
 		),
-		{"host1.example.com", _, _, _, StoredMetrics} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _, _, _, StoredMetrics, _} = maps:get("lucos_foo", SystemMap),
 		?assertEqual(NewMetrics, StoredMetrics).
 
 	% Helper to build a recording notifier and retrieve what it captured.
@@ -803,7 +820,7 @@ computePollStats(Timings) ->
 	% Unsuppressing a healthy system enters pending_verification and does NOT fire an immediate alert.
 	unsuppress_healthy_system_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
-		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, #{}, #{}}},
+		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, #{}, #{}, #{}}},
 		Notifier = recording_notifier(self()),
 		State = {SystemMap, #{"lucos_foo" => {erlang:system_time(second) + 600, #{}}}, [Notifier], #{}, fun(_) -> ok end},
 		{reply, ok, {_, NewSuppressionMap, _, _, _}} = handle_call(
@@ -820,7 +837,7 @@ computePollStats(Timings) ->
 	% Unsuppressing an unhealthy system enters pending_verification; alert is deferred, not immediate.
 	unsuppress_unhealthy_system_test() ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
-		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks}, #{}, #{}}},
+		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks}, #{}, #{}, #{}}},
 		Notifier = recording_notifier(self()),
 		State = {SystemMap, #{"lucos_foo" => {erlang:system_time(second) + 600, #{}}}, [Notifier], #{}, fun(_) -> ok end},
 		drain_notifications(),
@@ -846,7 +863,7 @@ computePollStats(Timings) ->
 	% After unsuppress, a fresh poll reporting unhealthy fires an alert and clears pending state.
 	pending_verification_fires_alert_when_unhealthy_test() ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
-		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks}, #{}, #{}}},
+		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks}, #{}, #{}, #{}}},
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
@@ -867,7 +884,7 @@ computePollStats(Timings) ->
 	% After unsuppress, a fresh poll reporting healthy clears pending state without alerting.
 	pending_verification_no_alert_when_healthy_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
-		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, #{}, #{}}},
+		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, #{}, #{}, #{}}},
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
@@ -889,7 +906,7 @@ computePollStats(Timings) ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => false}},
 		SystemMap = #{
-			"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks, circleci => CIChecks}, #{}, #{}}
+			"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks, circleci => CIChecks}, #{}, #{}, #{}}
 		},
 		PendingSources = sets:from_list([info, circleci], [{version, 2}]),
 		Notifier = recording_notifier(self()),
@@ -975,7 +992,7 @@ computePollStats(Timings) ->
 			<<"circleci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}
 		},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks, circleci => CIChecks}, ExistingNormalisedCache, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks, circleci => CIChecks}, ExistingNormalisedCache, #{}, #{}}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -994,7 +1011,7 @@ computePollStats(Timings) ->
 			State2
 		),
 		{SystemMap3, _, _, _, _} = State3,
-		{"host1.example.com", _, _, NormalisedAfterCI404, _} = maps:get("lucos_foo", SystemMap3),
+		{"host1.example.com", _, _, NormalisedAfterCI404, _, _} = maps:get("lucos_foo", SystemMap3),
 		% circleci check must be absent — 404 means "no CI", not "CI unknown"
 		?assertNot(maps:is_key(<<"circleci">>, NormalisedAfterCI404),
 			"circleci check must be wiped by 404, not resurrected by mergeMissingInfoChecks").
@@ -1021,7 +1038,7 @@ computePollStats(Timings) ->
 			<<"item-count">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1}
 		},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, ExistingNormalisedCache, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, ExistingNormalisedCache, #{}, #{}}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -1031,7 +1048,7 @@ computePollStats(Timings) ->
 			ExistingState
 		),
 		{SystemMap2, _, _, _, _} = State2,
-		{"host1.example.com", _, _, NormalisedAfterBlip, _} = maps:get("lucos_foo", SystemMap2),
+		{"host1.example.com", _, _, NormalisedAfterBlip, _, _} = maps:get("lucos_foo", SystemMap2),
 		?assert(maps:is_key(<<"tls-certificate">>, NormalisedAfterBlip),
 			"tls-certificate must persist during transient /_info blip"),
 		?assert(maps:is_key(<<"item-count">>, NormalisedAfterBlip),
@@ -1049,7 +1066,7 @@ computePollStats(Timings) ->
 		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks, circleci => CIChecks}, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks, circleci => CIChecks}, #{}, #{}, #{}}},
 			#{},
 			Notifiers,
 			#{}, fun(_) -> ok end
@@ -1060,7 +1077,7 @@ computePollStats(Timings) ->
 			ExistingState
 		),
 		{SystemMap2, _, _, _, _} = State2,
-		{"host1.example.com", _, _, NormalisedAfterCI, _} = maps:get("lucos_foo", SystemMap2),
+		{"host1.example.com", _, _, NormalisedAfterCI, _, _} = maps:get("lucos_foo", SystemMap2),
 		?assertEqual(1, maps:get(<<"consecutiveUnknownsCount">>, maps:get(<<"circleci">>, NormalisedAfterCI, #{}), -1)),
 		% Now info reports (ok, no change) — circleci check is carried over in the merged view
 		{noreply, State3} = handle_cast(
@@ -1068,7 +1085,7 @@ computePollStats(Timings) ->
 			State2
 		),
 		{SystemMap3, _, _, _, _} = State3,
-		{"host1.example.com", _, _, NormalisedAfterInfo, _} = maps:get("lucos_foo", SystemMap3),
+		{"host1.example.com", _, _, NormalisedAfterInfo, _, _} = maps:get("lucos_foo", SystemMap3),
 		% circleci count must still be 1, NOT 2 — info's update must not re-increment it
 		?assertEqual(1, maps:get(<<"consecutiveUnknownsCount">>, maps:get(<<"circleci">>, NormalisedAfterInfo, #{}), -1)).
 
@@ -1114,10 +1131,10 @@ computePollStats(Timings) ->
 		SystemMap = #{
 			"lucos_time" => {"host1.example.com", system, #{info => #{
 				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
-			}}, #{}, #{}},
+			}}, #{}, #{}, #{}},
 			"lucos_arachne" => {"host2.example.com", system, #{info => #{
 				<<"triplestore">> => #{<<"ok">> => true}
-			}}, #{}, #{}}
+			}}, #{}, #{}, #{}}
 		},
 		?assertEqual(["lucos_time"], find_dependent_systems("lucos_eolas", SystemMap)).
 
@@ -1126,7 +1143,7 @@ computePollStats(Timings) ->
 		SystemMap = #{
 			"lucos_time" => {"host1.example.com", system, #{info => #{
 				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
-			}}, #{}, #{}}
+			}}, #{}, #{}, #{}}
 		},
 		?assertEqual([], find_dependent_systems("some.other.system", SystemMap)).
 
@@ -1135,7 +1152,7 @@ computePollStats(Timings) ->
 		SystemMap = #{
 			"lucos_eolas" => {"host1.example.com", system, #{info => #{
 				<<"db">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
-			}}, #{}, #{}}
+			}}, #{}, #{}, #{}}
 		},
 		?assertEqual([], find_dependent_systems("lucos_eolas", SystemMap)).
 
@@ -1144,10 +1161,10 @@ computePollStats(Timings) ->
 		SystemMap = #{
 			"lucos_time" => {"host1.example.com", system, #{info => #{
 				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
-			}}, #{}, #{}},
+			}}, #{}, #{}, #{}},
 			"lucos_arachne" => {"host2.example.com", system, #{info => #{
 				<<"eolas-data">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
-			}}, #{}, #{}}
+			}}, #{}, #{}, #{}}
 		},
 		Deps = find_dependent_systems("lucos_eolas", SystemMap),
 		?assertEqual(["lucos_arachne", "lucos_time"], lists:sort(Deps)).
@@ -1213,7 +1230,7 @@ computePollStats(Timings) ->
 			"lucos_loganne" => {"host1.example.com", system, #{info => #{
 				<<"webhook-error-rate">> =>
 					#{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_a">>, <<"lucos_eolas">>, <<"lucos_b">>]}
-			}}, #{}, #{}}
+			}}, #{}, #{}, #{}}
 		},
 		?assertEqual(["lucos_loganne"], find_dependent_systems("lucos_eolas", SystemMap)).
 
@@ -1223,7 +1240,7 @@ computePollStats(Timings) ->
 			"lucos_loganne" => {"host1.example.com", system, #{info => #{
 				<<"webhook-error-rate">> =>
 					#{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_eolas">>]}
-			}}, #{}, #{}}
+			}}, #{}, #{}, #{}}
 		},
 		?assertEqual(["lucos_loganne"], find_dependent_systems("lucos_eolas", SystemMap)).
 
@@ -1233,7 +1250,7 @@ computePollStats(Timings) ->
 			"lucos_loganne" => {"host1.example.com", system, #{info => #{
 				<<"webhook-error-rate">> =>
 					#{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_loganne">>, <<"lucos_a">>]}
-			}}, #{}, #{}}
+			}}, #{}, #{}, #{}}
 		},
 		?assertEqual([], find_dependent_systems("lucos_loganne", SystemMap)).
 
@@ -1278,8 +1295,8 @@ computePollStats(Timings) ->
 	unsuppress_cascades_pending_verification_test() ->
 		TimeChecks = #{<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}},
 		SystemMap = #{
-			"lucos_eolas" => {"", system, #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, #{}},
-			"lucos_time" => {"schedule-tracker.l42.eu", system, #{info => TimeChecks}, #{}, #{}}
+			"lucos_eolas" => {"", system, #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, #{}, #{}},
+			"lucos_time" => {"schedule-tracker.l42.eu", system, #{info => TimeChecks}, #{}, #{}, #{}}
 		},
 		FutureExpiry = erlang:system_time(second) + 600,
 		SuppressionMap = #{"lucos_eolas" => {FutureExpiry, #{}}},
@@ -1461,7 +1478,7 @@ computePollStats(Timings) ->
 	suppress_snapshots_pre_existing_failures_test() ->
 		FailingChecks = #{<<"host-tracking-failures">> => #{<<"ok">> => false, <<"consecutiveFailsCount">> => 1, <<"consecutiveUnknownsCount">> => 0}},
 		AnnotatedFailing = annotateCheckStatuses(FailingChecks),
-		SystemMap = #{"lucos_foo" => {"host1", system, #{info => FailingChecks}, AnnotatedFailing, #{}}},
+		SystemMap = #{"lucos_foo" => {"host1", system, #{info => FailingChecks}, AnnotatedFailing, #{}, #{}}},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
 		State = {SystemMap, #{}, [Notifier], #{}, fun(_) -> ok end},
@@ -1639,7 +1656,7 @@ computePollStats(Timings) ->
 		Checks2 = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		ExistingAnnotated = annotateCheckStatuses(normaliseChecks(#{}, Checks1, sets:new([{version, 2}]))),
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks1}, ExistingAnnotated, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks1}, ExistingAnnotated, #{}, #{}}},
 			#{},
 			[],
 			#{}, PublishFun
@@ -1661,7 +1678,7 @@ computePollStats(Timings) ->
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingAnnotated = annotateCheckStatuses(normaliseChecks(#{}, Checks, sets:new([{version, 2}]))),
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, ExistingAnnotated, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, ExistingAnnotated, #{}, #{}}},
 			#{},
 			[],
 			#{}, PublishFun
@@ -1675,5 +1692,86 @@ computePollStats(Timings) ->
 		after 100 ->
 			ok
 		end.
+
+	% Source timestamps are recorded in the system entry on each updateSystem cast.
+	source_timestamp_recorded_on_first_update_test() ->
+		InitialState = {#{}, #{}, [], #{}, fun(_) -> ok end},
+		Before = erlang:system_time(second),
+		{noreply, {SystemMap, _, _, _, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, #{}, #{}},
+			InitialState
+		),
+		After = erlang:system_time(second),
+		{"host1.example.com", _, _, _, _, SourceTimestamps} = maps:get("lucos_foo", SystemMap),
+		?assert(maps:is_key(info, SourceTimestamps), "info source must have a timestamp entry"),
+		Ts = maps:get(info, SourceTimestamps),
+		?assert(Ts >= Before andalso Ts =< After, "timestamp must be within the test window").
+
+	% A second update from the same source refreshes its timestamp.
+	source_timestamp_updated_on_subsequent_cast_test() ->
+		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		ExistingTs = erlang:system_time(second) - 120,
+		ExistingState = {
+			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, #{}, #{}, #{info => ExistingTs}}},
+			#{}, [], #{}, fun(_) -> ok end
+		},
+		Before = erlang:system_time(second),
+		{noreply, {SystemMap, _, _, _, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, Checks, #{}},
+			ExistingState
+		),
+		After = erlang:system_time(second),
+		{"host1.example.com", _, _, _, _, SourceTimestamps} = maps:get("lucos_foo", SystemMap),
+		NewTs = maps:get(info, SourceTimestamps),
+		?assert(NewTs >= Before andalso NewTs =< After, "timestamp must be refreshed to current time"),
+		?assert(NewTs > ExistingTs, "new timestamp must be more recent than the old one").
+
+	% A second source gets its own timestamp entry alongside the first.
+	source_timestamp_per_source_independent_test() ->
+		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
+		ExistingState = {
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, #{}, #{}, #{info => 1000}}},
+			#{}, [], #{}, fun(_) -> ok end
+		},
+		{noreply, {SystemMap, _, _, _, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
+			ExistingState
+		),
+		{"host1.example.com", _, _, _, _, SourceTimestamps} = maps:get("lucos_foo", SystemMap),
+		?assert(maps:is_key(info, SourceTimestamps), "info timestamp must be preserved"),
+		?assert(maps:is_key(circleci, SourceTimestamps), "circleci timestamp must be added"),
+		?assertEqual(1000, maps:get(info, SourceTimestamps), "info timestamp must not be touched by circleci update").
+
+	% computeFreshnessTimestamps: empty map returns {0, 0}.
+	compute_freshness_timestamps_empty_test() ->
+		?assertEqual({0, 0}, computeFreshnessTimestamps(#{})).
+
+	% computeFreshnessTimestamps: single source returns that timestamp for both max and min.
+	compute_freshness_timestamps_single_source_test() ->
+		?assertEqual({1000, 1000}, computeFreshnessTimestamps(#{info => 1000})).
+
+	% computeFreshnessTimestamps: multiple sources — max is most recent, min is oldest.
+	compute_freshness_timestamps_multiple_sources_test() ->
+		Ts = #{info => 1500, circleci => 900, scheduled_jobs => 200},
+		{Max, Min} = computeFreshnessTimestamps(Ts),
+		?assertEqual(1500, Max),
+		?assertEqual(200, Min).
+
+	% buildSystemOutput includes last_updated and oldest_source_ts fields.
+	build_system_output_includes_freshness_fields_test() ->
+		Now = erlang:system_time(second),
+		SourceTimestamps = #{info => Now - 30, circleci => Now - 45},
+		Output = buildSystemOutput("host1.example.com", "lucos_foo", system, #{}, #{}, #{}, SourceTimestamps),
+		?assert(maps:is_key(<<"last_updated">>, Output), "last_updated must be present"),
+		?assert(maps:is_key(<<"oldest_source_ts">>, Output), "oldest_source_ts must be present"),
+		?assertEqual(Now - 30, maps:get(<<"last_updated">>, Output), "last_updated must be the most recent timestamp"),
+		?assertEqual(Now - 45, maps:get(<<"oldest_source_ts">>, Output), "oldest_source_ts must be the oldest timestamp").
+
+	% buildSystemOutput with no source timestamps produces {0, 0} freshness fields.
+	build_system_output_no_timestamps_test() ->
+		Output = buildSystemOutput("host1.example.com", "lucos_foo", system, #{}, #{}, #{}, #{}),
+		?assertEqual(0, maps:get(<<"last_updated">>, Output)),
+		?assertEqual(0, maps:get(<<"oldest_source_ts">>, Output)).
 
 -endif.
