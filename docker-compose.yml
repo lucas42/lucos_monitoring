@@ -14,6 +14,9 @@ services:
       - APP_ORIGIN
       - CLIENT_KEYS
       - SCHEDULE_TRACKER_ENDPOINT
+      - CIRCLECI_API_TOKEN
+      - LOG_LEVEL
+      - SYSTEM
     image: lucas42/lucos_monitoring:${VERSION:-latest}
     restart: always
     healthcheck:
