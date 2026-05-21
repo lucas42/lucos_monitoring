@@ -24,7 +24,12 @@ start(_StartType, _StartArgs) ->
 configureLogLevel() ->
 	LevelStr = os:getenv("LOG_LEVEL", "notice"),
 	Level = list_to_atom(LevelStr),
-	logger:set_primary_config(level, Level).
+	logger:set_primary_config(level, Level),
+	logger:update_handler_config(default, formatter, {logger_formatter, #{
+		single_line => true,
+		legacy_header => false,
+		template => [time, " [", level, "] ", msg, "\n"]
+	}}).
 
 listen_with_retry(Port, _Opts, _StatePid, _SchedulerCount, 0) ->
 	logger:emergency("Can't listen on port ~p: eaddrinuse (all retries exhausted)", [Port]),
