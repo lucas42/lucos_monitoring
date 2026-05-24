@@ -42,6 +42,7 @@ listen_with_retry(Port, Opts, StatePid, SchedulerCount, RetriesLeft) ->
 			end,
 			lists:foreach(Spawn, lists:seq(1, SchedulerCount)),
 			logger:notice("server listening on port ~b with ~b schedulers", [Port, SchedulerCount]),
+			loganne:notify_startup(),
 			fetcher_info:start(StatePid),
 			fetcher_circleci:start(StatePid),
 			fetcher_scheduled_jobs:start(StatePid),
