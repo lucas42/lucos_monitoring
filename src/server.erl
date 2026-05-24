@@ -45,6 +45,7 @@ listen_with_retry(Port, Opts, StatePid, SchedulerCount, RetriesLeft) ->
 			fetcher_info:start(StatePid),
 			fetcher_circleci:start(StatePid),
 			fetcher_scheduled_jobs:start(StatePid),
+			loganne:notify_startup(),
 			receive
 				Any -> logger:notice("~p", [Any])
 			end;

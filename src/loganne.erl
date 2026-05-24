@@ -1,5 +1,11 @@
 -module(loganne).
--export([notify/5]).
+-export([notify/5, notify_startup/0]).
+
+notify_startup() ->
+	Host = os:getenv("APP_ORIGIN", os:getenv("SYSTEM", "lucos_monitoring")),
+	HumanReadable = "lucos_monitoring restarted on " ++ Host,
+	AppOrigin = os:getenv("APP_ORIGIN", ""),
+	emit_event("monitoringSelfRestart", HumanReadable, AppOrigin).
 
 notify(Host, System, FailingChecks, Suppressed, _Metrics) ->
 	{EventType, HumanReadable} = buildEvent(Host, System, FailingChecks, Suppressed),
@@ -44,7 +50,7 @@ emit_event(EventType, HumanReadable, Url) ->
 				<<"url">> => list_to_binary(Url)
 			}),
 			Request = {Endpoint, [{"User-Agent", os:getenv("SYSTEM", "")}], "application/json", Body},
-			case httpc:request(post, Request, [], []) of
+			try httpc:request(post, Request, [], []) of
 				{ok, {{_, StatusCode, _}, _, _}} when StatusCode >= 200, StatusCode < 300 ->
 					logger:info("Loganne event ~p sent successfully to ~p", [EventType, Endpoint]);
 				{ok, {{_, StatusCode, _}, _, ResponseBody}} ->
@@ -52,6 +58,10 @@ emit_event(EventType, HumanReadable, Url) ->
 					ok;
 				{error, Reason} ->
 					logger:error("Failed to emit Loganne event ~p to ~p: ~p", [EventType, Endpoint, Reason]),
+					ok
+			catch
+				ExClass:ExReason ->
+					logger:error("Exception emitting Loganne event ~p to ~p: ~p ~p", [EventType, Endpoint, ExClass, ExReason]),
 					ok
 			end
 	end,
@@ -112,6 +122,33 @@ emit_event(EventType, HumanReadable, Url) ->
 			{"monitoringAlert", "1 failing check on unknown (foo.example.com): fetch-info"},
 			buildEvent("foo.example.com", unknown, #{<<"fetch-info">> => #{<<"ok">> => false}}, false)
 		).
+
+	notify_startup_no_endpoint_test() ->
+		%% When LOGANNE_ENDPOINT is unset, notify_startup/0 should return without crashing
+		os:unsetenv("LOGANNE_ENDPOINT"),
+		os:putenv("APP_ORIGIN", "https://monitoring.l42.eu"),
+		?assertEqual(ok, notify_startup()),
+		os:unsetenv("APP_ORIGIN").
+
+	notify_startup_inets_not_started_test() ->
+		%% When LOGANNE_ENDPOINT is set but inets is not running, notify_startup/0 must
+		%% return ok without crashing — this is the production failure mode from the
+		%% 2026-05-24 incident where notify_startup was called before the fetchers started inets.
+		os:putenv("LOGANNE_ENDPOINT", "https://loganne.l42.eu/events"),
+		os:putenv("APP_ORIGIN", "https://monitoring.l42.eu"),
+		case lists:keyfind(inets, 1, application:which_applications()) of
+			false ->
+				%% inets not running: exercise the try/catch path directly.
+				?assertEqual(ok, notify_startup());
+			_ ->
+				%% inets already running in this test environment — stopping it would
+				%% kill httpc_manager and crash the shared test VM (CI failure mode).
+				%% Skip the stop; the try/catch is the defence-in-depth guard, and the
+				%% ordering fix in server.erl is the real production fix.
+				ok
+		end,
+		os:unsetenv("LOGANNE_ENDPOINT"),
+		os:unsetenv("APP_ORIGIN").
 
 	emit_event_no_endpoint_test() ->
 		%% When LOGANNE_ENDPOINT is unset, emit_event/3 should return without crashing
