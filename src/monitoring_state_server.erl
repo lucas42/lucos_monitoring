@@ -85,7 +85,13 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 											logger:notice("Service ~p still unhealthy after deploy — alerting", [System]),
 											notify_all(Host, System, FailingNow, false, NewMetrics, Notifiers);
 										false ->
-											logger:notice("Service ~p healthy after deploy", [System])
+											case failingChecks(OldNormalisedCache) of
+												PrevFailing when map_size(PrevFailing) > 0 ->
+													logger:notice("Service ~p healthy after deploy — emitting recovery", [System]),
+													notify_all(Host, System, #{}, false, NewMetrics, Notifiers);
+												_ ->
+													logger:notice("Service ~p healthy after deploy", [System])
+											end
 									end,
 									maps:remove(System, SuppressionMap);
 								false ->
@@ -877,9 +883,11 @@ computePollStats(Timings) ->
 			?assert(false, "Expected alert was not fired after verification poll")
 		end.
 
-	% After unsuppress, a fresh poll reporting healthy clears pending state without alerting.
-	pending_verification_no_alert_when_healthy_test() ->
+	% After unsuppress, a fresh poll reporting healthy clears pending state without alerting —
+	% when the prior normalised state was also healthy (no recovery to emit).
+	pending_verification_no_alert_when_healthy_prior_also_healthy_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		% NormalisedCache is #{} — no prior failures
 		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, #{}, #{}, #{}}},
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
@@ -892,9 +900,33 @@ computePollStats(Timings) ->
 		% Suppression entry should be cleared
 		?assertEqual(#{}, NewSuppressionMap),
 		receive
-			{notified, _, _, _, _, _} -> ?assert(false, "No alert expected for healthy service after verify")
+			{notified, _, _, _, _, _} -> ?assert(false, "No alert expected when prior state was also healthy")
 		after 100 ->
 			ok
+		end.
+
+	% After unsuppress, a fresh poll reporting healthy emits a monitoringRecovery if the
+	% prior normalised state had failing checks (Mechanism B bug fix).
+	pending_verification_recovery_emitted_when_prior_state_was_failing_test() ->
+		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		FailingNormalisedCache = #{<<"fetch-info">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1}},
+		% NormalisedCache has a prior failure — a recovery must be emitted
+		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, FailingNormalisedCache, #{}, #{}}},
+		PendingSources = sets:from_list([info], [{version, 2}]),
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier], #{}, fun(_) -> ok end},
+		{noreply, {_, NewSuppressionMap, _, _, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, HealthyChecks, #{}},
+			State
+		),
+		% Suppression entry should be cleared
+		?assertEqual(#{}, NewSuppressionMap),
+		receive
+			{notified, "host1.example.com", "lucos_foo", FailingNow, false, _Metrics} ->
+				?assertEqual(#{}, FailingNow, "Recovery must be emitted with empty failing checks")
+		after 100 ->
+			?assert(false, "Expected monitoringRecovery was not emitted after deploy when prior state was failing")
 		end.
 
 	% With two sources pending, the first poll keeps pending state; the second evaluates.
