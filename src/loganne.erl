@@ -1,11 +1,5 @@
 -module(loganne).
--export([notify/5, notify_startup/0]).
-
-notify_startup() ->
-	Host = os:getenv("APP_ORIGIN", os:getenv("SYSTEM", "lucos_monitoring")),
-	HumanReadable = "lucos_monitoring restarted on " ++ Host,
-	AppOrigin = os:getenv("APP_ORIGIN", ""),
-	emit_event("monitoringSelfRestart", HumanReadable, AppOrigin).
+-export([notify/5]).
 
 notify(Host, System, FailingChecks, Suppressed, _Metrics) ->
 	{EventType, HumanReadable} = buildEvent(Host, System, FailingChecks, Suppressed),
@@ -118,13 +112,6 @@ emit_event(EventType, HumanReadable, Url) ->
 			{"monitoringAlert", "1 failing check on unknown (foo.example.com): fetch-info"},
 			buildEvent("foo.example.com", unknown, #{<<"fetch-info">> => #{<<"ok">> => false}}, false)
 		).
-
-	notify_startup_no_endpoint_test() ->
-		%% When LOGANNE_ENDPOINT is unset, notify_startup/0 should return without crashing
-		os:unsetenv("LOGANNE_ENDPOINT"),
-		os:putenv("APP_ORIGIN", "https://monitoring.l42.eu"),
-		?assertEqual(ok, notify_startup()),
-		os:unsetenv("APP_ORIGIN").
 
 	emit_event_no_endpoint_test() ->
 		%% When LOGANNE_ENDPOINT is unset, emit_event/3 should return without crashing
