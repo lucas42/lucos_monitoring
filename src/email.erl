@@ -1,11 +1,15 @@
 -module(email).
--export([notify/5]).
+-export([notify/1]).
 
 
-notify(_Host, _SystemName, _FailingChecks, true, _SystemMetrics) ->
+% Sends an alert email for a failing system. Accepts a Notification map.
+% Suppressed alerts (deploy windows) and recoveries (empty failing_checks)
+% are silently dropped — email is reserved for live, non-suppressed alerts.
+% Other keys in the map are accepted but unused.
+notify(#{suppressed := true}) ->
 	% Do not send emails during a suppressed deploy window
 	ok;
-notify(Host, SystemName, FailingChecks, _Suppressed, SystemMetrics) ->
+notify(#{host := Host, system := SystemName, failing_checks := FailingChecks, metrics := SystemMetrics}) ->
 	System = getSystemTitle(Host, SystemName),
 	% Use Host for consistent Subject lines so things get bundled into nice threads;
 	% fall back to system name when there's no host (e.g. components without a domain).
