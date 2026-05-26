@@ -7,10 +7,16 @@ notify_startup() ->
 	AppOrigin = os:getenv("APP_ORIGIN", ""),
 	emit_event("monitoringSelfRestart", HumanReadable, AppOrigin, undefined, undefined).
 
-% Notifier interface (see #260). Accepts a Notification map with keys:
-%   host, system, failing_checks, was_failing, suppressed, metrics.
-% failing_checks drives alert events; was_failing drives recovery events;
-% the {maps:size(failing_checks), suppressed} pair picks the event type.
+% Emits one monitoring event to loganne. The Notification map carries the
+% fields the event needs:
+%   host             — hostname (may be "" for components without a domain)
+%   system           — system id (string or 'unknown' atom)
+%   failing_checks   — checks currently failing; non-empty drives alert events
+%   was_failing      — checks that were failing in the prior state; populates
+%                      the failingChecks payload on recovery events
+%   suppressed       — whether the alert is suppressed (deploy window)
+%   metrics          — system metrics (unused by loganne; carried for symmetry
+%                      with other notifiers)
 notify(#{host := Host, system := System, failing_checks := FailingChecks,
          was_failing := WasFailing, suppressed := Suppressed}) ->
 	{EventType, HumanReadable, RelevantChecks} = buildEvent(Host, System, FailingChecks, WasFailing, Suppressed),
@@ -43,23 +49,18 @@ plural_checks(1) -> "check";
 plural_checks(_) -> "checks".
 
 % Builds the JSON `failingChecks` array from a map of check_name => check_map.
-% Each entry carries the check id, its `debug` string (the per-failure-mode signal —
-% timeout reason, HTTP status, exception message), and the static `techDetail`.
-% Empty-string fields are omitted to keep the payload compact. See lucas42/lucos_monitoring#260.
+% Each entry carries the check id, its `debug` string (the per-failure-mode
+% signal — timeout reason, HTTP status, exception message), and the static
+% `techDetail`. Missing fields default to empty binary.
 build_failing_checks_array(ChecksMap) ->
 	maps:fold(fun(CheckId, Check, Acc) ->
-		Base = #{<<"check">> => CheckId},
-		WithDebug = add_if_present(<<"debug">>, Check, Base),
-		WithTech = add_if_present(<<"techDetail">>, Check, WithDebug),
-		[WithTech | Acc]
+		Entry = #{
+			<<"check">> => CheckId,
+			<<"debug">> => maps:get(<<"debug">>, Check, <<>>),
+			<<"techDetail">> => maps:get(<<"techDetail">>, Check, <<>>)
+		},
+		[Entry | Acc]
 	end, [], ChecksMap).
-
-add_if_present(Key, Check, Acc) ->
-	case maps:get(Key, Check, <<>>) of
-		<<>> -> Acc;
-		Val when is_binary(Val) -> maps:put(Key, Val, Acc);
-		_ -> Acc
-	end.
 
 % emit_event for monitoring events that carry a system + checks payload. For
 % events without that shape (monitoringSelfRestart), pass System=undefined and
@@ -177,17 +178,11 @@ emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks) ->
 			[#{<<"check">> => <<"fetch-info">>, <<"debug">> => <<"Connection refused">>, <<"techDetail">> => <<"Fetches /_info">>}],
 			build_failing_checks_array(Single)
 		),
-		%% Check with no debug/techDetail strings → only the check id survives
+		%% Check with no debug/techDetail keys → fields default to empty binary
 		Bare = #{<<"foo">> => #{<<"ok">> => false}},
 		?assertEqual(
-			[#{<<"check">> => <<"foo">>}],
+			[#{<<"check">> => <<"foo">>, <<"debug">> => <<>>, <<"techDetail">> => <<>>}],
 			build_failing_checks_array(Bare)
-		),
-		%% Check with empty-string debug → debug field omitted
-		EmptyDebug = #{<<"foo">> => #{<<"ok">> => false, <<"debug">> => <<>>, <<"techDetail">> => <<"x">>}},
-		?assertEqual(
-			[#{<<"check">> => <<"foo">>, <<"techDetail">> => <<"x">>}],
-			build_failing_checks_array(EmptyDebug)
 		).
 
 	notify_startup_no_endpoint_test() ->

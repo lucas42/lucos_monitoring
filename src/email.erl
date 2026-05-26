@@ -2,9 +2,10 @@
 -export([notify/1]).
 
 
-% Notifier interface (see #260). Accepts a Notification map with keys:
-%   host, system, failing_checks, was_failing, suppressed, metrics.
-% Email doesn't emit on recoveries, so was_failing is ignored.
+% Sends an alert email for a failing system. Accepts a Notification map.
+% Suppressed alerts (deploy windows) and recoveries (empty failing_checks)
+% are silently dropped — email is reserved for live, non-suppressed alerts.
+% Other keys in the map are accepted but unused.
 notify(#{suppressed := true}) ->
 	% Do not send emails during a suppressed deploy window
 	ok;

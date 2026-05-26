@@ -349,7 +349,6 @@ failingChecks(Checks) ->
 %
 % Notification is a map carrying everything a notifier needs to emit one event:
 % host, system, failing_checks, was_failing, suppressed, metrics.
-% See lucas42/lucos_monitoring#260.
 notify_all(Notification, Notifiers) ->
 	#{host := Host, system := System} = Notification,
 	lists:foreach(fun(NotifyFn) ->
