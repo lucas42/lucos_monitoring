@@ -1,14 +1,14 @@
 -module(email).
--export([notify/6]).
+-export([notify/1]).
 
 
-% WasFailing (5th arg) is the prior-failing checks map used by other notifiers (loganne)
-% to populate the failingChecks payload on recoveries — email doesn't email on recovery
-% so it's ignored here. Kept in the signature for notifier-list arity uniformity.
-notify(_Host, _SystemName, _FailingChecks, _WasFailing, true, _SystemMetrics) ->
+% Notifier interface (see #260). Accepts a Notification map with keys:
+%   host, system, failing_checks, was_failing, suppressed, metrics.
+% Email doesn't emit on recoveries, so was_failing is ignored.
+notify(#{suppressed := true}) ->
 	% Do not send emails during a suppressed deploy window
 	ok;
-notify(Host, SystemName, FailingChecks, _WasFailing, _Suppressed, SystemMetrics) ->
+notify(#{host := Host, system := SystemName, failing_checks := FailingChecks, metrics := SystemMetrics}) ->
 	System = getSystemTitle(Host, SystemName),
 	% Use Host for consistent Subject lines so things get bundled into nice threads;
 	% fall back to system name when there's no host (e.g. components without a domain).

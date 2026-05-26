@@ -1,5 +1,5 @@
 -module(loganne).
--export([notify/6, notify_startup/0]).
+-export([notify/1, notify_startup/0]).
 
 notify_startup() ->
 	Host = os:getenv("APP_ORIGIN", os:getenv("SYSTEM", "lucos_monitoring")),
@@ -7,10 +7,12 @@ notify_startup() ->
 	AppOrigin = os:getenv("APP_ORIGIN", ""),
 	emit_event("monitoringSelfRestart", HumanReadable, AppOrigin, undefined, undefined).
 
-% FailingChecks: checks currently in the failing state (drives alert events).
-% WasFailing: checks that were failing in the prior normalised state (drives recovery events).
-% The {EventType, _, RelevantChecks} returned by buildEvent picks the right map per event type.
-notify(Host, System, FailingChecks, WasFailing, Suppressed, _Metrics) ->
+% Notifier interface (see #260). Accepts a Notification map with keys:
+%   host, system, failing_checks, was_failing, suppressed, metrics.
+% failing_checks drives alert events; was_failing drives recovery events;
+% the {maps:size(failing_checks), suppressed} pair picks the event type.
+notify(#{host := Host, system := System, failing_checks := FailingChecks,
+         was_failing := WasFailing, suppressed := Suppressed}) ->
 	{EventType, HumanReadable, RelevantChecks} = buildEvent(Host, System, FailingChecks, WasFailing, Suppressed),
 	AppOrigin = os:getenv("APP_ORIGIN", ""),
 	% Use the system ID for the anchor; host-based anchor was broken for components without a domain.
@@ -221,18 +223,22 @@ emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks) ->
 		?assertEqual(ok, emit_event("monitoringAlert", "Some alert", "https://monitoring.l42.eu/#system-lucos_foo", "lucos_foo", #{})).
 
 	notify_builds_url_test() ->
-		%% notify/6 should derive the URL from APP_ORIGIN and System (as anchor).
+		%% notify/1 should derive the URL from APP_ORIGIN and System (as anchor).
 		%% We can't easily intercept the HTTP call, so we test via emit_event behaviour:
 		%% with no LOGANNE_ENDPOINT set, notify should return ok without crashing.
 		os:unsetenv("LOGANNE_ENDPOINT"),
 		os:putenv("APP_ORIGIN", "https://monitoring.l42.eu"),
-		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, #{}, false, #{})),
+		?assertEqual(ok, notify(#{host => "foo.example.com", system => "lucos_foo",
+		                          failing_checks => #{}, was_failing => #{},
+		                          suppressed => false, metrics => #{}})),
 		os:unsetenv("APP_ORIGIN").
 
 	notify_missing_app_origin_test() ->
 		%% When APP_ORIGIN is unset, the url field should still be a valid (empty-prefixed) string.
 		os:unsetenv("LOGANNE_ENDPOINT"),
 		os:unsetenv("APP_ORIGIN"),
-		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, #{}, false, #{})).
+		?assertEqual(ok, notify(#{host => "foo.example.com", system => "lucos_foo",
+		                          failing_checks => #{}, was_failing => #{},
+		                          suppressed => false, metrics => #{}})).
 
 -endif.

@@ -8,7 +8,7 @@ start(_StartType, _StartArgs) ->
 		{Port, _} = string:to_integer(os:getenv("PORT", "8080")),
 		stream_handler:start(),
 		{ok, StatePid} = monitoring_state_server:start_link(
-			[fun loganne:notify/6, fun email:notify/6],
+			[fun loganne:notify/1, fun email:notify/1],
 			stream_handler:make_publish_fun()
 		),
 		SchedulerCount = erlang:system_info(schedulers),
