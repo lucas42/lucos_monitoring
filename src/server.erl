@@ -15,7 +15,9 @@ start(_StartType, _StartArgs) ->
 		Opts = [{active, false},
 				binary,
 				{packet, http_bin},
-				{reuseaddr, true}],
+				{reuseaddr, true},
+				inet6,
+				{ipv6_v6only, false}],
 		listen_with_retry(Port, Opts, StatePid, SchedulerCount, 30)
 	catch
 		Exception:Reason -> logger:emergency("Startup error occured: ~p ~p", [Exception, Reason])
