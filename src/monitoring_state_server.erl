@@ -80,16 +80,17 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 							case sets:size(Remaining) =:= 0 of
 								true ->
 									FailingNow = failingChecks(NormalisedChecks),
+									WasFailing = failingChecks(OldNormalisedCache),
 									case maps:size(FailingNow) > 0 of
 										true ->
 											logger:notice("Service ~p still unhealthy after deploy — alerting", [System]),
-											notify_all(Host, System, FailingNow, false, NewMetrics, Notifiers);
+											notify_all(Host, System, FailingNow, WasFailing, false, NewMetrics, Notifiers);
 										false ->
-											case failingChecks(OldNormalisedCache) of
-												PrevFailing when map_size(PrevFailing) > 0 ->
+											case map_size(WasFailing) > 0 of
+												true ->
 													logger:notice("Service ~p healthy after deploy — emitting recovery", [System]),
-													notify_all(Host, System, #{}, false, NewMetrics, Notifiers);
-												_ ->
+													notify_all(Host, System, #{}, WasFailing, false, NewMetrics, Notifiers);
+												false ->
 													logger:notice("Service ~p healthy after deploy", [System])
 											end
 									end,
@@ -100,7 +101,7 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 						_ ->
 							case meaningfulChange(OldNormalisedCache, NormalisedChecks) of
 								true ->
-									state_change(Host, System, NormalisedChecks, NewMetrics, SuppressionMap, Notifiers);
+									state_change(Host, System, NormalisedChecks, OldNormalisedCache, NewMetrics, SuppressionMap, Notifiers);
 								false ->
 									SuppressionMap
 							end
@@ -332,16 +333,22 @@ failingChecks(Checks) ->
 
 % Calls every notifier in Notifiers, catching any errors so a single
 % failing notifier cannot prevent the others from running.
-notify_all(Host, System, FailingNow, Suppressed, Metrics, Notifiers) ->
+%
+% WasFailing carries the prior-failing checks map so notifiers that emit
+% recovery events (loganne) can populate their failingChecks payload with
+% the just-recovered checks; notifiers that only act on alerts (email)
+% ignore it. See lucas42/lucos_monitoring#260.
+notify_all(Host, System, FailingNow, WasFailing, Suppressed, Metrics, Notifiers) ->
 	lists:foreach(fun(NotifyFn) ->
-		try NotifyFn(Host, System, FailingNow, Suppressed, Metrics)
+		try NotifyFn(Host, System, FailingNow, WasFailing, Suppressed, Metrics)
 		catch ExClass:ExReason ->
 			logger:error("Notify failed for ~p on ~p: ~p ~p", [System, Host, ExClass, ExReason])
 		end
 	end, Notifiers).
 
-state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifiers) ->
+state_change(Host, System, SystemChecks, OldChecks, SystemMetrics, SuppressionMap, Notifiers) ->
 	AllFailing = failingChecks(SystemChecks),
+	WasFailing = failingChecks(OldChecks),
 	% Filter out checks whose dependsOn system is currently under an active suppression window.
 	% Single-hop only: we never follow dependsOn chains transitively.
 	FailingNow = maps:filter(fun(_, Check) ->
@@ -351,14 +358,14 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 		true ->
 			% All failing checks are dependency-suppressed — notify as suppressed (no email alert).
 			logger:notice("All failing checks on ~p suppressed via dependency: ~p", [System, maps:keys(AllFailing)]),
-			notify_all(Host, System, AllFailing, true, SystemMetrics, Notifiers),
+			notify_all(Host, System, AllFailing, WasFailing, true, SystemMetrics, Notifiers),
 			SuppressionMap;
 		false ->
 			% FailingNow contains only non-dep-suppressed checks. Apply system-level suppression logic.
 			case maps:get(System, SuppressionMap, undefined) of
 				undefined ->
 					logger:notice("Checks' state changed for ~p on ~p", [System, Host]),
-					notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
+					notify_all(Host, System, FailingNow, WasFailing, false, SystemMetrics, Notifiers),
 					SuppressionMap;
 				{ExpiryTime, PreExisting} ->
 					Now = erlang:system_time(second),
@@ -376,20 +383,20 @@ state_change(Host, System, SystemChecks, SystemMetrics, SuppressionMap, Notifier
 							case maps:size(PreExistingFailing) > 0 of
 								true ->
 									logger:notice("Pre-existing failures continuing during deploy window for ~p: ~p", [System, maps:keys(PreExistingFailing)]),
-									notify_all(Host, System, PreExistingFailing, false, SystemMetrics, Notifiers);
+									notify_all(Host, System, PreExistingFailing, WasFailing, false, SystemMetrics, Notifiers);
 								false -> ok
 							end,
 							case maps:size(NewlyFailing) > 0 of
 								true ->
 									logger:notice("Alert suppressed for ~p during deploy window", [System]),
-									notify_all(Host, System, NewlyFailing, true, SystemMetrics, Notifiers);
+									notify_all(Host, System, NewlyFailing, WasFailing, true, SystemMetrics, Notifiers);
 								false -> ok
 							end,
 							SuppressionMap;
 						false ->
 							logger:error("Suppression window for ~p expired without being cleared - deploy may have taken longer than 10 minutes", [System]),
 							logger:notice("Checks' state changed for ~p on ~p", [System, Host]),
-							notify_all(Host, System, FailingNow, false, SystemMetrics, Notifiers),
+							notify_all(Host, System, FailingNow, WasFailing, false, SystemMetrics, Notifiers),
 							maps:remove(System, SuppressionMap)
 					end
 			end
@@ -807,14 +814,14 @@ computePollStats(Timings) ->
 	% Helper to build a recording notifier and retrieve what it captured.
 	% The notifier sends {notified, Args} to the calling test process.
 	recording_notifier(TestPid) ->
-		fun(Host, System, FailingNow, Suppressed, Metrics) ->
-			TestPid ! {notified, Host, System, FailingNow, Suppressed, Metrics}
+		fun(Host, System, FailingNow, WasFailing, Suppressed, Metrics) ->
+			TestPid ! {notified, Host, System, FailingNow, WasFailing, Suppressed, Metrics}
 		end.
 
 	% Drain all pending {notified, ...} messages from the mailbox.
 	drain_notifications() ->
 		receive
-			{notified, _, _, _, _, _} -> drain_notifications()
+			{notified, _, _, _, _, _, _} -> drain_notifications()
 		after 0 ->
 			ok
 		end.
@@ -831,7 +838,7 @@ computePollStats(Timings) ->
 		% System should be in pending_verification, not removed from the map
 		?assertMatch({pending_verification, _}, maps:get("lucos_foo", NewSuppressionMap)),
 		receive
-			{notified, _, _, _, _, _} -> ?assert(false, "Unexpected alert fired for healthy system")
+			{notified, _, _, _, _, _, _} -> ?assert(false, "Unexpected alert fired for healthy system")
 		after 100 ->
 			ok  % No immediate notification — correct
 		end.
@@ -849,7 +856,7 @@ computePollStats(Timings) ->
 		% System should be in pending_verification (not cleared)
 		?assertMatch({pending_verification, _}, maps:get("lucos_foo", NewSuppressionMap)),
 		receive
-			{notified, _, _, _, _, _} -> ?assert(false, "Alert must not fire immediately on unsuppress")
+			{notified, _, _, _, _, _, _} -> ?assert(false, "Alert must not fire immediately on unsuppress")
 		after 100 ->
 			ok  % No immediate notification — correct
 		end.
@@ -877,7 +884,7 @@ computePollStats(Timings) ->
 		% Suppression entry should be cleared
 		?assertEqual(#{}, NewSuppressionMap),
 		receive
-			{notified, "host1.example.com", "lucos_foo", FailingNow, false, _Metrics} ->
+			{notified, "host1.example.com", "lucos_foo", FailingNow, _WasFailing, false, _Metrics} ->
 				?assert(maps:is_key(<<"fetch-info">>, FailingNow))
 		after 100 ->
 			?assert(false, "Expected alert was not fired after verification poll")
@@ -900,7 +907,7 @@ computePollStats(Timings) ->
 		% Suppression entry should be cleared
 		?assertEqual(#{}, NewSuppressionMap),
 		receive
-			{notified, _, _, _, _, _} -> ?assert(false, "No alert expected when prior state was also healthy")
+			{notified, _, _, _, _, _, _} -> ?assert(false, "No alert expected when prior state was also healthy")
 		after 100 ->
 			ok
 		end.
@@ -923,7 +930,7 @@ computePollStats(Timings) ->
 		% Suppression entry should be cleared
 		?assertEqual(#{}, NewSuppressionMap),
 		receive
-			{notified, "host1.example.com", "lucos_foo", FailingNow, false, _Metrics} ->
+			{notified, "host1.example.com", "lucos_foo", FailingNow, _WasFailing, false, _Metrics} ->
 				?assertEqual(#{}, FailingNow, "Recovery must be emitted with empty failing checks")
 		after 100 ->
 			?assert(false, "Expected monitoringRecovery was not emitted after deploy when prior state was failing")
@@ -948,7 +955,7 @@ computePollStats(Timings) ->
 		{_, SuppressionMap2, _, _, _} = State2,
 		?assertMatch({pending_verification, _}, maps:get("lucos_foo", SuppressionMap2)),
 		receive
-			{notified, _, _, _, _, _} -> ?assert(false, "No alert expected after first source only")
+			{notified, _, _, _, _, _, _} -> ?assert(false, "No alert expected after first source only")
 		after 100 ->
 			ok
 		end,
@@ -959,7 +966,7 @@ computePollStats(Timings) ->
 		),
 		?assertEqual(#{}, SuppressionMap3),
 		receive
-			{notified, "host1.example.com", "lucos_foo", _, false, _} -> ok
+			{notified, "host1.example.com", "lucos_foo", _, _, false, _} -> ok
 		after 100 ->
 			?assert(false, "Expected alert after all sources reported")
 		end.
@@ -1291,9 +1298,9 @@ computePollStats(Timings) ->
 		},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
-		state_change("host1.example.com", "lucos_time", SystemChecks, #{}, SuppressionMap, [Notifier]),
+		state_change("host1.example.com", "lucos_time", SystemChecks, #{}, #{}, SuppressionMap, [Notifier]),
 		receive
-			{notified, "host1.example.com", "lucos_time", _FailingChecks, true, _} ->
+			{notified, "host1.example.com", "lucos_time", _FailingChecks, _WasFailing, true, _} ->
 				ok  % Suppressed alert — correct
 		after 100 ->
 			?assert(false, "Expected suppressed notification")
@@ -1309,9 +1316,9 @@ computePollStats(Timings) ->
 		},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
-		state_change("host1.example.com", "lucos_time", SystemChecks, #{}, SuppressionMap, [Notifier]),
+		state_change("host1.example.com", "lucos_time", SystemChecks, #{}, #{}, SuppressionMap, [Notifier]),
 		receive
-			{notified, "host1.example.com", "lucos_time", FailingNow, false, _} ->
+			{notified, "host1.example.com", "lucos_time", FailingNow, _WasFailing, false, _} ->
 				% Only db should alert, not eolas
 				?assert(maps:is_key(<<"db">>, FailingNow)),
 				?assertNot(maps:is_key(<<"eolas">>, FailingNow))
@@ -1526,9 +1533,9 @@ computePollStats(Timings) ->
 		SystemChecks = #{<<"host-tracking-failures">> => #{<<"ok">> => false, <<"consecutiveFailsCount">> => 1, <<"consecutiveUnknownsCount">> => 0}},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
-		state_change("host1", "lucos_backups", SystemChecks, #{}, SuppressionMap, [Notifier]),
+		state_change("host1", "lucos_backups", SystemChecks, #{}, #{}, SuppressionMap, [Notifier]),
 		receive
-			{notified, "host1", "lucos_backups", FailingNow, false, _} ->
+			{notified, "host1", "lucos_backups", FailingNow, _WasFailing, false, _} ->
 				?assert(maps:is_key(<<"host-tracking-failures">>, FailingNow))
 		after 100 ->
 			?assert(false, "Expected unsuppressed alert for pre-existing failure")
@@ -1542,9 +1549,9 @@ computePollStats(Timings) ->
 		SystemChecks = #{<<"new-failure">> => #{<<"ok">> => false, <<"consecutiveFailsCount">> => 1, <<"consecutiveUnknownsCount">> => 0}},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
-		state_change("host1", "lucos_foo", SystemChecks, #{}, SuppressionMap, [Notifier]),
+		state_change("host1", "lucos_foo", SystemChecks, #{}, #{}, SuppressionMap, [Notifier]),
 		receive
-			{notified, "host1", "lucos_foo", FailingNow, true, _} ->
+			{notified, "host1", "lucos_foo", FailingNow, _WasFailing, true, _} ->
 				?assert(maps:is_key(<<"new-failure">>, FailingNow))
 		after 100 ->
 			?assert(false, "Expected suppressed alert for newly-failing check")
@@ -1562,11 +1569,11 @@ computePollStats(Timings) ->
 		},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
-		state_change("host1", "lucos_foo", SystemChecks, #{}, SuppressionMap, [Notifier]),
+		state_change("host1", "lucos_foo", SystemChecks, #{}, #{}, SuppressionMap, [Notifier]),
 		% Collect both notifications — order is not guaranteed.
 		Notifications = collect_notifications(2, []),
-		Unsuppressed = [Keys || {_, _, _, Keys, false, _} <- Notifications],
-		Suppressed   = [Keys || {_, _, _, Keys, true,  _} <- Notifications],
+		Unsuppressed = [Keys || {_, _, _, Keys, _, false, _} <- Notifications],
+		Suppressed   = [Keys || {_, _, _, Keys, _, true,  _} <- Notifications],
 		?assertEqual(1, length(Unsuppressed)),
 		?assertEqual(1, length(Suppressed)),
 		[UnsupKeys] = Unsuppressed,
@@ -1581,7 +1588,7 @@ computePollStats(Timings) ->
 		lists:reverse(Acc);
 	collect_notifications(N, Acc) ->
 		receive
-			{notified, _, _, _, _, _} = Msg -> collect_notifications(N - 1, [Msg | Acc])
+			{notified, _, _, _, _, _, _} = Msg -> collect_notifications(N - 1, [Msg | Acc])
 		after 100 ->
 			lists:reverse(Acc)
 		end.

@@ -1,21 +1,24 @@
 -module(loganne).
--export([notify/5, notify_startup/0]).
+-export([notify/6, notify_startup/0]).
 
 notify_startup() ->
 	Host = os:getenv("APP_ORIGIN", os:getenv("SYSTEM", "lucos_monitoring")),
 	HumanReadable = "lucos_monitoring restarted on " ++ Host,
 	AppOrigin = os:getenv("APP_ORIGIN", ""),
-	emit_event("monitoringSelfRestart", HumanReadable, AppOrigin).
+	emit_event("monitoringSelfRestart", HumanReadable, AppOrigin, undefined, undefined).
 
-notify(Host, System, FailingChecks, Suppressed, _Metrics) ->
-	{EventType, HumanReadable} = buildEvent(Host, System, FailingChecks, Suppressed),
+% FailingChecks: checks currently in the failing state (drives alert events).
+% WasFailing: checks that were failing in the prior normalised state (drives recovery events).
+% The {EventType, _, RelevantChecks} returned by buildEvent picks the right map per event type.
+notify(Host, System, FailingChecks, WasFailing, Suppressed, _Metrics) ->
+	{EventType, HumanReadable, RelevantChecks} = buildEvent(Host, System, FailingChecks, WasFailing, Suppressed),
 	AppOrigin = os:getenv("APP_ORIGIN", ""),
 	% Use the system ID for the anchor; host-based anchor was broken for components without a domain.
 	SystemStr = case System of unknown -> "unknown"; _ -> System end,
 	Url = AppOrigin ++ "/#system-" ++ SystemStr,
-	emit_event(EventType, HumanReadable, Url).
+	emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks).
 
-buildEvent(Host, System, FailingChecks, Suppressed) ->
+buildEvent(Host, System, FailingChecks, WasFailing, Suppressed) ->
 	SystemStr = case System of
 		unknown -> "unknown";
 		_ -> System
@@ -25,30 +28,61 @@ buildEvent(Host, System, FailingChecks, Suppressed) ->
 	HostSuffix = case Host of "" -> ""; _ -> " (" ++ Host ++ ")" end,
 	case {maps:size(FailingChecks), Suppressed} of
 		{0, _} ->
-			{"monitoringRecovery", "All checks healthy on " ++ SystemTitle ++ HostSuffix};
+			{"monitoringRecovery", "All checks healthy on " ++ SystemTitle ++ HostSuffix, WasFailing};
 		{FailCount, true} ->
 			FailNames = string:join([binary_to_list(K) || K <- maps:keys(FailingChecks)], ", "),
-			{"monitoringAlertSuppressed", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ HostSuffix ++ ": " ++ FailNames ++ " (suppressed during deploy window)"};
+			{"monitoringAlertSuppressed", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ HostSuffix ++ ": " ++ FailNames ++ " (suppressed during deploy window)", FailingChecks};
 		{FailCount, false} ->
 			FailNames = string:join([binary_to_list(K) || K <- maps:keys(FailingChecks)], ", "),
-			{"monitoringAlert", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ HostSuffix ++ ": " ++ FailNames}
+			{"monitoringAlert", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ HostSuffix ++ ": " ++ FailNames, FailingChecks}
 	end.
 
 plural_checks(1) -> "check";
 plural_checks(_) -> "checks".
 
-emit_event(EventType, HumanReadable, Url) ->
+% Builds the JSON `failingChecks` array from a map of check_name => check_map.
+% Each entry carries the check id, its `debug` string (the per-failure-mode signal —
+% timeout reason, HTTP status, exception message), and the static `techDetail`.
+% Empty-string fields are omitted to keep the payload compact. See lucas42/lucos_monitoring#260.
+build_failing_checks_array(ChecksMap) ->
+	maps:fold(fun(CheckId, Check, Acc) ->
+		Base = #{<<"check">> => CheckId},
+		WithDebug = add_if_present(<<"debug">>, Check, Base),
+		WithTech = add_if_present(<<"techDetail">>, Check, WithDebug),
+		[WithTech | Acc]
+	end, [], ChecksMap).
+
+add_if_present(Key, Check, Acc) ->
+	case maps:get(Key, Check, <<>>) of
+		<<>> -> Acc;
+		Val when is_binary(Val) -> maps:put(Key, Val, Acc);
+		_ -> Acc
+	end.
+
+% emit_event for monitoring events that carry a system + checks payload. For
+% events without that shape (monitoringSelfRestart), pass System=undefined and
+% RelevantChecks=undefined — the system/failingChecks fields are then omitted.
+emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks) ->
 	Endpoint = os:getenv("LOGANNE_ENDPOINT"),
 	case Endpoint of
 		false ->
 			logger:warning("LOGANNE_ENDPOINT not set, skipping event ~p", [EventType]);
 		_ ->
-			Body = jiffy:encode(#{
+			BaseBody = #{
 				<<"source">> => <<"lucos_monitoring">>,
 				<<"type">> => list_to_binary(EventType),
 				<<"humanReadable">> => list_to_binary(HumanReadable),
 				<<"url">> => list_to_binary(Url)
-			}),
+			},
+			BodyWithSystem = case SystemStr of
+				undefined -> BaseBody;
+				_ -> maps:put(<<"system">>, list_to_binary(SystemStr), BaseBody)
+			end,
+			FullBody = case RelevantChecks of
+				undefined -> BodyWithSystem;
+				_ -> maps:put(<<"failingChecks">>, build_failing_checks_array(RelevantChecks), BodyWithSystem)
+			end,
+			Body = jiffy:encode(FullBody),
 			Request = {Endpoint, [{"User-Agent", os:getenv("SYSTEM", "")}], "application/json", Body},
 			try httpc:request(post, Request, [], []) of
 				{ok, {{_, StatusCode, _}, _, _}} when StatusCode >= 200, StatusCode < 300 ->
@@ -72,40 +106,44 @@ emit_event(EventType, HumanReadable, Url) ->
 	-include_lib("eunit/include/eunit.hrl").
 
 	buildEvent_test() ->
-		%% Recovery: no failing checks (host present — shown in parentheses)
+		%% Recovery: no failing checks (host present — shown in parentheses).
+		%% WasFailing is the relevant-checks payload for recoveries.
+		WasFailing = #{<<"ci">> => #{<<"ok">> => false, <<"debug">> => <<"Workflow failed">>}},
 		?assertEqual(
-			{"monitoringRecovery", "All checks healthy on lucos foo (foo.example.com)"},
-			buildEvent("foo.example.com", "lucos_foo", #{}, false)
+			{"monitoringRecovery", "All checks healthy on lucos foo (foo.example.com)", WasFailing},
+			buildEvent("foo.example.com", "lucos_foo", #{}, WasFailing, false)
 		),
 		%% Recovery during suppression window still uses monitoringRecovery
 		?assertEqual(
-			{"monitoringRecovery", "All checks healthy on lucos foo (foo.example.com)"},
-			buildEvent("foo.example.com", "lucos_foo", #{}, true)
+			{"monitoringRecovery", "All checks healthy on lucos foo (foo.example.com)", WasFailing},
+			buildEvent("foo.example.com", "lucos_foo", #{}, WasFailing, true)
 		),
 		%% Alert: one failing check, not suppressed (singular)
+		FailingCheck = #{<<"ci">> => #{<<"ok">> => false}},
 		?assertEqual(
-			{"monitoringAlert", "1 failing check on lucos foo (foo.example.com): ci"},
-			buildEvent("foo.example.com", "lucos_foo", #{<<"ci">> => #{<<"ok">> => false}}, false)
+			{"monitoringAlert", "1 failing check on lucos foo (foo.example.com): ci", FailingCheck},
+			buildEvent("foo.example.com", "lucos_foo", FailingCheck, #{}, false)
 		),
 		%% Alert: one failing check, suppressed (singular)
 		?assertEqual(
-			{"monitoringAlertSuppressed", "1 failing check on lucos foo (foo.example.com): ci (suppressed during deploy window)"},
-			buildEvent("foo.example.com", "lucos_foo", #{<<"ci">> => #{<<"ok">> => false}}, true)
+			{"monitoringAlertSuppressed", "1 failing check on lucos foo (foo.example.com): ci (suppressed during deploy window)", FailingCheck},
+			buildEvent("foo.example.com", "lucos_foo", FailingCheck, #{}, true)
 		).
 
 	buildEvent_no_host_test() ->
 		%% Components with no domain: host suffix is omitted from human-readable strings
 		?assertEqual(
-			{"monitoringRecovery", "All checks healthy on lucos component"},
-			buildEvent("", "lucos_component", #{}, false)
+			{"monitoringRecovery", "All checks healthy on lucos component", #{}},
+			buildEvent("", "lucos_component", #{}, #{}, false)
+		),
+		FailingCheck = #{<<"ci">> => #{<<"ok">> => false}},
+		?assertEqual(
+			{"monitoringAlert", "1 failing check on lucos component: ci", FailingCheck},
+			buildEvent("", "lucos_component", FailingCheck, #{}, false)
 		),
 		?assertEqual(
-			{"monitoringAlert", "1 failing check on lucos component: ci"},
-			buildEvent("", "lucos_component", #{<<"ci">> => #{<<"ok">> => false}}, false)
-		),
-		?assertEqual(
-			{"monitoringAlertSuppressed", "1 failing check on lucos component: ci (suppressed during deploy window)"},
-			buildEvent("", "lucos_component", #{<<"ci">> => #{<<"ok">> => false}}, true)
+			{"monitoringAlertSuppressed", "1 failing check on lucos component: ci (suppressed during deploy window)", FailingCheck},
+			buildEvent("", "lucos_component", FailingCheck, #{}, true)
 		).
 
 	plural_checks_test() ->
@@ -118,9 +156,36 @@ emit_event(EventType, HumanReadable, Url) ->
 
 	buildEvent_unknown_system_test() ->
 		%% System = unknown (atom) should not crash — happens when /_info returns non-200
+		FailingCheck = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		?assertEqual(
-			{"monitoringAlert", "1 failing check on unknown (foo.example.com): fetch-info"},
-			buildEvent("foo.example.com", unknown, #{<<"fetch-info">> => #{<<"ok">> => false}}, false)
+			{"monitoringAlert", "1 failing check on unknown (foo.example.com): fetch-info", FailingCheck},
+			buildEvent("foo.example.com", unknown, FailingCheck, #{}, false)
+		).
+
+	build_failing_checks_array_test() ->
+		%% Empty map → empty array
+		?assertEqual([], build_failing_checks_array(#{})),
+		%% Single check with debug and techDetail
+		Single = #{<<"fetch-info">> => #{
+			<<"ok">> => false,
+			<<"debug">> => <<"Connection refused">>,
+			<<"techDetail">> => <<"Fetches /_info">>
+		}},
+		?assertEqual(
+			[#{<<"check">> => <<"fetch-info">>, <<"debug">> => <<"Connection refused">>, <<"techDetail">> => <<"Fetches /_info">>}],
+			build_failing_checks_array(Single)
+		),
+		%% Check with no debug/techDetail strings → only the check id survives
+		Bare = #{<<"foo">> => #{<<"ok">> => false}},
+		?assertEqual(
+			[#{<<"check">> => <<"foo">>}],
+			build_failing_checks_array(Bare)
+		),
+		%% Check with empty-string debug → debug field omitted
+		EmptyDebug = #{<<"foo">> => #{<<"ok">> => false, <<"debug">> => <<>>, <<"techDetail">> => <<"x">>}},
+		?assertEqual(
+			[#{<<"check">> => <<"foo">>, <<"techDetail">> => <<"x">>}],
+			build_failing_checks_array(EmptyDebug)
 		).
 
 	notify_startup_no_endpoint_test() ->
@@ -151,23 +216,23 @@ emit_event(EventType, HumanReadable, Url) ->
 		os:unsetenv("APP_ORIGIN").
 
 	emit_event_no_endpoint_test() ->
-		%% When LOGANNE_ENDPOINT is unset, emit_event/3 should return without crashing
+		%% When LOGANNE_ENDPOINT is unset, emit_event/5 should return without crashing
 		os:unsetenv("LOGANNE_ENDPOINT"),
-		?assertEqual(ok, emit_event("monitoringAlert", "Some alert", "https://monitoring.l42.eu/#system-lucos_foo")).
+		?assertEqual(ok, emit_event("monitoringAlert", "Some alert", "https://monitoring.l42.eu/#system-lucos_foo", "lucos_foo", #{})).
 
 	notify_builds_url_test() ->
-		%% notify/5 should derive the URL from APP_ORIGIN and System (as anchor).
+		%% notify/6 should derive the URL from APP_ORIGIN and System (as anchor).
 		%% We can't easily intercept the HTTP call, so we test via emit_event behaviour:
 		%% with no LOGANNE_ENDPOINT set, notify should return ok without crashing.
 		os:unsetenv("LOGANNE_ENDPOINT"),
 		os:putenv("APP_ORIGIN", "https://monitoring.l42.eu"),
-		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, false, #{})),
+		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, #{}, false, #{})),
 		os:unsetenv("APP_ORIGIN").
 
 	notify_missing_app_origin_test() ->
 		%% When APP_ORIGIN is unset, the url field should still be a valid (empty-prefixed) string.
 		os:unsetenv("LOGANNE_ENDPOINT"),
 		os:unsetenv("APP_ORIGIN"),
-		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, false, #{})).
+		?assertEqual(ok, notify("foo.example.com", "lucos_foo", #{}, #{}, false, #{})).
 
 -endif.
