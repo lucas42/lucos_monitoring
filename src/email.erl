@@ -2,12 +2,16 @@
 -export([notify/1]).
 
 
-% Sends an alert email for a failing system. Accepts a Notification map.
-% Suppressed alerts (deploy windows) and recoveries (empty failing_checks)
-% are silently dropped — email is reserved for live, non-suppressed alerts.
+% Sends a monitoring email for a system. Accepts a Notification map.
+% Suppressed alerts (deploy windows / dependency suppression) are silently dropped —
+% the first clause below does that. Every other notification that reaches this module
+% is sent, including a recovery (empty failing_checks → "Everything OK on X."): the
+% caller in monitoring_state_server only emits a recovery once it has confirmed a
+% non-suppressed alert email already went out for the episode, so any recovery arriving
+% here is a genuine all-clear that closes a real alert thread (see ADR-0003 / #264).
 % Other keys in the map are accepted but unused.
 notify(#{suppressed := true}) ->
-	% Do not send emails during a suppressed deploy window
+	% Do not send emails during a suppressed deploy window or for dependency-suppressed checks
 	ok;
 notify(#{host := Host, system := SystemName, failing_checks := FailingChecks, metrics := SystemMetrics}) ->
 	System = getSystemTitle(Host, SystemName),
