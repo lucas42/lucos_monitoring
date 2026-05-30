@@ -1,6 +1,6 @@
 # ADR-0003: Recovery notifications gated on a per-episode `alerted` flag
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-05-30
 - **Issue**: [#264](https://github.com/lucas42/lucos_monitoring/issues/264)
 - **Supersedes**: the `prevFailing` recovery guard introduced for [#252](https://github.com/lucas42/lucos_monitoring/issues/252)
