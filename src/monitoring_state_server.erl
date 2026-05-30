@@ -32,7 +32,13 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 		{updateSystem, Host, System, SystemType, Source, SourceChecks, SystemMetrics} ->
 			logger:info("Received update for system ~p (Host ~p, Source ~p)", [System, Host, Source]),
 			IsFirstSeen = not maps:is_key(System, SystemMap),
-			{_, _, OldSourceChecksMap, OldNormalisedCache, OldMetrics, OldSourceTimestamps} = maps:get(System, SystemMap, {nil, system, #{}, #{}, #{}, #{}}),
+			% The per-system tuple carries, as its final element, a sticky-per-episode
+			% `Alerted` boolean: true once a non-suppressed alert email has actually gone
+			% out for the current down-episode, reset to false on recovery. It is the only
+			% reliable record of "did we tell the user about this?", which neither the current
+			% nor previous check cache can answer (a suppressed failure is cached as ok=false
+			% but was never emailed). See ADR-0003.
+			{_, _, OldSourceChecksMap, OldNormalisedCache, OldMetrics, OldSourceTimestamps, OldAlerted} = maps:get(System, SystemMap, {nil, system, #{}, #{}, #{}, #{}, false}),
 			NewSourceChecksMap = maps:put(Source, SourceChecks, OldSourceChecksMap),
 			NewMergedChecks = mergeSourceChecks(NewSourceChecksMap),
 			% When a source explicitly reports no checks (e.g. circleci returns 404,
@@ -67,10 +73,12 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 				0 -> OldMetrics;
 				_ -> SystemMetrics
 			end,
-			NewSuppressionMap = case IsFirstSeen of
+			% Each branch yields {NewSuppressionMap, NewAlerted}: the suppression-window
+			% bookkeeping plus the new value of the sticky per-episode Alerted flag.
+			{NewSuppressionMap, NewAlerted} = case IsFirstSeen of
 				true ->
 					logger:notice("Warm-up: skipping alert for ~p on first poll", [System]),
-					SuppressionMap;
+					{SuppressionMap, false};
 				false ->
 					case maps:get(System, SuppressionMap, undefined) of
 						{pending_verification, PendingSources} ->
@@ -90,19 +98,20 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 									case maps:size(FailingNow) > 0 of
 										true ->
 											logger:notice("Service ~p still unhealthy after deploy — alerting", [System]),
-											notify_all(NotificationBase#{failing_checks => FailingNow, suppressed => false}, Notifiers);
+											notify_all(NotificationBase#{failing_checks => FailingNow, suppressed => false}, Notifiers),
+											{maps:remove(System, SuppressionMap), true};
 										false ->
-											case map_size(WasFailing) > 0 of
-												true ->
-													logger:notice("Service ~p healthy after deploy — emitting recovery", [System]),
-													notify_all(NotificationBase#{failing_checks => #{}, suppressed => false}, Notifiers);
-												false ->
-													logger:notice("Service ~p healthy after deploy", [System])
-											end
-									end,
-									maps:remove(System, SuppressionMap);
+											% Recovery after deploy: emit the all-clear iff we actually
+											% sent an alert for this episode (OldAlerted). This supersedes
+											% the prior `map_size(WasFailing) > 0` guard from #252, which
+											% also fired for a suppressed-but-never-alerted failure (its
+											% ok=false sits in OldNormalisedCache) and so produced an
+											% orphaned all-clear (#264). See ADR-0003.
+											maybe_emit_recovery(OldAlerted, NotificationBase, System, Host, Notifiers),
+											{maps:remove(System, SuppressionMap), false}
+									end;
 								false ->
-									maps:put(System, {pending_verification, Remaining}, SuppressionMap)
+									{maps:put(System, {pending_verification, Remaining}, SuppressionMap), OldAlerted}
 							end;
 						_ ->
 							case meaningfulChange(OldNormalisedCache, NormalisedChecks) of
@@ -112,11 +121,12 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 										system => System,
 										current_checks => NormalisedChecks,
 										was_failing => failingChecks(OldNormalisedCache),
-										metrics => NewMetrics
+										metrics => NewMetrics,
+										alerted => OldAlerted
 									},
 									state_change(SystemContext, SuppressionMap, Notifiers);
 								false ->
-									SuppressionMap
+									{SuppressionMap, OldAlerted}
 							end
 					end
 			end,
@@ -124,7 +134,7 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 			% Record the current time for this source. Used by the view to render
 			% a per-section freshness indicator that reveals data-source-dark states.
 			NewSourceTimestamps = maps:put(Source, erlang:system_time(second), OldSourceTimestamps),
-			NewSystemMap = maps:put(System, {Host, SystemType, NewSourceChecksMap, AnnotatedChecks, NewMetrics, NewSourceTimestamps}, SystemMap),
+			NewSystemMap = maps:put(System, {Host, SystemType, NewSourceChecksMap, AnnotatedChecks, NewMetrics, NewSourceTimestamps, NewAlerted}, SystemMap),
 			% Always publish an SSE event on every updateSystem cast.
 			% The source timestamps are updated on every poll, and the client uses them
 			% to render per-section freshness indicators. Suppressing the event when
@@ -188,7 +198,7 @@ handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers, PollTimings, 
 					% partitioning in state_change. A system could in principle span multiple
 					% hosts (today it's 1:1; the data model supports more).
 					PreExisting = maps:fold(fun
-						(S, {Host, _, _, NormalisedCache, _, _}, Acc) when S =:= System ->
+						(S, {Host, _, _, NormalisedCache, _, _, _}, Acc) when S =:= System ->
 							FailingKeys = sets:from_list(maps:keys(failingChecks(NormalisedCache)), [{version, 2}]),
 							maps:put(Host, FailingKeys, Acc);
 						(_, _, Acc) -> Acc
@@ -244,7 +254,7 @@ systemExists(System, SystemMap) ->
 % across all hosts. Used to build the PendingSources set on unsuppress.
 collect_active_sources(System, SystemMap) ->
 	maps:fold(fun
-		(S, {_, _, SourceChecksMap, _, _, _}, Acc) when S =:= System ->
+		(S, {_, _, SourceChecksMap, _, _, _, _}, Acc) when S =:= System ->
 			sets:union(Acc, sets:from_list(maps:keys(SourceChecksMap)));
 		(_, _, Acc) -> Acc
 	end, sets:new([{version, 2}]), SystemMap).
@@ -360,16 +370,19 @@ notify_all(Notification, Notifiers) ->
 
 % SystemContext bundles all per-system fields state_change needs across its
 % multiple internal notify_all dispatch sites:
-%   host, system, current_checks, was_failing, metrics.
-% SuppressionMap is kept as a separate arg because state_change can return a
-% modified copy; bundling it would force unwrap-on-return at callers.
+%   host, system, current_checks, was_failing, metrics, alerted.
+% `alerted` is the sticky per-episode "did we email an alert?" flag (see ADR-0003).
+% state_change returns {NewSuppressionMap, NewAlerted}: the suppression bookkeeping
+% plus the updated flag. SuppressionMap is a separate arg because state_change can
+% return a modified copy; bundling it would force unwrap-on-return at callers.
 state_change(SystemContext, SuppressionMap, Notifiers) ->
 	#{
 		host := Host,
 		system := System,
 		current_checks := SystemChecks,
 		was_failing := WasFailing,
-		metrics := SystemMetrics
+		metrics := SystemMetrics,
+		alerted := OldAlerted
 	} = SystemContext,
 	AllFailing = failingChecks(SystemChecks),
 	% Filter out checks whose dependsOn system is currently under an active suppression window.
@@ -386,16 +399,28 @@ state_change(SystemContext, SuppressionMap, Notifiers) ->
 	case maps:size(AllFailing) > 0 andalso maps:size(FailingNow) =:= 0 of
 		true ->
 			% All failing checks are dependency-suppressed — notify as suppressed (no email alert).
+			% A suppressed notification does NOT count as having alerted the user, so the flag
+			% is carried forward unchanged (an earlier real alert in this episode still owes a
+			% recovery; a suppressed-only episode stays un-alerted).
 			logger:notice("All failing checks on ~p suppressed via dependency: ~p", [System, maps:keys(AllFailing)]),
 			notify_all(NotificationBase#{failing_checks => AllFailing, suppressed => true}, Notifiers),
-			SuppressionMap;
+			{SuppressionMap, OldAlerted};
 		false ->
 			% FailingNow contains only non-dep-suppressed checks. Apply system-level suppression logic.
 			case maps:get(System, SuppressionMap, undefined) of
 				undefined ->
-					logger:notice("Checks' state changed for ~p on ~p", [System, Host]),
-					notify_all(NotificationBase#{failing_checks => FailingNow, suppressed => false}, Notifiers),
-					SuppressionMap;
+					case maps:size(FailingNow) > 0 of
+						true ->
+							% A non-suppressed alert email goes out → mark the episode alerted.
+							logger:notice("Checks' state changed for ~p on ~p", [System, Host]),
+							notify_all(NotificationBase#{failing_checks => FailingNow, suppressed => false}, Notifiers),
+							{SuppressionMap, true};
+						false ->
+							% Fully healthy → recovery. Emit the all-clear iff we alerted this
+							% episode (OldAlerted). Supersedes #252's prevFailing guard; see ADR-0003.
+							maybe_emit_recovery(OldAlerted, NotificationBase, System, Host, Notifiers),
+							{SuppressionMap, false}
+					end;
 				{ExpiryTime, PreExisting} ->
 					Now = erlang:system_time(second),
 					case Now < ExpiryTime of
@@ -406,10 +431,13 @@ state_change(SystemContext, SuppressionMap, Notifiers) ->
 							%   - NewlyFailing: became unhealthy during the window → likely deploy churn,
 							%     alert as Suppressed=true (the existing suppression rationale)
 							% This restores the visual distinction between continuing failures and
-							% post-deploy flap in the Loganne event stream.
+							% post-deploy flap in the Loganne event stream. This branch only ever
+							% *emits* alerts (never a recovery), so the episode becomes alerted iff a
+							% non-suppressed (pre-existing) alert went out.
 							HostPreExisting = maps:get(Host, PreExisting, sets:new([{version, 2}])),
 							{PreExistingFailing, NewlyFailing} = partitionByPreExisting(FailingNow, HostPreExisting),
-							case maps:size(PreExistingFailing) > 0 of
+							PreExistingAlerted = maps:size(PreExistingFailing) > 0,
+							case PreExistingAlerted of
 								true ->
 									logger:notice("Pre-existing failures continuing during deploy window for ~p: ~p", [System, maps:keys(PreExistingFailing)]),
 									notify_all(NotificationBase#{failing_checks => PreExistingFailing, suppressed => false}, Notifiers);
@@ -421,15 +449,37 @@ state_change(SystemContext, SuppressionMap, Notifiers) ->
 									notify_all(NotificationBase#{failing_checks => NewlyFailing, suppressed => true}, Notifiers);
 								false -> ok
 							end,
-							SuppressionMap;
+							{SuppressionMap, OldAlerted orelse PreExistingAlerted};
 						false ->
 							logger:error("Suppression window for ~p expired without being cleared - deploy may have taken longer than 10 minutes", [System]),
-							logger:notice("Checks' state changed for ~p on ~p", [System, Host]),
-							notify_all(NotificationBase#{failing_checks => FailingNow, suppressed => false}, Notifiers),
-							maps:remove(System, SuppressionMap)
+							case maps:size(FailingNow) > 0 of
+								true ->
+									logger:notice("Checks' state changed for ~p on ~p", [System, Host]),
+									notify_all(NotificationBase#{failing_checks => FailingNow, suppressed => false}, Notifiers),
+									{maps:remove(System, SuppressionMap), true};
+								false ->
+									maybe_emit_recovery(OldAlerted, NotificationBase, System, Host, Notifiers),
+									{maps:remove(System, SuppressionMap), false}
+							end
 					end
 			end
 	end.
+
+% Emits an all-clear (recovery) notification iff a non-suppressed alert email was
+% actually sent for the current down-episode (Alerted). This single gate replaces the
+% three former per-site recovery conditions — the pending_verification/#252 branch, the
+% dependency state_change branch, and the expired-window branch — each of which used
+% "was something failing in the prior cache" as a proxy for "did we tell the user".
+% That proxy is wrong: a suppressed failure sits in the cache as ok=false but was never
+% emailed, so the proxy fired an orphaned all-clear (#264). `Alerted` is that fact
+% directly. WasFailing is retained in NotificationBase only as the recovery event's
+% Loganne payload (what had been failing), never as a decision input. See ADR-0003.
+maybe_emit_recovery(true, NotificationBase, System, Host, Notifiers) ->
+	logger:notice("Checks recovered for ~p on ~p — emitting all-clear", [System, Host]),
+	notify_all(NotificationBase#{failing_checks => #{}, suppressed => false}, Notifiers);
+maybe_emit_recovery(false, _NotificationBase, System, Host, _Notifiers) ->
+	logger:notice("Checks recovered for ~p on ~p with no prior alert — no all-clear sent", [System, Host]),
+	ok.
 
 % Partitions a map of failing checks into (PreExistingFailing, NewlyFailing) using
 % a set of pre-existing-failing check keys captured at suppress-time.
@@ -486,7 +536,7 @@ is_dependency_suppressed(Check, CurrentSystem, SuppressionMap) ->
 % pending_verification when TargetSystem unsuppresses. Excludes TargetSystem
 % itself (self-reference guard).
 find_dependent_systems(TargetSystem, SystemMap) ->
-	lists:usort(maps:fold(fun(System, {_Host, _SystemType, SourceChecksMap, _, _, _}, Acc) ->
+	lists:usort(maps:fold(fun(System, {_Host, _SystemType, SourceChecksMap, _, _, _, _}, Acc) ->
 		case System =:= TargetSystem of
 			true -> Acc;  % Guard: skip self
 			false ->
@@ -606,7 +656,7 @@ aggregateCheckStatuses(SystemId, NormalisedCache, SuppressionMap) ->
 % Builds the full system list as returned by {fetch, all}.
 % Used by both {fetch, all} handler and the publish hook at each mutation site.
 build_system_list(SystemMap, SuppressionMap) ->
-	maps:fold(fun(SystemId, {Host, SystemType, _SourceChecksMap, NormalisedCache, Metrics, SourceTimestamps}, Acc) ->
+	maps:fold(fun(SystemId, {Host, SystemType, _SourceChecksMap, NormalisedCache, Metrics, SourceTimestamps, _Alerted}, Acc) ->
 		[buildSystemOutput(Host, SystemId, SystemType, NormalisedCache, Metrics, SuppressionMap, SourceTimestamps) | Acc]
 	end, [], SystemMap).
 
@@ -706,8 +756,8 @@ computePollStats(Timings) ->
 
 	systemExists_test() ->
 		SystemMap = #{
-			"lucos_foo" => {"host1.example.com", system, #{}, #{}, #{}, #{}},
-			"lucos_bar" => {"host2.example.com", host, #{}, #{}, #{}, #{}}
+			"lucos_foo" => {"host1.example.com", system, #{}, #{}, #{}, #{}, false},
+			"lucos_bar" => {"host2.example.com", host, #{}, #{}, #{}, #{}, false}
 		},
 		?assertEqual(true, systemExists("lucos_foo", SystemMap)),
 		?assertEqual(true, systemExists("lucos_bar", SystemMap)),
@@ -740,7 +790,7 @@ computePollStats(Timings) ->
 		),
 		% System ID should now be in the SystemMap
 		?assert(maps:is_key("lucos_foo", SystemMap)),
-		{"host1.example.com", _Type, SourceChecksMap, _, _, _} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _Type, SourceChecksMap, _, _, _, _} = maps:get("lucos_foo", SystemMap),
 		StoredChecks = mergeSourceChecks(SourceChecksMap),
 		?assertEqual(false, maps:get(<<"ok">>, maps:get(<<"fetch-info">>, StoredChecks))).
 
@@ -749,7 +799,7 @@ computePollStats(Timings) ->
 	warmup_second_update_not_suppressed_test() ->
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, #{}, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, #{}, #{}, #{}, false}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -767,7 +817,7 @@ computePollStats(Timings) ->
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => false}},
 		% Start with info checks already stored
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, #{}, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, #{}, #{}, #{}, false}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -777,7 +827,7 @@ computePollStats(Timings) ->
 			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
 			ExistingState
 		),
-		{"host1.example.com", _Type, SourceChecksMap, _, _, _} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _Type, SourceChecksMap, _, _, _, _} = maps:get("lucos_foo", SystemMap),
 		Merged = mergeSourceChecks(SourceChecksMap),
 		% All three checks must be present
 		?assert(maps:is_key(<<"fetch-info">>, Merged)),
@@ -791,7 +841,7 @@ computePollStats(Timings) ->
 		OldInfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}, <<"custom-check">> => #{<<"ok">> => true}},
 		NewInfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => OldInfoChecks}, #{}, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => OldInfoChecks}, #{}, #{}, #{}, false}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -800,7 +850,7 @@ computePollStats(Timings) ->
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, NewInfoChecks, #{}},
 			ExistingState
 		),
-		{"host1.example.com", _Type, SourceChecksMap, _, _, _} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _Type, SourceChecksMap, _, _, _, _} = maps:get("lucos_foo", SystemMap),
 		Merged = mergeSourceChecks(SourceChecksMap),
 		?assertNot(maps:is_key(<<"custom-check">>, Merged)).
 
@@ -810,7 +860,7 @@ computePollStats(Timings) ->
 		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		Metrics = #{<<"agent-count">> => #{<<"value">> => 42, <<"techDetail">> => <<"count">>}},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, #{}, Metrics, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, #{}, Metrics, #{}, false}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -820,7 +870,7 @@ computePollStats(Timings) ->
 			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
 			ExistingState
 		),
-		{"host1.example.com", _, _, _, StoredMetrics, _} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _, _, _, StoredMetrics, _, _} = maps:get("lucos_foo", SystemMap),
 		?assertEqual(Metrics, StoredMetrics).
 
 	% When a source provides non-empty metrics, they replace the existing ones.
@@ -828,7 +878,7 @@ computePollStats(Timings) ->
 		OldMetrics = #{<<"agent-count">> => #{<<"value">> => 42, <<"techDetail">> => <<"count">>}},
 		NewMetrics = #{<<"agent-count">> => #{<<"value">> => 99, <<"techDetail">> => <<"count">>}},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, OldMetrics, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, OldMetrics, #{}, false}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -837,7 +887,7 @@ computePollStats(Timings) ->
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, #{<<"fetch-info">> => #{<<"ok">> => true}}, NewMetrics},
 			ExistingState
 		),
-		{"host1.example.com", _, _, _, StoredMetrics, _} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _, _, _, StoredMetrics, _, _} = maps:get("lucos_foo", SystemMap),
 		?assertEqual(NewMetrics, StoredMetrics).
 
 	% Helper to build a recording notifier and retrieve what it captured.
@@ -858,7 +908,7 @@ computePollStats(Timings) ->
 	% Unsuppressing a healthy system enters pending_verification and does NOT fire an immediate alert.
 	unsuppress_healthy_system_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
-		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, #{}, #{}, #{}}},
+		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, #{}, #{}, #{}, false}},
 		Notifier = recording_notifier(self()),
 		State = {SystemMap, #{"lucos_foo" => {erlang:system_time(second) + 600, #{}}}, [Notifier], #{}, fun(_) -> ok end},
 		{reply, ok, {_, NewSuppressionMap, _, _, _}} = handle_call(
@@ -875,7 +925,7 @@ computePollStats(Timings) ->
 	% Unsuppressing an unhealthy system enters pending_verification; alert is deferred, not immediate.
 	unsuppress_unhealthy_system_test() ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
-		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks}, #{}, #{}, #{}}},
+		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks}, #{}, #{}, #{}, false}},
 		Notifier = recording_notifier(self()),
 		State = {SystemMap, #{"lucos_foo" => {erlang:system_time(second) + 600, #{}}}, [Notifier], #{}, fun(_) -> ok end},
 		drain_notifications(),
@@ -901,7 +951,7 @@ computePollStats(Timings) ->
 	% After unsuppress, a fresh poll reporting unhealthy fires an alert and clears pending state.
 	pending_verification_fires_alert_when_unhealthy_test() ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
-		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks}, #{}, #{}, #{}}},
+		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks}, #{}, #{}, #{}, false}},
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
@@ -924,7 +974,7 @@ computePollStats(Timings) ->
 	pending_verification_no_alert_when_healthy_prior_also_healthy_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		% NormalisedCache is #{} — no prior failures
-		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, #{}, #{}, #{}}},
+		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, #{}, #{}, #{}, false}},
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
@@ -941,13 +991,42 @@ computePollStats(Timings) ->
 			ok
 		end.
 
-	% After unsuppress, a fresh poll reporting healthy emits a monitoringRecovery if the
-	% prior normalised state had failing checks (Mechanism B bug fix).
-	pending_verification_recovery_emitted_when_prior_state_was_failing_test() ->
+	% After unsuppress, a fresh poll reporting healthy emits a recovery if we had actually
+	% alerted for this episode (Alerted=true in the per-system tuple). Recovery is now gated
+	% on the sticky `alerted` flag, not on "was the prior cache failing" — see ADR-0003 / #264.
+	pending_verification_recovery_emitted_when_episode_was_alerted_test() ->
 		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		FailingNormalisedCache = #{<<"fetch-info">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1}},
-		% NormalisedCache has a prior failure — a recovery must be emitted
-		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, FailingNormalisedCache, #{}, #{}}},
+		% Prior cache had a failure AND we alerted (7th tuple element = true) — recovery must fire.
+		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, FailingNormalisedCache, #{}, #{}, true}},
+		PendingSources = sets:from_list([info], [{version, 2}]),
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State = {SystemMap, #{"lucos_foo" => {pending_verification, PendingSources}}, [Notifier], #{}, fun(_) -> ok end},
+		{noreply, {NewSystemMap, NewSuppressionMap, _, _, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, HealthyChecks, #{}},
+			State
+		),
+		% Suppression entry should be cleared
+		?assertEqual(#{}, NewSuppressionMap),
+		% Alerted flag must reset to false once the episode recovers.
+		?assertMatch({_, _, _, _, _, _, false}, maps:get("lucos_foo", NewSystemMap)),
+		receive
+			{notified, #{host := "host1.example.com", system := "lucos_foo", failing_checks := FailingNow, suppressed := false}} ->
+				?assertEqual(#{}, FailingNow, "Recovery must be emitted with empty failing checks")
+		after 100 ->
+			?assert(false, "Expected monitoringRecovery was not emitted after deploy when episode was alerted")
+		end.
+
+	% Orphan-recovery regression (#264): a prior failure that was suppressed-but-never-alerted
+	% (Alerted=false) must NOT produce an all-clear when it recovers, even though the prior cache
+	% holds it as ok=false. This is exactly the case #252's `prevFailing` guard got wrong.
+	pending_verification_no_recovery_when_prior_failure_was_never_alerted_test() ->
+		HealthyChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
+		FailingNormalisedCache = #{<<"fetch-info">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1}},
+		% Prior cache had a failure but we never alerted (7th tuple element = false, e.g. it was
+		% dependency- or deploy-window-suppressed) — no orphaned all-clear may be sent.
+		SystemMap = #{"lucos_foo" => {"host1.example.com", system, #{info => HealthyChecks}, FailingNormalisedCache, #{}, #{}, false}},
 		PendingSources = sets:from_list([info], [{version, 2}]),
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
@@ -956,13 +1035,76 @@ computePollStats(Timings) ->
 			{updateSystem, "host1.example.com", "lucos_foo", system, info, HealthyChecks, #{}},
 			State
 		),
-		% Suppression entry should be cleared
 		?assertEqual(#{}, NewSuppressionMap),
 		receive
-			{notified, #{host := "host1.example.com", system := "lucos_foo", failing_checks := FailingNow, suppressed := false}} ->
-				?assertEqual(#{}, FailingNow, "Recovery must be emitted with empty failing checks")
+			{notified, _} -> ?assert(false, "Orphaned all-clear must not be sent for a suppressed-but-never-alerted failure")
 		after 100 ->
-			?assert(false, "Expected monitoringRecovery was not emitted after deploy when prior state was failing")
+			ok
+		end.
+
+	% End-to-end orphan regression (#264), mirroring the production trace for
+	% lucos_media_weightings on 2026-05-30: a check whose dependsOn upstream is under an
+	% active suppression window fails (dependency-suppressed → no alert email), then recovers
+	% once the upstream deploy finishes. The recovery must send nothing, because we never
+	% alerted. Before the fix, this produced an orphaned "Everything OK" email.
+	dependency_suppressed_failure_recovers_without_orphan_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{"lucos_media_metadata_api" => {FutureExpiry, #{}}},
+		FailingCheck = #{<<"media-api-reachable">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_media_metadata_api">>}},
+		HealthyCheck = #{<<"media-api-reachable">> => #{<<"ok">> => true, <<"dependsOn">> => <<"lucos_media_metadata_api">>}},
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State0 = {#{}, SuppressionMap, [Notifier], #{}, fun(_) -> ok end},
+		% Poll 0: first sighting, healthy → warm-up (no notification).
+		{noreply, State1} = handle_cast(
+			{updateSystem, "media-weighting.l42.eu", "lucos_media_weightings", system, info, HealthyCheck, #{}}, State0),
+		% Poll 1: the dependent check fails while upstream is suppressed → suppressed notification, never alerted.
+		{noreply, {SystemMap2, _, _, _, _} = State2} = handle_cast(
+			{updateSystem, "media-weighting.l42.eu", "lucos_media_weightings", system, info, FailingCheck, #{}}, State1),
+		?assertMatch({_, _, _, _, _, _, false}, maps:get("lucos_media_weightings", SystemMap2)),
+		receive
+			{notified, #{suppressed := true}} -> ok
+		after 100 ->
+			?assert(false, "Expected a suppressed notification for the dependency-suppressed failure")
+		end,
+		% Poll 2: the check recovers → no orphaned all-clear (we never alerted).
+		{noreply, {SystemMap3, _, _, _, _}} = handle_cast(
+			{updateSystem, "media-weighting.l42.eu", "lucos_media_weightings", system, info, HealthyCheck, #{}}, State2),
+		?assertMatch({_, _, _, _, _, _, false}, maps:get("lucos_media_weightings", SystemMap3)),
+		receive
+			{notified, _} -> ?assert(false, "Orphaned all-clear must not be emitted for a dependency-suppressed recovery (#264)")
+		after 100 ->
+			ok
+		end.
+
+	% Guards the normal path: a genuine (non-suppressed) failure still alerts, sets the sticky
+	% `alerted` flag, and its recovery still sends the all-clear and resets the flag.
+	real_failure_then_recovery_alerts_then_all_clears_test() ->
+		FailingCheck = #{<<"db">> => #{<<"ok">> => false}},
+		HealthyCheck = #{<<"db">> => #{<<"ok">> => true}},
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State0 = {#{}, #{}, [Notifier], #{}, fun(_) -> ok end},
+		% Poll 0: first sighting, healthy → warm-up (no notification).
+		{noreply, State1} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, HealthyCheck, #{}}, State0),
+		% Poll 1: real failure → unsuppressed alert, alerted flag set true.
+		{noreply, {SystemMap2, _, _, _, _} = State2} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, FailingCheck, #{}}, State1),
+		?assertMatch({_, _, _, _, _, _, true}, maps:get("lucos_foo", SystemMap2)),
+		receive
+			{notified, #{failing_checks := F1, suppressed := false}} -> ?assert(maps:is_key(<<"db">>, F1))
+		after 100 ->
+			?assert(false, "Expected an alert for the real failure")
+		end,
+		% Poll 2: recovery → all-clear emitted, alerted reset to false.
+		{noreply, {SystemMap3, _, _, _, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, HealthyCheck, #{}}, State2),
+		?assertMatch({_, _, _, _, _, _, false}, maps:get("lucos_foo", SystemMap3)),
+		receive
+			{notified, #{failing_checks := F2, suppressed := false}} -> ?assertEqual(#{}, F2, "Recovery must carry empty failing checks")
+		after 100 ->
+			?assert(false, "Expected an all-clear after the real recovery")
 		end.
 
 	% With two sources pending, the first poll keeps pending state; the second evaluates.
@@ -970,7 +1112,7 @@ computePollStats(Timings) ->
 		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => false}},
 		SystemMap = #{
-			"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks, circleci => CIChecks}, #{}, #{}, #{}}
+			"lucos_foo" => {"host1.example.com", system, #{info => FailingChecks, circleci => CIChecks}, #{}, #{}, #{}, false}
 		},
 		PendingSources = sets:from_list([info, circleci], [{version, 2}]),
 		Notifier = recording_notifier(self()),
@@ -1056,7 +1198,7 @@ computePollStats(Timings) ->
 			<<"circleci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}
 		},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks, circleci => CIChecks}, ExistingNormalisedCache, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks, circleci => CIChecks}, ExistingNormalisedCache, #{}, #{}, false}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -1075,7 +1217,7 @@ computePollStats(Timings) ->
 			State2
 		),
 		{SystemMap3, _, _, _, _} = State3,
-		{"host1.example.com", _, _, NormalisedAfterCI404, _, _} = maps:get("lucos_foo", SystemMap3),
+		{"host1.example.com", _, _, NormalisedAfterCI404, _, _, _} = maps:get("lucos_foo", SystemMap3),
 		% circleci check must be absent — 404 means "no CI", not "CI unknown"
 		?assertNot(maps:is_key(<<"circleci">>, NormalisedAfterCI404),
 			"circleci check must be wiped by 404, not resurrected by mergeMissingInfoChecks").
@@ -1102,7 +1244,7 @@ computePollStats(Timings) ->
 			<<"item-count">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1}
 		},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, ExistingNormalisedCache, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, ExistingNormalisedCache, #{}, #{}, false}},
 			#{},
 			[],
 			#{}, fun(_) -> ok end
@@ -1112,7 +1254,7 @@ computePollStats(Timings) ->
 			ExistingState
 		),
 		{SystemMap2, _, _, _, _} = State2,
-		{"host1.example.com", _, _, NormalisedAfterBlip, _, _} = maps:get("lucos_foo", SystemMap2),
+		{"host1.example.com", _, _, NormalisedAfterBlip, _, _, _} = maps:get("lucos_foo", SystemMap2),
 		?assert(maps:is_key(<<"tls-certificate">>, NormalisedAfterBlip),
 			"tls-certificate must persist during transient /_info blip"),
 		?assert(maps:is_key(<<"item-count">>, NormalisedAfterBlip),
@@ -1130,7 +1272,7 @@ computePollStats(Timings) ->
 		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks, circleci => CIChecks}, #{}, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks, circleci => CIChecks}, #{}, #{}, #{}, false}},
 			#{},
 			Notifiers,
 			#{}, fun(_) -> ok end
@@ -1141,7 +1283,7 @@ computePollStats(Timings) ->
 			ExistingState
 		),
 		{SystemMap2, _, _, _, _} = State2,
-		{"host1.example.com", _, _, NormalisedAfterCI, _, _} = maps:get("lucos_foo", SystemMap2),
+		{"host1.example.com", _, _, NormalisedAfterCI, _, _, _} = maps:get("lucos_foo", SystemMap2),
 		?assertEqual(1, maps:get(<<"consecutiveUnknownsCount">>, maps:get(<<"circleci">>, NormalisedAfterCI, #{}), -1)),
 		% Now info reports (ok, no change) — circleci check is carried over in the merged view
 		{noreply, State3} = handle_cast(
@@ -1149,7 +1291,7 @@ computePollStats(Timings) ->
 			State2
 		),
 		{SystemMap3, _, _, _, _} = State3,
-		{"host1.example.com", _, _, NormalisedAfterInfo, _, _} = maps:get("lucos_foo", SystemMap3),
+		{"host1.example.com", _, _, NormalisedAfterInfo, _, _, _} = maps:get("lucos_foo", SystemMap3),
 		% circleci count must still be 1, NOT 2 — info's update must not re-increment it
 		?assertEqual(1, maps:get(<<"consecutiveUnknownsCount">>, maps:get(<<"circleci">>, NormalisedAfterInfo, #{}), -1)).
 
@@ -1195,10 +1337,10 @@ computePollStats(Timings) ->
 		SystemMap = #{
 			"lucos_time" => {"host1.example.com", system, #{info => #{
 				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
-			}}, #{}, #{}, #{}},
+			}}, #{}, #{}, #{}, false},
 			"lucos_arachne" => {"host2.example.com", system, #{info => #{
 				<<"triplestore">> => #{<<"ok">> => true}
-			}}, #{}, #{}, #{}}
+			}}, #{}, #{}, #{}, false}
 		},
 		?assertEqual(["lucos_time"], find_dependent_systems("lucos_eolas", SystemMap)).
 
@@ -1207,7 +1349,7 @@ computePollStats(Timings) ->
 		SystemMap = #{
 			"lucos_time" => {"host1.example.com", system, #{info => #{
 				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
-			}}, #{}, #{}, #{}}
+			}}, #{}, #{}, #{}, false}
 		},
 		?assertEqual([], find_dependent_systems("some.other.system", SystemMap)).
 
@@ -1216,7 +1358,7 @@ computePollStats(Timings) ->
 		SystemMap = #{
 			"lucos_eolas" => {"host1.example.com", system, #{info => #{
 				<<"db">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
-			}}, #{}, #{}, #{}}
+			}}, #{}, #{}, #{}, false}
 		},
 		?assertEqual([], find_dependent_systems("lucos_eolas", SystemMap)).
 
@@ -1225,10 +1367,10 @@ computePollStats(Timings) ->
 		SystemMap = #{
 			"lucos_time" => {"host1.example.com", system, #{info => #{
 				<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
-			}}, #{}, #{}, #{}},
+			}}, #{}, #{}, #{}, false},
 			"lucos_arachne" => {"host2.example.com", system, #{info => #{
 				<<"eolas-data">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}
-			}}, #{}, #{}, #{}}
+			}}, #{}, #{}, #{}, false}
 		},
 		Deps = find_dependent_systems("lucos_eolas", SystemMap),
 		?assertEqual(["lucos_arachne", "lucos_time"], lists:sort(Deps)).
@@ -1294,7 +1436,7 @@ computePollStats(Timings) ->
 			"lucos_loganne" => {"host1.example.com", system, #{info => #{
 				<<"webhook-error-rate">> =>
 					#{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_a">>, <<"lucos_eolas">>, <<"lucos_b">>]}
-			}}, #{}, #{}, #{}}
+			}}, #{}, #{}, #{}, false}
 		},
 		?assertEqual(["lucos_loganne"], find_dependent_systems("lucos_eolas", SystemMap)).
 
@@ -1304,7 +1446,7 @@ computePollStats(Timings) ->
 			"lucos_loganne" => {"host1.example.com", system, #{info => #{
 				<<"webhook-error-rate">> =>
 					#{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_eolas">>]}
-			}}, #{}, #{}, #{}}
+			}}, #{}, #{}, #{}, false}
 		},
 		?assertEqual(["lucos_loganne"], find_dependent_systems("lucos_eolas", SystemMap)).
 
@@ -1314,7 +1456,7 @@ computePollStats(Timings) ->
 			"lucos_loganne" => {"host1.example.com", system, #{info => #{
 				<<"webhook-error-rate">> =>
 					#{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_loganne">>, <<"lucos_a">>]}
-			}}, #{}, #{}, #{}}
+			}}, #{}, #{}, #{}, false}
 		},
 		?assertEqual([], find_dependent_systems("lucos_loganne", SystemMap)).
 
@@ -1328,7 +1470,7 @@ computePollStats(Timings) ->
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
 		state_change(#{host => "host1.example.com", system => "lucos_time",
-		               current_checks => SystemChecks, was_failing => #{}, metrics => #{}},
+		               current_checks => SystemChecks, was_failing => #{}, metrics => #{}, alerted => false},
 		             SuppressionMap, [Notifier]),
 		receive
 			{notified, #{host := "host1.example.com", system := "lucos_time", suppressed := true}} ->
@@ -1348,7 +1490,7 @@ computePollStats(Timings) ->
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
 		state_change(#{host => "host1.example.com", system => "lucos_time",
-		               current_checks => SystemChecks, was_failing => #{}, metrics => #{}},
+		               current_checks => SystemChecks, was_failing => #{}, metrics => #{}, alerted => false},
 		             SuppressionMap, [Notifier]),
 		receive
 			{notified, #{host := "host1.example.com", system := "lucos_time", failing_checks := FailingNow, suppressed := false}} ->
@@ -1363,8 +1505,8 @@ computePollStats(Timings) ->
 	unsuppress_cascades_pending_verification_test() ->
 		TimeChecks = #{<<"eolas">> => #{<<"ok">> => false, <<"dependsOn">> => <<"lucos_eolas">>}},
 		SystemMap = #{
-			"lucos_eolas" => {"", system, #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, #{}, #{}},
-			"lucos_time" => {"schedule-tracker.l42.eu", system, #{info => TimeChecks}, #{}, #{}, #{}}
+			"lucos_eolas" => {"", system, #{info => #{<<"fetch-info">> => #{<<"ok">> => true}}}, #{}, #{}, #{}, false},
+			"lucos_time" => {"schedule-tracker.l42.eu", system, #{info => TimeChecks}, #{}, #{}, #{}, false}
 		},
 		FutureExpiry = erlang:system_time(second) + 600,
 		SuppressionMap = #{"lucos_eolas" => {FutureExpiry, #{}}},
@@ -1546,7 +1688,7 @@ computePollStats(Timings) ->
 	suppress_snapshots_pre_existing_failures_test() ->
 		FailingChecks = #{<<"host-tracking-failures">> => #{<<"ok">> => false, <<"consecutiveFailsCount">> => 1, <<"consecutiveUnknownsCount">> => 0}},
 		AnnotatedFailing = annotateCheckStatuses(FailingChecks),
-		SystemMap = #{"lucos_foo" => {"host1", system, #{info => FailingChecks}, AnnotatedFailing, #{}, #{}}},
+		SystemMap = #{"lucos_foo" => {"host1", system, #{info => FailingChecks}, AnnotatedFailing, #{}, #{}, false}},
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
 		State = {SystemMap, #{}, [Notifier], #{}, fun(_) -> ok end},
@@ -1567,7 +1709,7 @@ computePollStats(Timings) ->
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
 		state_change(#{host => "host1", system => "lucos_backups",
-		               current_checks => SystemChecks, was_failing => #{}, metrics => #{}},
+		               current_checks => SystemChecks, was_failing => #{}, metrics => #{}, alerted => false},
 		             SuppressionMap, [Notifier]),
 		receive
 			{notified, #{host := "host1", system := "lucos_backups", failing_checks := FailingNow, suppressed := false}} ->
@@ -1585,7 +1727,7 @@ computePollStats(Timings) ->
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
 		state_change(#{host => "host1", system => "lucos_foo",
-		               current_checks => SystemChecks, was_failing => #{}, metrics => #{}},
+		               current_checks => SystemChecks, was_failing => #{}, metrics => #{}, alerted => false},
 		             SuppressionMap, [Notifier]),
 		receive
 			{notified, #{host := "host1", system := "lucos_foo", failing_checks := FailingNow, suppressed := true}} ->
@@ -1607,7 +1749,7 @@ computePollStats(Timings) ->
 		Notifier = recording_notifier(self()),
 		drain_notifications(),
 		state_change(#{host => "host1", system => "lucos_foo",
-		               current_checks => SystemChecks, was_failing => #{}, metrics => #{}},
+		               current_checks => SystemChecks, was_failing => #{}, metrics => #{}, alerted => false},
 		             SuppressionMap, [Notifier]),
 		% Collect both notifications — order is not guaranteed.
 		Notifications = collect_notifications(2, []),
@@ -1730,7 +1872,7 @@ computePollStats(Timings) ->
 		Checks2 = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		ExistingAnnotated = annotateCheckStatuses(normaliseChecks(#{}, Checks1, sets:new([{version, 2}]))),
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks1}, ExistingAnnotated, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks1}, ExistingAnnotated, #{}, #{}, false}},
 			#{},
 			[],
 			#{}, PublishFun
@@ -1754,7 +1896,7 @@ computePollStats(Timings) ->
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingAnnotated = annotateCheckStatuses(normaliseChecks(#{}, Checks, sets:new([{version, 2}]))),
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, ExistingAnnotated, #{}, #{}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, ExistingAnnotated, #{}, #{}, false}},
 			#{},
 			[],
 			#{}, PublishFun
@@ -1778,7 +1920,7 @@ computePollStats(Timings) ->
 			InitialState
 		),
 		After = erlang:system_time(second),
-		{"host1.example.com", _, _, _, _, SourceTimestamps} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _, _, _, _, SourceTimestamps, _} = maps:get("lucos_foo", SystemMap),
 		?assert(maps:is_key(info, SourceTimestamps), "info source must have a timestamp entry"),
 		Ts = maps:get(info, SourceTimestamps),
 		?assert(Ts >= Before andalso Ts =< After, "timestamp must be within the test window").
@@ -1788,7 +1930,7 @@ computePollStats(Timings) ->
 		Checks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		ExistingTs = erlang:system_time(second) - 120,
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, #{}, #{}, #{info => ExistingTs}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => Checks}, #{}, #{}, #{info => ExistingTs}, false}},
 			#{}, [], #{}, fun(_) -> ok end
 		},
 		Before = erlang:system_time(second),
@@ -1797,7 +1939,7 @@ computePollStats(Timings) ->
 			ExistingState
 		),
 		After = erlang:system_time(second),
-		{"host1.example.com", _, _, _, _, SourceTimestamps} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _, _, _, _, SourceTimestamps, _} = maps:get("lucos_foo", SystemMap),
 		NewTs = maps:get(info, SourceTimestamps),
 		?assert(NewTs >= Before andalso NewTs =< After, "timestamp must be refreshed to current time"),
 		?assert(NewTs > ExistingTs, "new timestamp must be more recent than the old one").
@@ -1807,14 +1949,14 @@ computePollStats(Timings) ->
 		InfoChecks = #{<<"fetch-info">> => #{<<"ok">> => true}},
 		CIChecks = #{<<"circleci">> => #{<<"ok">> => true}},
 		ExistingState = {
-			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, #{}, #{}, #{info => 1000}}},
+			#{"lucos_foo" => {"host1.example.com", system, #{info => InfoChecks}, #{}, #{}, #{info => 1000}, false}},
 			#{}, [], #{}, fun(_) -> ok end
 		},
 		{noreply, {SystemMap, _, _, _, _}} = handle_cast(
 			{updateSystem, "host1.example.com", "lucos_foo", system, circleci, CIChecks, #{}},
 			ExistingState
 		),
-		{"host1.example.com", _, _, _, _, SourceTimestamps} = maps:get("lucos_foo", SystemMap),
+		{"host1.example.com", _, _, _, _, SourceTimestamps, _} = maps:get("lucos_foo", SystemMap),
 		?assert(maps:is_key(info, SourceTimestamps), "info timestamp must be preserved"),
 		?assert(maps:is_key(circleci, SourceTimestamps), "circleci timestamp must be added"),
 		?assertEqual(1000, maps:get(info, SourceTimestamps), "info timestamp must not be touched by circleci update").
