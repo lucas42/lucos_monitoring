@@ -475,9 +475,8 @@ state_change(SystemContext, SuppressionMap, Notifiers) ->
 							maybe_emit_recovery(OldAlerted, NotificationBase, System, Host, Notifiers),
 							{SuppressionMap, false}
 					end;
-				#suppression_window{expiry_time = ExpiryTime, pre_existing = PreExisting} ->
-					Now = erlang:system_time(second),
-					case Now < ExpiryTime of
+				#suppression_window{pre_existing = PreExisting} ->
+					case not windowExpired(System, SuppressionMap) of
 						true ->
 							% Partition FailingNow against the pre-existing snapshot for this Host:
 							%   - PreExistingFailing: failing-already-at-suppress-time → continuing problem,
