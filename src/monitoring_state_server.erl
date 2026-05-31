@@ -145,7 +145,8 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 									{maps:put(System, #pending_verification{sources = Remaining}, SuppressionMap), OldAlerted}
 							end;
 						_ ->
-							case meaningfulChange(OldNormalisedCache, NormalisedChecks) of
+							case meaningfulChange(OldNormalisedCache, NormalisedChecks)
+									orelse windowExpired(System, SuppressionMap) of
 								true ->
 									SystemContext = #{
 										host => Host,
@@ -392,6 +393,20 @@ failingChecks(Checks) ->
 	maps:filter(fun(_, Check) ->
 		maps:get(<<"ok">>, Check, unknown) == false
 	end, Checks).
+
+% Returns true when the system has an expired suppression window in SuppressionMap
+% (ExpiryTime =< now). Returns false for undefined or pending_verification entries.
+% Used to force re-evaluation on the poll immediately after a deploy window expires
+% by timeout, even when the failing-check set has not changed (which would normally
+% suppress the meaningfulChange gate). The existing expired-window branch inside
+% state_change removes the entry via maps:remove, making this fire exactly once.
+windowExpired(System, SuppressionMap) ->
+	case maps:get(System, SuppressionMap, undefined) of
+		#suppression_window{expiry_time = ExpiryTime} ->
+			erlang:system_time(second) >= ExpiryTime;
+		_ ->
+			false
+	end.
 
 % Calls every notifier in Notifiers, catching any errors so a single
 % failing notifier cannot prevent the others from running.
@@ -2030,5 +2045,73 @@ computePollStats(Timings) ->
 		Output = buildSystemOutput("host1.example.com", "lucos_foo", system, #{}, #{}, #{}, #{}),
 		?assertEqual(0, maps:get(<<"last_updated">>, Output)),
 		?assertEqual(0, maps:get(<<"oldest_source_ts">>, Output)).
+
+	% Regression: a failure that begins inside a deploy window and persists unchanged past
+	% the 10-minute timeout must alert on the first poll after window expiry (#266).
+	%
+	% Mechanism: windowExpired/2 extends the meaningfulChange gate so an expired-but-uncleared
+	% window forces re-evaluation through state_change. state_change's own expired branch then
+	% removes the window entry via maps:remove, making this fire exactly once.
+	expired_deploy_window_fires_alert_on_next_poll_test() ->
+		FailingChecks = #{<<"fetch-info">> => #{<<"ok">> => false}},
+		% NormalisedCache simulates what was stored during the window (failing, but suppressed).
+		FailingNormalisedCache = #{<<"fetch-info">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1}},
+		PastExpiry = erlang:system_time(second) - 1,
+		% System is already known (second-poll semantics) with the failing check cached.
+		SystemMap = #{"lucos_foo" => #system_state{host="host1.example.com", system_type=system, source_checks_map=#{info => FailingChecks}, normalised_cache=FailingNormalisedCache}},
+		% Suppression window is expired (ExpiryTime in the past, no pre-existing failures).
+		SuppressionMap = #{"lucos_foo" => #suppression_window{expiry_time = PastExpiry, pre_existing = #{}}},
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State = {SystemMap, SuppressionMap, [Notifier], #{}, fun(_) -> ok end},
+		% Poll 1: same failing check, unchanged set — meaningfulChange is false, but window is
+		% expired → windowExpired forces re-evaluation. Alert must fire unsuppressed.
+		{noreply, {SystemMap2, NewSuppressionMap, _, _, _} = State2} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, FailingChecks, #{}},
+			State
+		),
+		% (a) alert fires unsuppressed
+		receive
+			{notified, #{host := "host1.example.com", system := "lucos_foo", failing_checks := FailingNow, suppressed := false}} ->
+				?assert(maps:is_key(<<"fetch-info">>, FailingNow))
+		after 100 ->
+			?assert(false, "Expected unsuppressed alert on first poll after window expiry")
+		end,
+		% (b) alerted flag is now set
+		?assertMatch(#system_state{alerted = true}, maps:get("lucos_foo", SystemMap2)),
+		% (c) window entry removed — so the next poll cannot re-fire via windowExpired
+		?assertEqual(#{}, NewSuppressionMap),
+		% Poll 2: same failing check, window now absent — must NOT re-alert (self-limiting).
+		{noreply, _} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_foo", system, info, FailingChecks, #{}},
+			State2
+		),
+		receive
+			{notified, _} -> ?assert(false, "Second poll must not re-alert after window is removed")
+		after 100 ->
+			ok
+		end.
+
+	% windowExpired: active window (ExpiryTime in future) → false
+	window_expired_active_test() ->
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{"lucos_foo" => #suppression_window{expiry_time = FutureExpiry, pre_existing = #{}}},
+		?assertEqual(false, windowExpired("lucos_foo", SuppressionMap)).
+
+	% windowExpired: expired window (ExpiryTime in past) → true
+	window_expired_past_test() ->
+		PastExpiry = erlang:system_time(second) - 1,
+		SuppressionMap = #{"lucos_foo" => #suppression_window{expiry_time = PastExpiry, pre_existing = #{}}},
+		?assertEqual(true, windowExpired("lucos_foo", SuppressionMap)).
+
+	% windowExpired: no entry in SuppressionMap → false
+	window_expired_not_in_map_test() ->
+		?assertEqual(false, windowExpired("lucos_foo", #{})).
+
+	% windowExpired: pending_verification entry → false (suppression was lifted, not expired)
+	window_expired_pending_verification_test() ->
+		PendingSources = sets:from_list([info], [{version, 2}]),
+		SuppressionMap = #{"lucos_foo" => #pending_verification{sources = PendingSources}},
+		?assertEqual(false, windowExpired("lucos_foo", SuppressionMap)).
 
 -endif.
