@@ -24,7 +24,8 @@ notify(#{host := Host, system := System, failing_checks := FailingChecks,
 	% Use the system ID for the anchor; host-based anchor was broken for components without a domain.
 	SystemStr = case System of unknown -> "unknown"; _ -> System end,
 	Url = AppOrigin ++ "/#system-" ++ SystemStr,
-	emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks).
+	Level = event_level(EventType),
+	emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks, Level).
 
 buildEvent(Host, System, FailingChecks, WasFailing, Suppressed) ->
 	SystemStr = case System of
@@ -48,6 +49,14 @@ buildEvent(Host, System, FailingChecks, WasFailing, Suppressed) ->
 plural_checks(1) -> "check";
 plural_checks(_) -> "checks".
 
+% Returns the loganne `level` value for a given event type.
+% monitoringAlertSuppressed is low-editorial-prominence (fired during a deploy
+% window / dependency suppression) and should be hidden from the default feed.
+% All other event types emit at the default level (routine), so we return
+% undefined and omit the field from the payload entirely.
+event_level("monitoringAlertSuppressed") -> "detail";
+event_level(_) -> undefined.
+
 % Builds the JSON `failingChecks` array from a map of check_name => check_map.
 % Each entry carries the check id, its `debug` string (the per-failure-mode
 % signal — timeout reason, HTTP status, exception message), and the static
@@ -62,10 +71,15 @@ build_failing_checks_array(ChecksMap) ->
 		[Entry | Acc]
 	end, [], ChecksMap).
 
-% emit_event for monitoring events that carry a system + checks payload. For
-% events without that shape (monitoringSelfRestart), pass System=undefined and
-% RelevantChecks=undefined — the system/failingChecks fields are then omitted.
+% emit_event/5 — convenience wrapper for events that carry no level field
+% (monitoringSelfRestart). Pass System=undefined and RelevantChecks=undefined
+% to omit those fields from the payload.
 emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks) ->
+	emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks, undefined).
+
+% emit_event/6 — full form.  Level should be a string (e.g. "detail") or
+% undefined to omit the field (loganne will default to "routine").
+emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks, Level) ->
 	Endpoint = os:getenv("LOGANNE_ENDPOINT"),
 	case Endpoint of
 		false ->
@@ -81,9 +95,13 @@ emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks) ->
 				undefined -> BaseBody;
 				_ -> maps:put(<<"system">>, list_to_binary(SystemStr), BaseBody)
 			end,
-			FullBody = case RelevantChecks of
+			BodyWithChecks = case RelevantChecks of
 				undefined -> BodyWithSystem;
 				_ -> maps:put(<<"failingChecks">>, build_failing_checks_array(RelevantChecks), BodyWithSystem)
+			end,
+			FullBody = case Level of
+				undefined -> BodyWithChecks;
+				_ -> maps:put(<<"level">>, list_to_binary(Level), BodyWithChecks)
 			end,
 			Body = jiffy:encode(FullBody),
 			Request = {Endpoint, [{"User-Agent", os:getenv("SYSTEM", "")}], "application/json", Body},
@@ -235,5 +253,24 @@ emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks) ->
 		?assertEqual(ok, notify(#{host => "foo.example.com", system => "lucos_foo",
 		                          failing_checks => #{}, was_failing => #{},
 		                          suppressed => false, metrics => #{}})).
+
+	event_level_test() ->
+		%% monitoringAlertSuppressed is the only type that should carry "detail".
+		?assertEqual("detail", event_level("monitoringAlertSuppressed")),
+		%% All other event types should return undefined (field omitted → defaults to "routine").
+		?assertEqual(undefined, event_level("monitoringAlert")),
+		?assertEqual(undefined, event_level("monitoringRecovery")),
+		?assertEqual(undefined, event_level("monitoringSelfRestart")).
+
+	notify_suppressed_no_endpoint_test() ->
+		%% notify/1 with suppressed => true should still return ok without crashing.
+		%% Verifies the level-derivation path is wired up and doesn't break the call.
+		os:unsetenv("LOGANNE_ENDPOINT"),
+		os:putenv("APP_ORIGIN", "https://monitoring.l42.eu"),
+		FailingCheck = #{<<"ci">> => #{<<"ok">> => false}},
+		?assertEqual(ok, notify(#{host => "foo.example.com", system => "lucos_foo",
+		                          failing_checks => FailingCheck, was_failing => #{},
+		                          suppressed => true, metrics => #{}})),
+		os:unsetenv("APP_ORIGIN").
 
 -endif.
