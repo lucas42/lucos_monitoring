@@ -19,12 +19,11 @@ notify_startup() ->
 %                      with other notifiers)
 notify(#{host := Host, system := System, failing_checks := FailingChecks,
          was_failing := WasFailing, suppressed := Suppressed}) ->
-	{EventType, HumanReadable, RelevantChecks} = buildEvent(Host, System, FailingChecks, WasFailing, Suppressed),
+	{EventType, HumanReadable, RelevantChecks, Level} = buildEvent(Host, System, FailingChecks, WasFailing, Suppressed),
 	AppOrigin = os:getenv("APP_ORIGIN", ""),
 	% Use the system ID for the anchor; host-based anchor was broken for components without a domain.
 	SystemStr = case System of unknown -> "unknown"; _ -> System end,
 	Url = AppOrigin ++ "/#system-" ++ SystemStr,
-	Level = event_level(EventType),
 	emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks, Level).
 
 buildEvent(Host, System, FailingChecks, WasFailing, Suppressed) ->
@@ -37,25 +36,17 @@ buildEvent(Host, System, FailingChecks, WasFailing, Suppressed) ->
 	HostSuffix = case Host of "" -> ""; _ -> " (" ++ Host ++ ")" end,
 	case {maps:size(FailingChecks), Suppressed} of
 		{0, _} ->
-			{"monitoringRecovery", "All checks healthy on " ++ SystemTitle ++ HostSuffix, WasFailing};
+			{"monitoringRecovery", "All checks healthy on " ++ SystemTitle ++ HostSuffix, WasFailing, "routine"};
 		{FailCount, true} ->
 			FailNames = string:join([binary_to_list(K) || K <- maps:keys(FailingChecks)], ", "),
-			{"monitoringAlertSuppressed", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ HostSuffix ++ ": " ++ FailNames ++ " (suppressed during deploy window)", FailingChecks};
+			{"monitoringAlertSuppressed", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ HostSuffix ++ ": " ++ FailNames ++ " (suppressed during deploy window)", FailingChecks, "detail"};
 		{FailCount, false} ->
 			FailNames = string:join([binary_to_list(K) || K <- maps:keys(FailingChecks)], ", "),
-			{"monitoringAlert", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ HostSuffix ++ ": " ++ FailNames, FailingChecks}
+			{"monitoringAlert", integer_to_list(FailCount) ++ " failing " ++ plural_checks(FailCount) ++ " on " ++ SystemTitle ++ HostSuffix ++ ": " ++ FailNames, FailingChecks, "routine"}
 	end.
 
 plural_checks(1) -> "check";
 plural_checks(_) -> "checks".
-
-% Returns the loganne `level` value for a given event type.
-% monitoringAlertSuppressed is low-editorial-prominence (fired during a deploy
-% window / dependency suppression) and should be hidden from the default feed.
-% All other event types emit at the default level (routine), so we return
-% undefined and omit the field from the payload entirely.
-event_level("monitoringAlertSuppressed") -> "detail";
-event_level(_) -> undefined.
 
 % Builds the JSON `failingChecks` array from a map of check_name => check_map.
 % Each entry carries the check id, its `debug` string (the per-failure-mode
@@ -71,14 +62,14 @@ build_failing_checks_array(ChecksMap) ->
 		[Entry | Acc]
 	end, [], ChecksMap).
 
-% emit_event/5 — convenience wrapper for events that carry no level field
-% (monitoringSelfRestart). Pass System=undefined and RelevantChecks=undefined
-% to omit those fields from the payload.
+% emit_event/5 — convenience wrapper for events with no explicit level
+% (monitoringSelfRestart). Defaults level to "routine". Pass System=undefined
+% and RelevantChecks=undefined to omit those fields from the payload.
 emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks) ->
-	emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks, undefined).
+	emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks, "routine").
 
-% emit_event/6 — full form.  Level should be a string (e.g. "detail") or
-% undefined to omit the field (loganne will default to "routine").
+% emit_event/6 — full form.  Level is a string (e.g. "routine", "detail")
+% and is always included in the payload.
 emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks, Level) ->
 	Endpoint = os:getenv("LOGANNE_ENDPOINT"),
 	case Endpoint of
@@ -89,19 +80,16 @@ emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks, Level) ->
 				<<"source">> => <<"lucos_monitoring">>,
 				<<"type">> => list_to_binary(EventType),
 				<<"humanReadable">> => list_to_binary(HumanReadable),
-				<<"url">> => list_to_binary(Url)
+				<<"url">> => list_to_binary(Url),
+				<<"level">> => list_to_binary(Level)
 			},
 			BodyWithSystem = case SystemStr of
 				undefined -> BaseBody;
 				_ -> maps:put(<<"system">>, list_to_binary(SystemStr), BaseBody)
 			end,
-			BodyWithChecks = case RelevantChecks of
+			FullBody = case RelevantChecks of
 				undefined -> BodyWithSystem;
 				_ -> maps:put(<<"failingChecks">>, build_failing_checks_array(RelevantChecks), BodyWithSystem)
-			end,
-			FullBody = case Level of
-				undefined -> BodyWithChecks;
-				_ -> maps:put(<<"level">>, list_to_binary(Level), BodyWithChecks)
 			end,
 			Body = jiffy:encode(FullBody),
 			Request = {Endpoint, [{"User-Agent", os:getenv("SYSTEM", "")}], "application/json", Body},
@@ -131,39 +119,39 @@ emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks, Level) ->
 		%% WasFailing is the relevant-checks payload for recoveries.
 		WasFailing = #{<<"ci">> => #{<<"ok">> => false, <<"debug">> => <<"Workflow failed">>}},
 		?assertEqual(
-			{"monitoringRecovery", "All checks healthy on lucos foo (foo.example.com)", WasFailing},
+			{"monitoringRecovery", "All checks healthy on lucos foo (foo.example.com)", WasFailing, "routine"},
 			buildEvent("foo.example.com", "lucos_foo", #{}, WasFailing, false)
 		),
 		%% Recovery during suppression window still uses monitoringRecovery
 		?assertEqual(
-			{"monitoringRecovery", "All checks healthy on lucos foo (foo.example.com)", WasFailing},
+			{"monitoringRecovery", "All checks healthy on lucos foo (foo.example.com)", WasFailing, "routine"},
 			buildEvent("foo.example.com", "lucos_foo", #{}, WasFailing, true)
 		),
-		%% Alert: one failing check, not suppressed (singular)
+		%% Alert: one failing check, not suppressed — level is "routine"
 		FailingCheck = #{<<"ci">> => #{<<"ok">> => false}},
 		?assertEqual(
-			{"monitoringAlert", "1 failing check on lucos foo (foo.example.com): ci", FailingCheck},
+			{"monitoringAlert", "1 failing check on lucos foo (foo.example.com): ci", FailingCheck, "routine"},
 			buildEvent("foo.example.com", "lucos_foo", FailingCheck, #{}, false)
 		),
-		%% Alert: one failing check, suppressed (singular)
+		%% Alert: one failing check, suppressed — level is "detail"
 		?assertEqual(
-			{"monitoringAlertSuppressed", "1 failing check on lucos foo (foo.example.com): ci (suppressed during deploy window)", FailingCheck},
+			{"monitoringAlertSuppressed", "1 failing check on lucos foo (foo.example.com): ci (suppressed during deploy window)", FailingCheck, "detail"},
 			buildEvent("foo.example.com", "lucos_foo", FailingCheck, #{}, true)
 		).
 
 	buildEvent_no_host_test() ->
 		%% Components with no domain: host suffix is omitted from human-readable strings
 		?assertEqual(
-			{"monitoringRecovery", "All checks healthy on lucos component", #{}},
+			{"monitoringRecovery", "All checks healthy on lucos component", #{}, "routine"},
 			buildEvent("", "lucos_component", #{}, #{}, false)
 		),
 		FailingCheck = #{<<"ci">> => #{<<"ok">> => false}},
 		?assertEqual(
-			{"monitoringAlert", "1 failing check on lucos component: ci", FailingCheck},
+			{"monitoringAlert", "1 failing check on lucos component: ci", FailingCheck, "routine"},
 			buildEvent("", "lucos_component", FailingCheck, #{}, false)
 		),
 		?assertEqual(
-			{"monitoringAlertSuppressed", "1 failing check on lucos component: ci (suppressed during deploy window)", FailingCheck},
+			{"monitoringAlertSuppressed", "1 failing check on lucos component: ci (suppressed during deploy window)", FailingCheck, "detail"},
 			buildEvent("", "lucos_component", FailingCheck, #{}, true)
 		).
 
@@ -179,7 +167,7 @@ emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks, Level) ->
 		%% System = unknown (atom) should not crash — happens when /_info returns non-200
 		FailingCheck = #{<<"fetch-info">> => #{<<"ok">> => false}},
 		?assertEqual(
-			{"monitoringAlert", "1 failing check on unknown (foo.example.com): fetch-info", FailingCheck},
+			{"monitoringAlert", "1 failing check on unknown (foo.example.com): fetch-info", FailingCheck, "routine"},
 			buildEvent("foo.example.com", unknown, FailingCheck, #{}, false)
 		).
 
@@ -254,17 +242,10 @@ emit_event(EventType, HumanReadable, Url, SystemStr, RelevantChecks, Level) ->
 		                          failing_checks => #{}, was_failing => #{},
 		                          suppressed => false, metrics => #{}})).
 
-	event_level_test() ->
-		%% monitoringAlertSuppressed is the only type that should carry "detail".
-		?assertEqual("detail", event_level("monitoringAlertSuppressed")),
-		%% All other event types should return undefined (field omitted → defaults to "routine").
-		?assertEqual(undefined, event_level("monitoringAlert")),
-		?assertEqual(undefined, event_level("monitoringRecovery")),
-		?assertEqual(undefined, event_level("monitoringSelfRestart")).
-
 	notify_suppressed_no_endpoint_test() ->
 		%% notify/1 with suppressed => true should still return ok without crashing.
-		%% Verifies the level-derivation path is wired up and doesn't break the call.
+		%% Exercises the full path: buildEvent returns "detail" level, emit_event/6
+		%% includes it in the body.
 		os:unsetenv("LOGANNE_ENDPOINT"),
 		os:putenv("APP_ORIGIN", "https://monitoring.l42.eu"),
 		FailingCheck = #{<<"ci">> => #{<<"ok">> => false}},
