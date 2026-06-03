@@ -59,8 +59,8 @@ runChecks(StatePid, Id, Type, Host) ->
 	logger:info("Checked ~p: duration_ms=~p fetch_info=~p tls=~p", [Id, DurationMs, InfoOk, TLSOk]),
 	ok = gen_server:cast(StatePid, {poll_timing, Id, DurationMs, IsOk}).
 
-% make_direct_probe_check stamps failThreshold: 2 on a check produced by a fetcher
-% that directly probes the system itself (e.g. fetch-info, tls-certificate).
+% make_direct_probe_check stamps failThreshold: 2 and dependsOn on a check produced
+% by a fetcher that directly probes the system itself (e.g. fetch-info, tls-certificate).
 %
 % When this fetcher cannot reach the system, it emits ok: false — transport failure
 % here means the system is genuinely unreachable, so the FailsGate
@@ -68,11 +68,18 @@ runChecks(StatePid, Id, Type, Host) ->
 % suppression mechanism.  Requiring 2 consecutive failures absorbs single-poll
 % transient blips during deploys or container restarts without masking real outages.
 %
+% dependsOn: [lucos_router, lucos_dns] tells the suppress engine that a failing
+% fetch-info or tls-certificate during a router or DNS deploy window is expected
+% infra noise, not a real service failure.  See ADR-0004.
+%
 % Use this helper for any synthetic check where the fetcher is the direct probe.
 % Do NOT use it for third-party probes (e.g. CircleCI) — see
 % make_third_party_probe_check/2 in fetcher_circleci.erl for that case.
 make_direct_probe_check(Check) ->
-	maps:put(<<"failThreshold">>, 2, Check).
+	maps:merge(Check, #{
+		<<"failThreshold">> => 2,
+		<<"dependsOn">> => [<<"lucos_router">>, <<"lucos_dns">>]
+	}).
 
 checkTlsExpiry(Host) ->
 	TechDetail = <<"Checks whether the TLS Certificate is valid and not about to expire">>,
@@ -443,11 +450,21 @@ fetchInfo(Host) ->
 		?assertEqual(false, maps:get(<<"ok">>, Result)),
 		?assertEqual(<<"Makes HTTP request to https://foo.l42.eu/_info">>, maps:get(<<"techDetail">>, Result)).
 
+	% make_direct_probe_check: stamps dependsOn: [lucos_router, lucos_dns] onto the check.
+	% This allows the suppress engine to suppress failing fetch-info/tls-certificate checks
+	% during router or DNS deploy windows — see ADR-0004.
+	make_direct_probe_check_stamps_dependsOn_test() ->
+		BaseCheck = #{<<"ok">> => false, <<"techDetail">> => <<"Makes HTTP request to https://foo.l42.eu/_info">>},
+		Result = make_direct_probe_check(BaseCheck),
+		DependsOn = maps:get(<<"dependsOn">>, Result),
+		?assertEqual([<<"lucos_router">>, <<"lucos_dns">>], DependsOn).
+
 	% make_direct_probe_check: preserves arbitrary check fields (techDetail, debug, link).
 	make_direct_probe_check_preserves_fields_test() ->
 		BaseCheck = #{<<"ok">> => true, <<"techDetail">> => <<"tls check">>, <<"debug">> => <<"ok">>},
 		Result = make_direct_probe_check(BaseCheck),
 		?assertEqual(2, maps:get(<<"failThreshold">>, Result)),
+		?assertEqual([<<"lucos_router">>, <<"lucos_dns">>], maps:get(<<"dependsOn">>, Result)),
 		?assertEqual(<<"tls check">>, maps:get(<<"techDetail">>, Result)),
 		?assertEqual(<<"ok">>, maps:get(<<"debug">>, Result)).
 

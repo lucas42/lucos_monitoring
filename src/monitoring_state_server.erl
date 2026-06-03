@@ -2113,4 +2113,77 @@ computePollStats(Timings) ->
 		SuppressionMap = #{"lucos_foo" => #pending_verification{sources = PendingSources}},
 		?assertEqual(false, windowExpired("lucos_foo", SuppressionMap)).
 
+	% --- ADR-0004: monitoring-authored dependsOn on synthetic probes ---
+
+	% Closing lucos_router's deploy window fans pending_verification across every system
+	% whose checks carry dependsOn: [lucos_router, lucos_dns] (the new list shape stamped
+	% by make_direct_probe_check/1 in fetcher_info.erl).  This is the estate-wide cascade
+	% described in ADR-0004 and the second read site of dependsOn (find_dependent_systems/2).
+	unsuppress_router_cascades_estate_wide_pending_verification_test() ->
+		RouterDnsDepChecks = #{
+			<<"fetch-info">>      => #{<<"ok">> => true, <<"dependsOn">> => [<<"lucos_router">>, <<"lucos_dns">>]},
+			<<"tls-certificate">> => #{<<"ok">> => true, <<"dependsOn">> => [<<"lucos_router">>, <<"lucos_dns">>]}
+		},
+		SystemMap = #{
+			"lucos_router"  => #system_state{host="router.l42.eu", system_type=system,
+			                                  source_checks_map=#{info => RouterDnsDepChecks}},
+			"lucos_photos"  => #system_state{host="photos.l42.eu", system_type=system,
+			                                  source_checks_map=#{info => RouterDnsDepChecks}},
+			"lucos_arachne" => #system_state{host="arachne.l42.eu", system_type=system,
+			                                  source_checks_map=#{info => RouterDnsDepChecks}}
+		},
+		FutureExpiry = erlang:system_time(second) + 600,
+		SuppressionMap = #{"lucos_router" => #suppression_window{expiry_time = FutureExpiry, pre_existing = #{}}},
+		State = {SystemMap, SuppressionMap, [], #{}, fun(_) -> ok end},
+		{reply, ok, {_, NewSuppressionMap, _, _, _}} = handle_call(
+			{unsuppress, "lucos_router"}, from, State
+		),
+		% lucos_router itself enters pending_verification
+		?assertMatch(#pending_verification{}, maps:get("lucos_router", NewSuppressionMap)),
+		% All dependent systems (fetch-info / tls-certificate carry dependsOn the router) also
+		% enter pending_verification — estate-wide cascade.
+		?assertMatch(#pending_verification{}, maps:get("lucos_photos",  NewSuppressionMap)),
+		?assertMatch(#pending_verification{}, maps:get("lucos_arachne", NewSuppressionMap)).
+
+	% After being swept into pending_verification by the estate-wide cascade (see above),
+	% a healthy system's next poll must clear the pending state without alerting.
+	% This is the "one poll interval" resolution: fresh data shows the system is fine.
+	unsuppress_cascade_healthy_system_clears_without_alert_test() ->
+		HealthyChecks = #{
+			<<"fetch-info">>      => #{<<"ok">> => true, <<"dependsOn">> => [<<"lucos_router">>, <<"lucos_dns">>]},
+			<<"tls-certificate">> => #{<<"ok">> => true, <<"dependsOn">> => [<<"lucos_router">>, <<"lucos_dns">>]}
+		},
+		SystemMap = #{"lucos_photos" => #system_state{host="photos.l42.eu", system_type=system, source_checks_map=#{info => HealthyChecks}}},
+		PendingSources = sets:from_list([info], [{version, 2}]),
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State = {SystemMap, #{"lucos_photos" => #pending_verification{sources = PendingSources}}, [Notifier], #{}, fun(_) -> ok end},
+		{noreply, {_, NewSuppressionMap, _, _, _}} = handle_cast(
+			{updateSystem, "photos.l42.eu", "lucos_photos", system, info, HealthyChecks, #{}},
+			State
+		),
+		% pending_verification must be cleared after the healthy post-cascade poll
+		?assertEqual(#{}, NewSuppressionMap),
+		% No alert must fire — the system was healthy all along
+		receive
+			{notified, _} -> ?assert(false, "No alert expected for a healthy system clearing pending_verification after cascade")
+		after 100 ->
+			ok
+		end.
+
+	% Router's own checks carry dependsOn: [lucos_router, lucos_dns] (via make_direct_probe_check/1).
+	% During lucos_router's own deploy window, is_dependency_suppressed must return false for
+	% router's own checks: the lucos_router element in the list is skipped by the self-reference
+	% guard, and lucos_dns is not suppressed. This confirms the guard holds with list-valued deps.
+	% (Router's checks are already suppressed by its own deploy-window entry; this test confirms
+	% the self-reference guard doesn't produce an unrelated false-positive suppression path.)
+	router_own_checks_not_self_suppressed_by_list_deps_test() ->
+		RouterCheck = #{<<"ok">> => false, <<"dependsOn">> => [<<"lucos_router">>, <<"lucos_dns">>]},
+		FutureExpiry = erlang:system_time(second) + 600,
+		% Only lucos_router has an active suppression window; lucos_dns does not.
+		SuppressionMap = #{"lucos_router" => #suppression_window{expiry_time = FutureExpiry, pre_existing = #{}}},
+		% Evaluating from lucos_router's own perspective — self-reference guard must skip
+		% lucos_router from the list, and lucos_dns is not in SuppressionMap → false.
+		?assertEqual(false, is_dependency_suppressed(RouterCheck, "lucos_router", SuppressionMap)).
+
 -endif.
