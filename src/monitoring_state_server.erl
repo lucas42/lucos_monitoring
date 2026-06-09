@@ -19,7 +19,7 @@
 % which then goes through the FailsGate with the default threshold of 1.  A direct false
 % (e.g. a workflow failure from circleci) skips the UnknownsGate entirely and is only
 % subject to the FailsGate.
--define(CONSECUTIVE_UNKNOWNS_THRESHOLD, 3).
+-define(CONSECUTIVE_UNKNOWNS_THRESHOLD, 5).
 
 % Per-system state stored as a value in SystemMap.  Named fields prevent
 % positional-tuple confusion and make it safe to add future fields without
@@ -829,8 +829,12 @@ computePollStats(Timings) ->
 		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 1, <<"consecutiveFailsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
 		% Second consecutive unknown for ci (count 1→2, ok still held as true)
 		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 2, <<"consecutiveFailsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
-		% Third consecutive unknown for ci (count 2→3, ok flips to false and alerts)
-		?assertEqual(#{<<"ci">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 3, <<"consecutiveFailsCount">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
+		% Third consecutive unknown for ci (count 2→3, ok still held as true — below the threshold of 5)
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 3, <<"consecutiveFailsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 2}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
+		% Fourth consecutive unknown for ci (count 3→4, ok still held as true — one below the threshold)
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 4, <<"consecutiveFailsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 3}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
+		% Fifth consecutive unknown for ci (count 4→5, hits ?CONSECUTIVE_UNKNOWNS_THRESHOLD, ok flips to false and alerts)
+		?assertEqual(#{<<"ci">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 5, <<"consecutiveFailsCount">> => 1}, <<"fetch-info">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}}, normaliseChecks(#{<<"ci">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 4}}, #{<<"ci">> => #{<<"ok">> => unknown}, <<"fetch-info">> => #{<<"ok">> => true}}, CiCountable)),
 		% fetch-info goes unknown while other checks are carried forward from old state
 		?assertEqual(#{<<"item-count">> => #{<<"ok">> => false, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 1}, <<"api-check">> => #{<<"ok">> => true, <<"consecutiveUnknownsCount">> => 0, <<"consecutiveFailsCount">> => 0}, <<"fetch-info">> => #{<<"ok">> => true,  <<"consecutiveUnknownsCount">> => 1, <<"consecutiveFailsCount">> => 0}}, normaliseChecks(#{<<"item-count">> => #{<<"ok">> => false}, <<"api-check">> => #{<<"ok">> => true}, <<"fetch-info">> => #{<<"ok">> => true}}, #{<<"fetch-info">> => #{<<"ok">> => unknown}}, FetchInfoCountable)).
 
