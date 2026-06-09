@@ -76,6 +76,16 @@ Recovery is gated at the **`notify_all` dispatch site** in `monitoring_state_ser
 - **State is in-memory and per-process.** A `monitoring` restart resets `alerted` to `false`. This is safe: a recovery only fires on an observed failing→healthy transition, and a freshly-restarted source starts `healthy` (no transition), so the orphan cannot recur across a restart. No persistence is introduced.
 - **Failure born inside a deploy window and sustained past it.** In the normal path this *does* alert: when the deploy finishes and `unsuppress` is called, the system enters `pending_verification` and the next poll, seeing `FailingNow > 0`, sends the alert — and this PR leaves that emit behaviourally unchanged (it only additionally sets `alerted`). The one path that stays silent is narrow: the window **expires by its 10-minute timeout** (rather than being explicitly unsuppressed) **and** the failing-check set never changes — there `meaningfulChange/2` never re-fires, so `state_change` and its expiry branch are never reached. That gap is **pre-existing** (both the expiry branch and the `meaningfulChange` gate predate this PR), is **not a regression introduced here**, and is left for a separate follow-up about re-evaluating on window expiry.
 
+## Addendum — post-deploy re-alert gate (issue #277, 2026-06-09)
+
+The `pending_verification` path originally alerted unconditionally whenever `FailingNow > 0` after the verification poll. When a broken service was redeployed multiple times without fixing the failure, each deploy produced an additional alert email for an unchanged failing set — one alert per deploy (observed 5 alerts in ~3 hours for `lucos_backups`).
+
+**Fix:** the `pending_verification` path now gates the re-alert on `partitionByPreExisting(FailingNow, pre_existing)`: it only alerts if `FailingNow` contains any check that was **not** in the suppress-time snapshot (`pre_existing`). Checks that were already failing before the deploy are not re-alerted if the set is unchanged; the still-open episode (`alerted = true`, no recovery sent) continues to carry the signal.
+
+**Why `pre_existing` is the load-bearing baseline (not `OldNormalisedCache`):** a check born *inside* the deploy window is absent from `pre_existing` (which was snapshotted at suppress-time) but present in `OldNormalisedCache` by the time `pending_verification` resolves. Using `OldNormalisedCache` as the baseline would treat such a check as "already known" and suppress it — silently hiding a failure introduced by the deploy. `pre_existing` preserves the guarantee: a failure that appeared during the window is a new entry and still fires the alert.
+
+**Threaded through `pending_verification`:** `pre_existing` is copied from the closing `#suppression_window` into the `#pending_verification` record at `unsuppress` time. Cascaded dependent-system entries default to `#{}` (all failures treated as new — correct conservative behaviour for systems without a deploy-window baseline).
+
 ## Alternatives considered
 
 - **Gate on `wasFailing` as-is.** Provably cannot work: a dependency-suppressed failure is stored as `ok=false`, so `wasFailing` includes it on recovery. This is the route that produced the orphan.

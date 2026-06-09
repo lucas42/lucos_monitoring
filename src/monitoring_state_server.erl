@@ -42,8 +42,13 @@
 
 % Post-unsuppress entry in SuppressionMap: alert decision deferred until all
 % sources have reported fresh data.
+% pre_existing mirrors the field from #suppression_window: a per-Host map of
+% check-key sets captured at suppress-time.  Used in the post-deploy alert gate
+% to suppress re-alerts for failures that were already known before the deploy.
+% Defaults to #{} (no pre-existing baseline) for cascaded dependent-system entries.
 -record(pending_verification, {
-	sources
+	sources,
+	pre_existing = #{}
 }).
 
 start_link(Notifiers, Publish) ->
@@ -112,7 +117,7 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 					{SuppressionMap, false};
 				false ->
 					case maps:get(System, SuppressionMap, undefined) of
-						#pending_verification{sources = PendingSources} ->
+						#pending_verification{sources = PendingSources, pre_existing = PreExisting} ->
 							% Suppression was recently lifted. Defer the alert decision until
 							% all sources have reported fresh post-deploy data.
 							Remaining = sets:del_element(Source, PendingSources),
@@ -128,9 +133,25 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 									},
 									case maps:size(FailingNow) > 0 of
 										true ->
-											logger:notice("Service ~p still unhealthy after deploy — alerting", [System]),
-											notify_all(NotificationBase#{failing_checks => FailingNow, suppressed => false}, Notifiers),
-											{maps:remove(System, SuppressionMap), true};
+											% Gate the re-alert: only fire if FailingNow contains any
+											% check that wasn't already failing before the deploy
+											% (i.e., a genuinely new failure). Checks present in
+											% pre_existing are unchanged from before the deploy —
+											% the user was already told about them; no new email needed.
+											% A check born *inside* the deploy window is absent from
+											% pre_existing, so it still alerts here (ADR-0003 guarantee
+											% preserved). See #277.
+											HostPreExisting = maps:get(Host, PreExisting, sets:new([{version, 2}])),
+											{_PreExistingFailing, NewlyFailing} = partitionByPreExisting(FailingNow, HostPreExisting),
+											case maps:size(NewlyFailing) > 0 of
+												true ->
+													logger:notice("Service ~p still unhealthy after deploy — alerting", [System]),
+													notify_all(NotificationBase#{failing_checks => FailingNow, suppressed => false}, Notifiers),
+													{maps:remove(System, SuppressionMap), true};
+												false ->
+													logger:notice("Service ~p still unhealthy after deploy but failing set unchanged — suppressing re-alert", [System]),
+													{maps:remove(System, SuppressionMap), OldAlerted}
+											end;
 										false ->
 											% Recovery after deploy: emit the all-clear iff we actually
 											% sent an alert for this episode (OldAlerted). This supersedes
@@ -142,7 +163,9 @@ handle_cast(Request, {SystemMap, SuppressionMap, Notifiers, PollTimings, Publish
 											{maps:remove(System, SuppressionMap), false}
 									end;
 								false ->
-									{maps:put(System, #pending_verification{sources = Remaining}, SuppressionMap), OldAlerted}
+									% Pre_existing is threaded forward so the final verification
+									% poll has the correct suppress-time baseline.
+									{maps:put(System, #pending_verification{sources = Remaining, pre_existing = PreExisting}, SuppressionMap), OldAlerted}
 							end;
 						_ ->
 							case meaningfulChange(OldNormalisedCache, NormalisedChecks)
@@ -258,7 +281,17 @@ handle_call(Request, _From, {SystemMap, SuppressionMap, Notifiers, PollTimings, 
 			case maps:is_key(System, SuppressionMap) of
 				true ->
 					Sources = collect_active_sources(System, SystemMap),
-					NewSuppressionMap = maps:put(System, #pending_verification{sources = Sources}, SuppressionMap),
+					% Thread pre_existing from the closing suppression window so the
+					% post-deploy alert gate can compare against the suppress-time
+					% snapshot (checks already failing before the deploy are not
+					% re-alerted if the set is unchanged). Falls back to #{} for any
+					% non-window entry (e.g. a double-unsuppress), which treats all
+					% failures as new — correct conservative default.
+					WindowPreExisting = case maps:get(System, SuppressionMap) of
+						#suppression_window{pre_existing = PE} -> PE;
+						_ -> #{}
+					end,
+					NewSuppressionMap = maps:put(System, #pending_verification{sources = Sources, pre_existing = WindowPreExisting}, SuppressionMap),
 					logger:notice("Suppression window closed for ~p — awaiting verification poll", [System]),
 					% Cascade pending_verification to systems that have checks depending on this system.
 					% Single-hop only: we do not follow dependsOn chains transitively.
@@ -1193,6 +1226,61 @@ computePollStats(Timings) ->
 			{notified, #{host := "host1.example.com", system := "lucos_foo", suppressed := false}} -> ok
 		after 100 ->
 			?assert(false, "Expected alert after all sources reported")
+		end.
+
+	% Regression (#277): when the post-deploy failing set is identical to the pre-deploy
+	% snapshot, the re-alert is suppressed.  The user was already told about these failures
+	% before the deploy; no new email is needed.  The episode stays open (alerted=true, no
+	% recovery sent), so a genuine recovery still fires the all-clear.
+	pending_verification_unchanged_failing_set_suppresses_re_alert_test() ->
+		FailingChecks = #{<<"create-backups">> => #{<<"ok">> => false}},
+		% pre_existing mirrors what was failing at suppress-time: same check key.
+		PreExistingKeys = sets:from_list([<<"create-backups">>], [{version, 2}]),
+		PreExisting = #{"host1.example.com" => PreExistingKeys},
+		SystemMap = #{"lucos_backups" => #system_state{host="host1.example.com", system_type=system, source_checks_map=#{info => FailingChecks}, alerted=true}},
+		PendingSources = sets:from_list([info], [{version, 2}]),
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State = {SystemMap, #{"lucos_backups" => #pending_verification{sources = PendingSources, pre_existing = PreExisting}}, [Notifier], #{}, fun(_) -> ok end},
+		{noreply, {NewSystemMap, NewSuppressionMap, _, _, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_backups", system, info, FailingChecks, #{}},
+			State
+		),
+		% Suppression entry should be cleared
+		?assertEqual(#{}, NewSuppressionMap),
+		% alerted flag must remain true — the episode is still open, recovery not yet sent
+		?assertMatch(#system_state{alerted = true}, maps:get("lucos_backups", NewSystemMap)),
+		receive
+			{notified, _} -> ?assert(false, "No re-alert expected when failing set is unchanged after deploy")
+		after 100 ->
+			ok
+		end.
+
+	% Regression (#277): a deploy that introduces a genuinely new failing check still
+	% alerts, even when pre-existing failures are also present.
+	pending_verification_new_failure_in_set_still_alerts_test() ->
+		ExistingFailure = #{<<"create-backups">> => #{<<"ok">> => false}},
+		NewFailure = #{<<"new-check">> => #{<<"ok">> => false}},
+		FailingChecks = maps:merge(ExistingFailure, NewFailure),
+		% pre_existing only covers the check that was failing before the deploy.
+		PreExistingKeys = sets:from_list([<<"create-backups">>], [{version, 2}]),
+		PreExisting = #{"host1.example.com" => PreExistingKeys},
+		SystemMap = #{"lucos_backups" => #system_state{host="host1.example.com", system_type=system, source_checks_map=#{info => FailingChecks}, alerted=true}},
+		PendingSources = sets:from_list([info], [{version, 2}]),
+		Notifier = recording_notifier(self()),
+		drain_notifications(),
+		State = {SystemMap, #{"lucos_backups" => #pending_verification{sources = PendingSources, pre_existing = PreExisting}}, [Notifier], #{}, fun(_) -> ok end},
+		{noreply, {_, NewSuppressionMap, _, _, _}} = handle_cast(
+			{updateSystem, "host1.example.com", "lucos_backups", system, info, FailingChecks, #{}},
+			State
+		),
+		% Suppression entry should be cleared
+		?assertEqual(#{}, NewSuppressionMap),
+		receive
+			{notified, #{host := "host1.example.com", system := "lucos_backups", failing_checks := FailingNow, suppressed := false}} ->
+				?assert(maps:is_key(<<"new-check">>, FailingNow), "Alert must include the new failure")
+		after 100 ->
+			?assert(false, "Expected alert for new failure introduced by deploy")
 		end.
 
 	% With default failThreshold (1), a single failure is reported immediately.
