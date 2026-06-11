@@ -6,9 +6,9 @@
 % recurring CI check process for each repo.
 start(StatePid) ->
 	{ok, _} = application:ensure_all_started([ssl, inets]),
-	{ok, SystemsBody} = file:read_file("./config/ci-systems-list.json"),
+	{ok, SystemsBody} = file:read_file("./config/all-systems-list.json"),
 	{ok, ComponentsBody} = file:read_file("./config/ci-components-list.json"),
-	% ci-systems-list.json entries are systems; ci-components-list.json entries are components.
+	% all-systems-list.json entries are systems; ci-components-list.json entries are components.
 	% DefaultType is the atom used when an entry has no explicit "type" field.
 	Repos = parseConfigyRepos(binary_to_list(SystemsBody), system) ++
 	        parseConfigyRepos(binary_to_list(ComponentsBody), component),

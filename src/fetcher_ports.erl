@@ -6,10 +6,10 @@
 %
 % Source of truth is configy's `public_ports` declarations — the same list that
 % drives lucos_firewall's inbound allow-list — so "declared public" and "monitored"
-% are the same set by construction. The data is curled into config/info-ports-list.json
-% at Docker build from the FULL configy.l42.eu/systems endpoint (not /systems/http),
-% because the systems most worth probing here (dns, dns_secondary) have no http_port
-% and so are absent from the HTTP-only list used by fetcher_info.
+% are the same set by construction. The data is read from config/all-systems-list.json
+% (the FULL configy.l42.eu/systems list, curled at Docker build and shared with
+% fetcher_circleci), not /systems/http, because the systems most worth probing here
+% (dns, dns_secondary) have no http_port and so are absent from the HTTP-only list.
 %
 % For every system that declares a TCP public_port AND has a domain to connect to,
 % start/1 spawns a 60s loop that opens a bare TCP connection to each such port and
@@ -24,7 +24,7 @@
 % verify resolution — the primary DNS path is UDP, which is not probed).
 
 start(StatePid) ->
-	{ok, Body} = file:read_file("./config/info-ports-list.json"),
+	{ok, Body} = file:read_file("./config/all-systems-list.json"),
 	Targets = parsePortTargets(binary_to_list(Body)),
 	logger:notice("fetcher_ports: probing ~p target system(s)", [length(Targets)]),
 	lists:foreach(fun(Target) ->
