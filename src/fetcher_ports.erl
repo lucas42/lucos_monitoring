@@ -38,6 +38,7 @@ parsePortTargets(Body) ->
 	Entries = jiffy:decode(Body, [return_maps]),
 	lists:filtermap(fun(Entry) ->
 		Id = binary_to_list(maps:get(<<"id">>, Entry)),
+		Type = binary_to_atom(maps:get(<<"type">>, Entry, <<"system">>), utf8),
 		Host = case maps:get(<<"domain">>, Entry, null) of
 			null -> "";
 			Domain -> binary_to_list(Domain)
@@ -50,7 +51,7 @@ parsePortTargets(Body) ->
 			{"", _} -> false;
 			% No TCP public ports — nothing to probe.
 			{_, []} -> false;
-			{_, Ports} -> {true, {Id, system, Host, Ports}}
+			{_, Ports} -> {true, {Id, Type, Host, Ports}}
 		end
 	end, Entries).
 
@@ -67,10 +68,7 @@ tryRunChecks(StatePid, Target) ->
 runChecks(StatePid, {Id, Type, Host, Ports}) ->
 	Checks = lists:foldl(fun({Port, Purpose}, Acc) ->
 		Key = list_to_binary("port-" ++ integer_to_list(Port) ++ "-reachable"),
-		% make_direct_probe_check stamps failThreshold: 2 + dependsOn so a sustained
-		% failure escalates via the UnknownsGate/FailsGate, while single-poll blips
-		% (deploys, restarts) are absorbed. The fetcher IS the direct probe here.
-		Check = fetcher_info:make_direct_probe_check(checkPortReachable(Host, Port, Purpose)),
+		Check = make_port_probe_check(checkPortReachable(Host, Port, Purpose)),
 		maps:put(Key, Check, Acc)
 	end, #{}, Ports),
 	ok = gen_server:cast(StatePid, {updateSystem, Host, Id, Type, ports, Checks, #{}}).
@@ -111,6 +109,22 @@ classifyConnectError(Host, Port, Reason) ->
 		closed       -> {unknown, "TCP connection to " ++ Target ++ " closed during handshake"};
 		Other        -> {false, "Unexpected error connecting to " ++ Target ++ ": " ++ lists:flatten(io_lib:format("~p", [Other]))}
 	end.
+
+% Stamps the suppression policy for a port-reachability check: failThreshold 2
+% (absorb a single-poll restart/deploy blip) + dependsOn [lucos_dns].
+%
+% This deliberately does NOT depend on lucos_router (unlike fetcher_info's
+% make_direct_probe_check, used by the HTTP probes). A raw gen_tcp:connect to the
+% target port bypasses nginx entirely, so a router deploy is not on the path —
+% depending on it would suppress a genuine port outage that happened to coincide
+% with a router deploy window, which is exactly the failure mode this check exists
+% to catch. The probe DOES resolve the target's domain, so the lucos_dns dependency
+% (suppress during a DNS deploy window) is retained.
+make_port_probe_check(Check) ->
+	maps:merge(Check, #{
+		<<"failThreshold">> => 2,
+		<<"dependsOn">> => [<<"lucos_dns">>]
+	}).
 
 -ifdef(TEST).
 
@@ -155,6 +169,25 @@ classifyConnectError(Host, Port, Reason) ->
 
 	parsePortTargets_empty_test() ->
 		?assertEqual([], parsePortTargets("[]")).
+
+	% Type defaults to `system` when absent (the current configy /systems shape has no type field).
+	parsePortTargets_type_defaults_to_system_test() ->
+		Body = "[{\"id\":\"lucos_mail\",\"domain\":\"mail.l42.eu\",\"public_ports\":[{\"port\":25,\"protocol\":\"tcp\",\"purpose\":\"SMTP inbound\"}]}]",
+		[{_, Type, _, _}] = parsePortTargets(Body),
+		?assertEqual(system, Type).
+
+	% An explicit type field is honoured (future-proofs against a host/component declaring a public_port).
+	parsePortTargets_explicit_type_test() ->
+		Body = "[{\"id\":\"lucos_thing\",\"type\":\"component\",\"domain\":\"thing.l42.eu\",\"public_ports\":[{\"port\":9000,\"protocol\":\"tcp\",\"purpose\":\"x\"}]}]",
+		?assertEqual([{"lucos_thing", component, "thing.l42.eu", [{9000, <<"x">>}]}], parsePortTargets(Body)).
+
+	% Port checks depend on lucos_dns (resolution) but NOT lucos_router (raw TCP bypasses nginx).
+	make_port_probe_check_test() ->
+		Result = make_port_probe_check(#{<<"ok">> => true, <<"techDetail">> => <<"t">>}),
+		?assertEqual(2, maps:get(<<"failThreshold">>, Result)),
+		?assertEqual([<<"lucos_dns">>], maps:get(<<"dependsOn">>, Result)),
+		% original fields preserved
+		?assertEqual(true, maps:get(<<"ok">>, Result)).
 
 	% Connection-level errors classify to unknown (UnknownsGate escalates a sustained one).
 	classifyConnectError_econnrefused_test() ->
