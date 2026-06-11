@@ -1,5 +1,5 @@
 -module(fetcher_info).
--export([start/1, tryRunChecks/4]).
+-export([start/1, tryRunChecks/4, make_direct_probe_check/1]).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("public_key/include/public_key.hrl").
 

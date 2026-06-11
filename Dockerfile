@@ -16,6 +16,9 @@ RUN rebar3 as prod release
 RUN mkdir -p config
 RUN curl -s "https://configy.l42.eu/systems/http" -H "Accept: application/json" > config/info-systems-list.json
 RUN curl -s "https://configy.l42.eu/hosts/http" -H "Accept: application/json" > config/info-hosts-list.json
+# fetcher_ports probes public_ports, which are only emitted by the FULL /systems list
+# (dns/dns_secondary have no http_port and so are absent from /systems/http above).
+RUN curl -s "https://configy.l42.eu/systems" -H "Accept: application/json" > config/info-ports-list.json
 RUN curl -s "https://configy.l42.eu/systems" -H "Accept: application/json" > config/ci-systems-list.json
 RUN curl -s "https://configy.l42.eu/components" -H "Accept: application/json" > config/ci-components-list.json
 
