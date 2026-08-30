@@ -28,3 +28,8 @@ tr.metric[title] { cursor: help; }
 .system-checks > table { width: 100%; }
 .freshness-indicator { font-size: 0.75em; color: #888; text-align: right; margin: 0.1em 0 0; padding: 0 1em; font-style: italic; }
 .freshness-indicator.stale { color: #7a3b00; font-style: normal; font-weight: bold; background: #fff3e0; padding: 0.2em 1em; border-left: 3px solid #da9000; }
+.failure-rollup { font-weight: bold; text-align: center; margin: 0 0 1em; }
+.failure-rollup a { color: inherit; }
+.system.dependent-failure { border-left: 4px solid #c66; padding-left: 0.75em; margin-left: 0.25em; }
+.dependency-note { font-size: 0.85em; color: #555; margin: 0.2em 0 0.5em; padding: 0 1em; }
+.dependency-note a { color: inherit; }

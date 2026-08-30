@@ -778,6 +778,10 @@ computeFreshnessTimestamps(SourceTimestamps) ->
 
 % Builds the check output map. Includes optional string fields (techDetail, debug, link)
 % only when present and non-empty; omits internal counter fields.
+% <<"dependsOn">> is the polymorphic field normalised (ADR-0002) to a list of system ID
+% binaries, and omitted entirely when empty — this lets view.erl group root-vs-dependent
+% failures (#296) without re-implementing normalise_depends_on/1 or reaching into the
+% counter fields this function otherwise omits.
 buildCheckOutput(CheckId, Check) ->
 	Status = maps:get(<<"status">>, Check, unknown),
 	StatusText = maps:get(<<"statusText">>, Check, <<"unknown">>),
@@ -786,13 +790,17 @@ buildCheckOutput(CheckId, Check) ->
 		<<"status">>     => Status,
 		<<"statusText">> => StatusText
 	},
-	lists:foldl(fun(Key, Acc) ->
+	WithStrings = lists:foldl(fun(Key, Acc) ->
 		case maps:get(Key, Check, <<>>) of
 			<<>> -> Acc;
 			Val when is_binary(Val) -> maps:put(Key, Val, Acc);
 			_ -> Acc
 		end
-	end, Base, [<<"techDetail">>, <<"debug">>, <<"link">>]).
+	end, Base, [<<"techDetail">>, <<"debug">>, <<"link">>]),
+	case normalise_depends_on(Check) of
+		[] -> WithStrings;
+		DependsOnList -> maps:put(<<"dependsOn">>, [list_to_binary(D) || D <- DependsOnList], WithStrings)
+	end.
 
 % Builds the metric output map.
 buildMetricOutput(MetricId, Metric) ->
@@ -2136,6 +2144,23 @@ computePollStats(Timings) ->
 		Output = buildSystemOutput("host1.example.com", "lucos_foo", system, #{}, #{}, #{}, #{}),
 		?assertEqual(0, maps:get(<<"last_updated">>, Output)),
 		?assertEqual(0, maps:get(<<"oldest_source_ts">>, Output)).
+
+	% buildCheckOutput: a check with no dependsOn field omits the key entirely (#296).
+	build_check_output_no_depends_on_test() ->
+		Output = buildCheckOutput(<<"fetch-info">>, #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>}),
+		?assertEqual(false, maps:is_key(<<"dependsOn">>, Output)).
+
+	% buildCheckOutput: legacy single-binary dependsOn is normalised to a one-element list (#296).
+	build_check_output_depends_on_single_test() ->
+		Check = #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>, <<"dependsOn">> => <<"lucos_time">>},
+		Output = buildCheckOutput(<<"time-api-reachable">>, Check),
+		?assertEqual([<<"lucos_time">>], maps:get(<<"dependsOn">>, Output)).
+
+	% buildCheckOutput: list-shaped dependsOn (ADR-0002) is preserved as a list (#296).
+	build_check_output_depends_on_list_test() ->
+		Check = #{<<"ok">> => false, <<"status">> => failing, <<"statusText">> => <<"failing">>, <<"dependsOn">> => [<<"lucos_router">>, <<"lucos_dns">>]},
+		Output = buildCheckOutput(<<"fetch-info">>, Check),
+		?assertEqual([<<"lucos_router">>, <<"lucos_dns">>], maps:get(<<"dependsOn">>, Output)).
 
 	% Regression: a failure that begins inside a deploy window and persists unchanged past
 	% the 10-minute timeout must alert on the first poll after window expiry (#266).

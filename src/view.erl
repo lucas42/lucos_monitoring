@@ -21,8 +21,105 @@ render_page(Systems) ->
 % Renders the dashboard block (the <div id="checks"> element and its contents)
 % for a list of systems. Called by render_page/1 for the initial page load
 % and by stream_handler when pushing SSE updates to connected clients.
+% Classifications (#296) is computed once here and threaded through both the summary
+% rollup line and the per-system rendering, so the two can never disagree.
 render_dashboard_block(Systems) ->
-	"<div id=\"checks\">\n" ++ renderAll(Systems) ++ "\n</div>".
+	Classifications = classifyFailures(Systems),
+	"<div id=\"checks\">\n" ++ renderFailureRollup(Classifications) ++ renderAll(Systems, Classifications) ++ "\n</div>".
+
+% Returns the system-id strings (as Erlang lists) of every currently-`failing` system.
+failingSystemIds(Systems) ->
+	sets:from_list(
+		[binary_to_list(maps:get(<<"name">>, S)) || S <- Systems, maps:get(<<"status">>, S) =:= failing],
+		[{version, 2}]
+	).
+
+% Returns the normalised dependsOn system IDs declared by ANY check belonging to this
+% system — not just whichever check happens to be failing right now. This matters: the
+% check that fails first during a dependency outage can be monitoring's own reachability
+% probe (fetch-info), which carries no dependsOn on the upstream system at fault — that
+% declaration lives on a different check, one which may never have run this poll because
+% fetch-info failed first. See #296 and ADR-0004.
+systemDependsOn(SystemChecks) ->
+	lists:usort(lists:append([
+		[binary_to_list(D) || D <- maps:get(<<"dependsOn">>, Check, [])] || Check <- SystemChecks
+	])).
+
+% Classifies one failing system as `root` or `{dependent, RootSystemId}`: dependent when
+% any system it declares a dependency on (via systemDependsOn/1) is ALSO currently
+% failing. Single-hop only (ADR-0002/0004) — a dependent's own dependents are not chased,
+% matching #296's explicit exclusion of a dependency-graph view. Self-references are
+% guarded defensively even though no declared dependsOn in this estate is reflexive. When
+% more than one declared dependency is itself failing, the first after sorting is
+% reported as the anchor.
+classifyFailure(SystemId, SystemChecks, FailingIds) ->
+	DependsOn = systemDependsOn(SystemChecks),
+	FailingDeps = [D || D <- DependsOn, D =/= SystemId, sets:is_element(D, FailingIds)],
+	case FailingDeps of
+		[] -> root;
+		[RootId | _] -> {dependent, RootId}
+	end.
+
+% Builds a map of SystemId -> root | {dependent, RootSystemId} for every currently-failing
+% system. Systems in any other status are absent — the root/dependent distinction only
+% means something for a system that is actually failing.
+classifyFailures(Systems) ->
+	FailingIds = failingSystemIds(Systems),
+	lists:foldl(fun(S, Acc) ->
+		case maps:get(<<"status">>, S) of
+			failing ->
+				SystemId = binary_to_list(maps:get(<<"name">>, S)),
+				Checks = maps:get(<<"checks">>, S, []),
+				maps:put(SystemId, classifyFailure(SystemId, Checks, FailingIds), Acc);
+			_ -> Acc
+		end
+	end, #{}, Systems).
+
+% Sort key that clusters a dependent system immediately after its root cause, rather than
+% floating free among unrelated failures purely by name (#296) — a dependent's whole point
+% is to read next to the system it's explained by. Non-dependent systems (including every
+% healthy/unknown/etc. system, which classifyFailures/1 never classifies) group under
+% their own ID and sort first within any shared group.
+sortGroupKey(SystemId, Classifications) ->
+	case maps:get(SystemId, Classifications, root) of
+		{dependent, RootId} -> {RootId, true};
+		_ -> {SystemId, false}
+	end.
+
+% Renders the "N failing — M root causes (...), K dependent" summary line, or "" when
+% grouping wouldn't change how the failures read: either nothing is classified dependent,
+% or (degenerate — only reachable via a dependsOn cycle, which nothing in this estate's
+% declared dependencies forms) every failing system is dependent with no anchor to name.
+% A rollup claiming "0 root causes" would be worse than no rollup at all.
+renderFailureRollup(Classifications) ->
+	Entries = maps:to_list(Classifications),
+	RootIds = lists:usort([Id || {Id, root} <- Entries]),
+	DependentCount = length([ok || {_, {dependent, _}} <- Entries]),
+	FailingCount = length(Entries),
+	case {DependentCount, RootIds} of
+		{0, _} -> "";
+		{_, []} -> "";
+		_ ->
+			RootLinksHtml = string:join([rootLink(Id) || Id <- RootIds], ", "),
+			RootWord = case length(RootIds) of 1 -> "root cause"; _ -> "root causes" end,
+			"<p class=\"failure-rollup\">"
+			++ integer_to_list(FailingCount) ++ " failing &mdash; "
+			++ integer_to_list(length(RootIds)) ++ " " ++ RootWord ++ " (" ++ RootLinksHtml ++ "), "
+			++ integer_to_list(DependentCount) ++ " dependent</p>\n"
+	end.
+
+rootLink(SystemId) ->
+	"<a href=\"#system-"++SystemId++"\">"++readableName(SystemId)++"</a>".
+
+% Dependent-failure note rendered under a dependent system's header (#296). Text, not
+% colour alone, carries the meaning — matches the freshness-indicator convention above.
+% "Never hidden": this supplements the system's normal failing display, it never replaces it.
+renderDependencyNote(RootId) ->
+	"<p class=\"dependency-note\">Dependent on <a href=\"#system-"++RootId++"\">"++readableName(RootId)++"</a></p>".
+
+% Converts a system ID (e.g. "lucos_time") to its human-readable form ("lucos time").
+readableName(SystemId) ->
+	re:replace(SystemId, "_", " ", [global, {return, list}]).
 
 
 formatStringFromInfo(Key, CheckInfo) ->
@@ -182,7 +279,7 @@ renderSystemMetrics(SystemMetrics) ->
 
 renderSystemHeader(Name, Host, Type, DupNameCount) ->
 	SystemId = binary_to_list(Name),
-	ReadableName = re:replace(SystemId, "_", " ", [global, {return,list}]),
+	ReadableName = readableName(SystemId),
 	{Emoji, TypeLabel} = typeToEmoji(Type),
 	EmojiHtml = "<span class=\"type-icon\" role=\"img\" aria-label=\""++TypeLabel++"\" title=\""++TypeLabel++"\">"++Emoji++"</span>\n\t\t\t\t",
 	InfoLinkHtml = case Host of
@@ -204,8 +301,10 @@ renderSystemHeader(Name, Host, Type, DupNameCount) ->
 % Renders all systems. Systems is the list returned by {fetch, all} — each
 % element is a map with <<"host">>, <<"name">>, <<"status">>, <<"checks">>, <<"metrics">>.
 % Status-based CSS class and suppression states are derived from <<"status">> directly;
-% no separate suppression map fetch is needed.
-renderAll(Systems) ->
+% no separate suppression map fetch is needed. Classifications is the map built by
+% classifyFailures/1 — passed in rather than recomputed here so the per-system rendering
+% can never disagree with the rollup line built from the same map (#296).
+renderAll(Systems, Classifications) ->
 	SortedSystems = lists:sort(
 		fun (SysA, SysB) ->
 			StatusA = maps:get(<<"status">>, SysA),
@@ -214,11 +313,15 @@ renderAll(Systems) ->
 			NameB = maps:get(<<"name">>, SysB, <<"">>),
 			HostA = maps:get(<<"host">>, SysA, <<"">>),
 			HostB = maps:get(<<"host">>, SysB, <<"">>),
-			{systemStatusSortPriority(StatusA), NameA, HostA} =< {systemStatusSortPriority(StatusB), NameB, HostB}
+			{GroupA, DependentA} = sortGroupKey(binary_to_list(NameA), Classifications),
+			{GroupB, DependentB} = sortGroupKey(binary_to_list(NameB), Classifications),
+			{systemStatusSortPriority(StatusA), GroupA, DependentA, NameA, HostA}
+				=< {systemStatusSortPriority(StatusB), GroupB, DependentB, NameB, HostB}
 		end, Systems),
 	lists:foldl(
 		fun (System, Output) ->
 			Name = maps:get(<<"name">>, System),
+			SystemId = binary_to_list(Name),
 			Host = binary_to_list(maps:get(<<"host">>, System, <<"">>)),
 			Status = maps:get(<<"status">>, System),
 			Type = maps:get(<<"type">>, System, unknown),
@@ -229,10 +332,14 @@ renderAll(Systems) ->
 			DupNameCount = length(lists:filter(
 				fun(S) -> maps:get(<<"name">>, S, <<>>) =:= Name end,
 				Systems)),
-			CssClass = "system " ++ statusToCssClass(Status),
+			{CssClass, DependencyNoteHtml} = case maps:get(SystemId, Classifications, root) of
+				{dependent, RootId} -> {"system " ++ statusToCssClass(Status) ++ " dependent-failure", renderDependencyNote(RootId)};
+				_ -> {"system " ++ statusToCssClass(Status), ""}
+			end,
 			Output++"
 			<div class=\""++CssClass++"\">
 				"++renderSystemHeader(Name, Host, Type, DupNameCount)++"
+				"++DependencyNoteHtml++"
 				"++renderFreshnessIndicator(LastUpdated, OldestSourceTs)++"
 				"++renderSystemChecks(SystemChecks)++"
 				"++renderSystemMetrics(SystemMetrics)++"
@@ -544,5 +651,177 @@ renderAll(Systems) ->
 		Html = render_dashboard_block(Systems),
 		?assert(string:str(Html, "stale") > 0, "dashboard must show stale warning for outdated source"),
 		?assert(string:str(Html, "Data may be outdated") > 0, "stale warning must contain explanatory text").
+
+	% ── readableName ─────────────────────────────────────────────────────────
+
+	readable_name_test() ->
+		?assertEqual("lucos time", readableName("lucos_time")).
+
+	% ── systemDependsOn / classifyFailure / classifyFailures (#296) ───────────
+
+	system_depends_on_no_checks_test() ->
+		?assertEqual([], systemDependsOn([])).
+
+	system_depends_on_no_dependson_field_test() ->
+		?assertEqual([], systemDependsOn([#{<<"id">> => <<"fetch-info">>, <<"status">> => failing}])).
+
+	% The trap this exists to avoid: the check that actually failed (fetch-info) carries
+	% no dependsOn, but a DIFFERENT check on the same system does. systemDependsOn/1 must
+	% surface it regardless of which check is currently failing.
+	system_depends_on_scans_all_checks_not_just_failing_one_test() ->
+		SystemChecks = [
+			#{<<"id">> => <<"fetch-info">>, <<"status">> => failing},
+			#{<<"id">> => <<"time-api-reachable">>, <<"status">> => unknown, <<"dependsOn">> => [<<"lucos_time">>]}
+		],
+		?assertEqual(["lucos_time"], systemDependsOn(SystemChecks)).
+
+	system_depends_on_dedupes_and_sorts_test() ->
+		SystemChecks = [
+			#{<<"id">> => <<"a">>, <<"dependsOn">> => [<<"lucos_b">>, <<"lucos_a">>]},
+			#{<<"id">> => <<"b">>, <<"dependsOn">> => [<<"lucos_a">>]}
+		],
+		?assertEqual(["lucos_a", "lucos_b"], systemDependsOn(SystemChecks)).
+
+	classify_failure_no_dependson_is_root_test() ->
+		?assertEqual(root, classifyFailure("lucos_time", [#{<<"id">> => <<"fetch-info">>}], sets:from_list(["lucos_time"], [{version, 2}]))).
+
+	classify_failure_dependency_not_failing_is_root_test() ->
+		SystemChecks = [#{<<"id">> => <<"fetch-info">>, <<"dependsOn">> => [<<"lucos_router">>]}],
+		FailingIds = sets:from_list(["lucos_weightings"], [{version, 2}]),
+		?assertEqual(root, classifyFailure("lucos_weightings", SystemChecks, FailingIds)).
+
+	classify_failure_dependency_failing_is_dependent_test() ->
+		SystemChecks = [#{<<"id">> => <<"time-api-reachable">>, <<"dependsOn">> => [<<"lucos_time">>]}],
+		FailingIds = sets:from_list(["lucos_weightings", "lucos_time"], [{version, 2}]),
+		?assertEqual({dependent, "lucos_time"}, classifyFailure("lucos_weightings", SystemChecks, FailingIds)).
+
+	classify_failure_self_reference_guard_test() ->
+		SystemChecks = [#{<<"id">> => <<"self-check">>, <<"dependsOn">> => [<<"lucos_foo">>]}],
+		FailingIds = sets:from_list(["lucos_foo"], [{version, 2}]),
+		?assertEqual(root, classifyFailure("lucos_foo", SystemChecks, FailingIds)).
+
+	classify_failures_only_includes_failing_systems_test() ->
+		Systems = [
+			#{<<"name">> => <<"lucos_healthy">>, <<"status">> => healthy, <<"checks">> => []},
+			#{<<"name">> => <<"lucos_time">>, <<"status">> => failing, <<"checks">> => []}
+		],
+		Classifications = classifyFailures(Systems),
+		?assertEqual(1, maps:size(Classifications)),
+		?assertEqual(root, maps:get("lucos_time", Classifications)).
+
+	classify_failures_incident_shape_test() ->
+		% Reproduces the 2026-08-08 lucos_time incident shape: the dependent's failing
+		% check (fetch-info) carries no dependsOn on lucos_time; a different check
+		% (time-api-reachable, cached from its last successful poll) does.
+		Systems = [
+			#{<<"name">> => <<"lucos_time">>, <<"status">> => failing, <<"checks">> => [
+				#{<<"id">> => <<"fetch-info">>, <<"status">> => failing}
+			]},
+			#{<<"name">> => <<"lucos_media_weightings">>, <<"status">> => failing, <<"checks">> => [
+				#{<<"id">> => <<"fetch-info">>, <<"status">> => failing},
+				#{<<"id">> => <<"time-api-reachable">>, <<"status">> => unknown, <<"dependsOn">> => [<<"lucos_time">>]}
+			]}
+		],
+		Classifications = classifyFailures(Systems),
+		?assertEqual(root, maps:get("lucos_time", Classifications)),
+		?assertEqual({dependent, "lucos_time"}, maps:get("lucos_media_weightings", Classifications)).
+
+	% ── renderFailureRollup ─────────────────────────────────────────────────
+
+	render_failure_rollup_no_dependents_is_empty_test() ->
+		?assertEqual("", renderFailureRollup(#{"lucos_a" => root, "lucos_b" => root})).
+
+	render_failure_rollup_empty_map_is_empty_test() ->
+		?assertEqual("", renderFailureRollup(#{})).
+
+	render_failure_rollup_single_root_test() ->
+		Html = renderFailureRollup(#{
+			"lucos_time" => root,
+			"lucos_media_weightings" => {dependent, "lucos_time"}
+		}),
+		?assert(string:str(Html, "2 failing") > 0),
+		?assert(string:str(Html, "1 root cause") > 0),
+		?assertEqual(0, string:str(Html, "root causes"), "singular root cause must not also match the plural form's substring incorrectly"),
+		?assert(string:str(Html, "1 dependent") > 0),
+		?assert(string:str(Html, "lucos time") > 0, "root cause name must be human-readable"),
+		?assert(string:str(Html, "href=\"#system-lucos_time\"") > 0, "root cause name must link to its system anchor").
+
+	render_failure_rollup_multiple_roots_pluralises_test() ->
+		Html = renderFailureRollup(#{
+			"lucos_a" => root,
+			"lucos_b" => root,
+			"lucos_c" => {dependent, "lucos_a"}
+		}),
+		?assert(string:str(Html, "2 root causes") > 0),
+		?assert(string:str(Html, "1 dependent") > 0).
+
+	% Degenerate cycle guard: if every failing system somehow classifies as dependent
+	% (no root identified), the rollup must not claim "0 root causes" — it renders nothing.
+	render_failure_rollup_no_root_identified_is_empty_test() ->
+		?assertEqual("", renderFailureRollup(#{
+			"lucos_a" => {dependent, "lucos_b"},
+			"lucos_b" => {dependent, "lucos_a"}
+		})).
+
+	% ── render_dashboard_block integration (#296) ────────────────────────────
+
+	render_dashboard_block_shows_rollup_and_dependency_note_test() ->
+		Systems = [
+			#{<<"host">> => <<"time.l42.eu">>, <<"name">> => <<"lucos_time">>, <<"status">> => failing,
+			  <<"checks">> => [#{<<"id">> => <<"fetch-info">>, <<"status">> => failing, <<"statusText">> => <<"failing">>}],
+			  <<"metrics">> => []},
+			#{<<"host">> => <<"weightings.l42.eu">>, <<"name">> => <<"lucos_media_weightings">>, <<"status">> => failing,
+			  <<"checks">> => [
+				#{<<"id">> => <<"fetch-info">>, <<"status">> => failing, <<"statusText">> => <<"failing">>},
+				#{<<"id">> => <<"time-api-reachable">>, <<"status">> => unknown, <<"statusText">> => <<"unknown">>, <<"dependsOn">> => [<<"lucos_time">>]}
+			  ],
+			  <<"metrics">> => []}
+		],
+		Html = render_dashboard_block(Systems),
+		?assert(string:str(Html, "failure-rollup") > 0, "must render the rollup line"),
+		?assert(string:str(Html, "2 failing") > 0),
+		?assert(string:str(Html, "1 root cause") > 0),
+		?assert(string:str(Html, "dependent-failure") > 0, "dependent system must carry the de-emphasis class"),
+		?assert(string:str(Html, "Dependent on") > 0, "dependent system must show an explanatory note"),
+		?assert(string:str(Html, "href=\"#system-lucos_time\"") > 0, "dependency note must link back to the root cause"),
+		% Never hidden: the dependent system's own failing check must still be fully visible.
+		?assert(string:str(Html, "time-api-reachable") > 0).
+
+	% Regression: a dependent must render immediately after its root cause, not float
+	% ahead of it by alphabetical accident (lucos_media_weightings < lucos_time by name,
+	% but must still appear after it — this is the exact ordering readers hit on #296).
+	render_dashboard_block_dependent_clusters_after_root_test() ->
+		Systems = [
+			#{<<"host">> => <<"time.l42.eu">>, <<"name">> => <<"lucos_time">>, <<"status">> => failing,
+			  <<"checks">> => [#{<<"id">> => <<"fetch-info">>, <<"status">> => failing, <<"statusText">> => <<"failing">>}],
+			  <<"metrics">> => []},
+			#{<<"host">> => <<"weightings.l42.eu">>, <<"name">> => <<"lucos_media_weightings">>, <<"status">> => failing,
+			  <<"checks">> => [
+				#{<<"id">> => <<"fetch-info">>, <<"status">> => failing, <<"statusText">> => <<"failing">>},
+				#{<<"id">> => <<"time-api-reachable">>, <<"status">> => unknown, <<"statusText">> => <<"unknown">>, <<"dependsOn">> => [<<"lucos_time">>]}
+			  ],
+			  <<"metrics">> => []}
+		],
+		Html = render_dashboard_block(Systems),
+		PosRoot = string:str(Html, "id=\"system-lucos_time\""),
+		PosDependent = string:str(Html, "id=\"system-lucos_media_weightings\""),
+		?assert(PosRoot > 0, "root system must be rendered"),
+		?assert(PosDependent > 0, "dependent system must be rendered"),
+		?assert(PosRoot < PosDependent, "root cause must render before its dependent, even though it sorts later alphabetically").
+
+	render_dashboard_block_independent_failures_show_no_rollup_test() ->
+		% Two unrelated failing systems (neither depends on the other) — grouping would
+		% add no information, so no rollup line and no dependent-failure class.
+		Systems = [
+			#{<<"host">> => <<"a.l42.eu">>, <<"name">> => <<"lucos_a">>, <<"status">> => failing,
+			  <<"checks">> => [#{<<"id">> => <<"fetch-info">>, <<"status">> => failing, <<"statusText">> => <<"failing">>}],
+			  <<"metrics">> => []},
+			#{<<"host">> => <<"b.l42.eu">>, <<"name">> => <<"lucos_b">>, <<"status">> => failing,
+			  <<"checks">> => [#{<<"id">> => <<"fetch-info">>, <<"status">> => failing, <<"statusText">> => <<"failing">>}],
+			  <<"metrics">> => []}
+		],
+		Html = render_dashboard_block(Systems),
+		?assertEqual(0, string:str(Html, "failure-rollup")),
+		?assertEqual(0, string:str(Html, "dependent-failure")).
 
 -endif.
