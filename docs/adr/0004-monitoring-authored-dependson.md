@@ -27,7 +27,7 @@ This establishes a deliberate second class of `dependsOn` author:
 | A service | its own `/_info` | `webhook-error-rate` on `lucos_loganne` (ADR-0002) |
 | **Monitoring itself** | synthetic probe generation | `fetch-info` / `tls-certificate` (this ADR) |
 
-The suppression *engine* is untouched. Both read sites in `monitoring_state_server.erl` (`is_dependency_suppressed/3` and `find_dependent_systems/2`) consume `normalise_depends_on/1` and are agnostic to where the `dependsOn` came from. ADR-0002's invariants — polymorphic shape, OR semantics, single-hop, per-element self-reference guard — all hold unchanged. This ADR adds an *authorship* concept, not an engine change.
+The suppression *engine* is untouched. Both read sites in `depends_on.erl` (`is_dependency_suppressed/3` and `find_dependent_systems/2`) consume `normalise_depends_on/1` and are agnostic to where the `dependsOn` came from. ADR-0002's invariants — polymorphic shape, OR semantics, single-hop, per-element self-reference guard — all hold unchanged. This ADR adds an *authorship* concept, not an engine change.
 
 ### Why monitoring-authored, not service-declared
 
