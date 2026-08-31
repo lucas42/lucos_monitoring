@@ -22,7 +22,7 @@ The crux: **"did we alert the user for this episode?" is not a function of the c
 
 ## Decision
 
-Add a **per-system, per-episode `alerted` boolean** to the in-memory state in `src/monitoring_state_server.erl`. It is the final element of the per-system state tuple already held in `SystemMap`:
+Add a **per-system, per-episode `alerted` boolean** to the in-memory state (the `system_state` record, now defined in `src/monitoring_state.hrl`). It is the final element of the per-system state tuple already held in `SystemMap`:
 
 ```
 {Host, SystemType, SourceChecksMap, NormalisedCache, Metrics, SourceTimestamps, Alerted}
@@ -49,7 +49,7 @@ This single flag replaces the **three** former ad-hoc recovery conditions with o
 
 ### Why gate the dispatch, not the email module
 
-Recovery is gated at the **`notify_all` dispatch site** in `monitoring_state_server`, so a gated-out recovery reaches *neither* notifier. Both `email:notify/1` and `loganne:notify/1` are driven from the same `notify_all` call; gating there keeps `alerted` as the single decision input in one module, rather than splitting the decision across `monitoring_state_server` (loganne) and `email.erl` (email). `loganne.erl` is left **untouched**. `email.erl` changes only its (previously inaccurate) header comment, which claimed recoveries were dropped — they are not; a recovery that reaches `email.erl` is a genuine all-clear closing a real alert, and is sent.
+Recovery is gated at the **`notify_all` dispatch site** in `alerting.erl`, so a gated-out recovery reaches *neither* notifier. Both `email:notify/1` and `loganne:notify/1` are driven from the same `notify_all` call; gating there keeps `alerted` as the single decision input in one module, rather than splitting the decision across `alerting.erl` (loganne) and `email.erl` (email). `loganne.erl` is left **untouched**. `email.erl` changes only its (previously inaccurate) header comment, which claimed recoveries were dropped — they are not; a recovery that reaches `email.erl` is a genuine all-clear closing a real alert, and is sent.
 
 ### This also fixes #252
 

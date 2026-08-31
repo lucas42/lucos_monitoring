@@ -7,7 +7,7 @@
 
 ## Context
 
-The `dependsOn` field on a `/_info` check is the monitoring-side contract for "this check's value is sensitive to that other system being mid-deploy." Today the contract is a single binary string — one check, one dep. The state server reads it at two sites in `src/monitoring_state_server.erl`:
+The `dependsOn` field on a `/_info` check is the monitoring-side contract for "this check's value is sensitive to that other system being mid-deploy." Today the contract is a single binary string — one check, one dep. The state server reads it at two sites in `src/depends_on.erl`:
 
 - `is_dependency_suppressed/3` — if the failing check's `dependsOn` system is in an active suppression window, the failure is filtered out of `failingChecks/1` (alerts get suppressed).
 - `find_dependent_systems/2` — when a system unsuppresses, cascade `pending_verification` to systems whose checks declare it as a dep.
