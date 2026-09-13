@@ -122,14 +122,72 @@ getMetricSummary(SystemMetrics) ->
 
 -endif.
 
+buildContent(Subject, Sender, To, CurrentDate, MessageId, Body) ->
+	"Subject: "++Subject++"\r\nFrom: "++Sender++"\r\nTo: <"++To++">"
+	++"\r\nDate: "++CurrentDate++"\r\nMessage-ID: "++MessageId++"\r\n\r\n"++Body.
+
+% RFC 5322 date-time format, e.g. "Mon, 20 Jul 2026 20:18:50 +0000". Mail relays
+% (Gmail included) validate against this; RFC 3339 ("2026-07-20T20:18:50Z") is not
+% the same format and isn't accepted for the Date: header.
+formatRfc5322Date(UnixTime) ->
+	{{Year, Month, Day}, {Hour, Min, Sec}} = calendar:system_time_to_universal_time(UnixTime, second),
+	DayName = element(calendar:day_of_the_week(Year, Month, Day),
+		{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}),
+	MonthName = element(Month,
+		{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}),
+	lists:flatten(io_lib:format("~s, ~2..0B ~s ~4..0B ~2..0B:~2..0B:~2..0B +0000",
+		[DayName, Day, MonthName, Year, Hour, Min, Sec])).
+
+% A globally-unique Message-ID, per RFC 5322 3.6.4. Gmail (and other RFC-compliant
+% relays) reject messages that omit this header.
+buildMessageId(Domain) ->
+	lists:flatten(io_lib:format("<~B.~B@~s>",
+		[erlang:system_time(second), erlang:unique_integer([positive]), Domain])).
+
+getDomain(EmailAddress) ->
+	case string:split(EmailAddress, "@") of
+		[_, Domain] -> Domain;
+		_ -> EmailAddress
+	end.
+
+-ifdef(TEST).
+	-include_lib("eunit/include/eunit.hrl").
+
+	buildContent_includes_message_id_test() ->
+		Content = buildContent("Subject line", "Lucos Monitoring <monitoring@l42.eu>", "to@example.com",
+			"Mon, 20 Jul 2026 20:18:50 +0000", "<12345.67@l42.eu>", "Body text"),
+		?assert(string:str(Content, "\r\nMessage-ID: <12345.67@l42.eu>\r\n") > 0).
+
+	buildContent_includes_date_test() ->
+		Content = buildContent("Subject line", "Lucos Monitoring <monitoring@l42.eu>", "to@example.com",
+			"Mon, 20 Jul 2026 20:18:50 +0000", "<12345.67@l42.eu>", "Body text"),
+		?assert(string:str(Content, "\r\nDate: Mon, 20 Jul 2026 20:18:50 +0000\r\n") > 0).
+
+	formatRfc5322Date_test() ->
+		% 2026-07-20T20:18:50Z, a Monday
+		?assertEqual("Mon, 20 Jul 2026 20:18:50 +0000", formatRfc5322Date(1784578730)).
+
+	buildMessageId_format_test() ->
+		MessageId = buildMessageId("l42.eu"),
+		?assertMatch({match, _}, re:run(MessageId, "^<[0-9]+\\.[0-9]+@l42\\.eu>$")).
+
+	buildMessageId_unique_test() ->
+		?assertNotEqual(buildMessageId("l42.eu"), buildMessageId("l42.eu")).
+
+	getDomain_test() ->
+		?assertEqual("l42.eu", getDomain("monitoring@l42.eu")).
+
+-endif.
+
 sendEmail(Subject, Body) ->
 	SendAddress =  os:getenv("SEND_ADDRESS"),
 	Password = os:getenv("SEND_PASSWORD"),
 	Relay = os:getenv("SMTP_RELAY"),
 	To = os:getenv("TO_ADDRESS"),
 	Sender = "Lucos Monitoring <"++SendAddress++">",
-	CurrentDate = calendar:system_time_to_rfc3339(erlang:system_time(second)),
-	Content = "Subject: "++Subject++"\r\nFrom: "++Sender++"\r\nTo: <"++To++">"++"\r\nDate: "++CurrentDate++"\r\n\r\n"++Body,
+	CurrentDate = formatRfc5322Date(erlang:system_time(second)),
+	MessageId = buildMessageId(getDomain(SendAddress)),
+	Content = buildContent(Subject, Sender, To, CurrentDate, MessageId, Body),
 	Email = {SendAddress, [To], Content},
 	Options = [
 		{relay, Relay},
