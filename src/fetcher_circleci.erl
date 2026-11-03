@@ -1,5 +1,7 @@
 -module(fetcher_circleci).
--export([start/1, parseConfigyRepos/2]).
+-export([start/1, parseConfigyRepos/2, slotOffsetMs/3, nextSleepMs/2]).
+
+-define(PERIOD_MS, 60000).
 -include_lib("eunit/include/eunit.hrl").
 
 % Reads the CI repo lists (written at build time from configy) and spawns a
@@ -12,9 +14,20 @@ start(StatePid) ->
 	% DefaultType is the atom used when an entry has no explicit "type" field.
 	Repos = parseConfigyRepos(binary_to_list(SystemsBody), system) ++
 	        parseConfigyRepos(binary_to_list(ComponentsBody), component),
-	lists:foreach(fun({RepoId, Type, Host}) ->
-		spawn(fun() -> ciRepoLoop(StatePid, RepoId, Type, Host) end)
-	end, Repos).
+	Count = length(Repos),
+	Now = erlang:monotonic_time(millisecond),
+	lists:foreach(fun({Index, {RepoId, Type, Host}}) ->
+		Deadline = Now + slotOffsetMs(Index, Count, ?PERIOD_MS),
+		spawn(fun() -> ciRepoLoop(StatePid, RepoId, Type, Host, Deadline) end)
+	end, lists:zip(lists:seq(0, Count - 1), Repos)).
+
+% Start offset (ms) of the Index'th of Count loops, spread evenly across the period.
+slotOffsetMs(Index, Count, PeriodMs) ->
+	Index * PeriodMs div Count.
+
+% Time to sleep until Deadline; never negative, so an overrunning iteration starts the next immediately.
+nextSleepMs(Deadline, Now) ->
+	max(0, Deadline - Now).
 
 % Parses a JSON array of repo entries. DefaultType is the atom used when an
 % entry has no "type" field. Returns a list of {RepoId, Type, Host} triples.
@@ -30,7 +43,8 @@ repoHost(Repo) ->
 		Domain -> binary_to_list(Domain)
 	end.
 
-ciRepoLoop(StatePid, RepoId, Type, Host) ->
+ciRepoLoop(StatePid, RepoId, Type, Host, Deadline) ->
+	timer:sleep(nextSleepMs(Deadline, erlang:monotonic_time(millisecond))),
 	try
 		Slug = "github/lucas42/" ++ RepoId,
 		CIChecks = checkCIForSlug(Slug),
@@ -39,8 +53,7 @@ ciRepoLoop(StatePid, RepoId, Type, Host) ->
 		ExceptionClass:Term:StackTrace ->
 			logger:error("ExceptionClass: ~p Term: ~p StackTrace: ~p", [ExceptionClass, Term, StackTrace])
 	end,
-	timer:sleep(timer:seconds(60)),
-	ciRepoLoop(StatePid, RepoId, Type, Host).
+	ciRepoLoop(StatePid, RepoId, Type, Host, Deadline + ?PERIOD_MS).
 
 % make_third_party_probe_check/2 builds a circleci checks-map in the ok: unknown state
 % for use when a transport or API error prevents fetching from CircleCI.
@@ -193,6 +206,27 @@ checkWorkflowStatuses(_Slug, Workflows, PipelineUrl, TechDetail) ->
 	end.
 
 -ifdef(TEST).
+	slotOffsetMs_distinct_and_even_test() ->
+		Offsets = [slotOffsetMs(I, 56, 60000) || I <- lists:seq(0, 55)],
+		?assertEqual(56, length(lists:usort(Offsets))),
+		?assertEqual(0, hd(Offsets)),
+		?assert(lists:last(Offsets) < 60000),
+		Gaps = lists:zipwith(fun(A, B) -> B - A end, lists:droplast(Offsets), tl(Offsets)),
+		?assert(lists:all(fun(G) -> G >= 1071 andalso G =< 1072 end, Gaps)).
+
+	slotOffsetMs_single_repo_test() ->
+		?assertEqual(0, slotOffsetMs(0, 1, 60000)).
+
+	nextSleepMs_overrun_is_zero_test() ->
+		?assertEqual(0, nextSleepMs(1000, 1000)),
+		?assertEqual(0, nextSleepMs(1000, 9000)).
+
+	nextSleepMs_work_time_does_not_change_period_test() ->
+		% Iteration starts at D, takes W ms; the next one must still start at D + Period.
+		D = 5000, W = 700,
+		NextDeadline = D + 60000,
+		?assertEqual(60000 - W, nextSleepMs(NextDeadline, D + W)).
+
 	parseConfigyRepos_test() ->
 		% System with a domain: host is the domain.
 		% Entry with no domain: host is empty string (no URL to check).
